@@ -72,4 +72,14 @@ pub enum Serverbound {
     /// `ServerboundPlayerAbilitiesPacket` — the client's abilities bitset. Only
     /// the flying bit (0x02) is meaningful serverbound.
     PlayerAbilities { flags: u8 },
+    /// `ServerboundSetCarriedItemPacket` — the selected hotbar slot (0..8). The
+    /// wire field is a signed short; the sim validates the range.
+    SetCarriedItem { slot: i16 },
+    /// `ServerboundSetCreativeModeSlotPacket` — a container slot index plus the
+    /// stack to place there. The `net` layer decodes the `ItemStack` so the sim
+    /// stays protocol-shape-agnostic; `None` is the empty stack.
+    SetCreativeSlot {
+        slot: i16,
+        stack: Option<crate::inventory::ItemStack>,
+    },
 }
