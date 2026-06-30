@@ -11,14 +11,16 @@ mod components;
 mod packets;
 mod systems;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bevy_ecs::prelude::*;
 use tracing::info;
 
+use crate::config::ServerConfig;
+
 use bridge::ToSim;
-use components::{Control, Ingress, NextEntityId, PlayerIndex, Tick};
+use components::{Config, Control, Ingress, NextEntityId, PlayerIndex, Tick};
 
 /// One tick is 50 ms (20 TPS).
 const TICK: Duration = Duration::from_millis(50);
@@ -26,9 +28,10 @@ const TICK: Duration = Duration::from_millis(50);
 /// Run the simulation loop until the ingress channel closes (all connections
 /// gone and the listener dropped — i.e. shutdown). Blocks the calling thread;
 /// spawn it on a dedicated OS thread, not a tokio worker.
-pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>) {
+pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
     let mut world = World::new();
     world.insert_resource(Ingress(Mutex::new(rx)));
+    world.insert_resource(Config(config));
     world.insert_resource(Tick(0));
     // Entity id 1 is the first player; the framing test pins the first join to 1.
     world.insert_resource(NextEntityId(1));

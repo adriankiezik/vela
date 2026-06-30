@@ -4,12 +4,14 @@
 //! `Conn` + `KeepAlive`. World-wide state lives in resources.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bevy_ecs::prelude::*;
 use uuid::Uuid;
 
 use super::bridge::{OutboxTx, ToSim};
+use super::packets::JoinParams;
+use crate::config::ServerConfig;
 
 /// The player's stable identity, used to resolve incoming `ToSim` messages
 /// (keyed by `Uuid`) back to this entity via `PlayerIndex`.
@@ -75,4 +77,25 @@ pub struct PlayerIndex(pub HashMap<Uuid, Entity>);
 #[derive(Resource, Default)]
 pub struct Control {
     pub stop: bool,
+}
+
+/// The loaded server configuration, shared with the network half. Held so the
+/// join sequence can be built from `server.properties` (view distance, game
+/// mode, max players, …).
+#[derive(Resource)]
+pub struct Config(pub Arc<ServerConfig>);
+
+impl Config {
+    /// The join-packet parameters derived from `server.properties`.
+    pub fn join_params(&self) -> JoinParams {
+        let p = &self.0.properties;
+        JoinParams {
+            max_players: p.max_players(),
+            view_distance: p.view_distance(),
+            simulation_distance: p.simulation_distance(),
+            hardcore: p.hardcore(),
+            online_mode: p.online_mode(),
+            game_type: p.gamemode(),
+        }
+    }
 }

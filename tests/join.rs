@@ -21,8 +21,16 @@ impl Drop for Server {
 }
 
 fn start_server(addr: &str) -> Server {
+    // Run each server in its own temp directory so the generated config files
+    // (server.properties, ops.json, …) don't litter the checkout, and set the
+    // IDE bypass so the EULA gate auto-agrees — mirroring how vanilla's own
+    // tests run with `IS_RUNNING_IN_IDE`.
+    let workdir = std::env::temp_dir().join(format!("vela-it-{}", addr.replace(':', "_")));
+    std::fs::create_dir_all(&workdir).expect("create server workdir");
     let child = Command::new(env!("CARGO_BIN_EXE_vela"))
         .arg(addr)
+        .current_dir(&workdir)
+        .env("VELA_RUNNING_IN_IDE", "1")
         .spawn()
         .expect("spawn vela");
     // Give it a moment to bind the listener.
@@ -307,9 +315,11 @@ fn login_through_configuration_into_play() {
     // A SystemChat (121) carrying the rendered "<TestPlayer> hello vela" line
     // should come back (we're subscribed to our own broadcast). It trails the
     // large backlog of join-sequence chunk packets (id 45) still in the stream,
-    // plus the odd keep-alive (44), so drain a generous run looking for it.
+    // plus the odd keep-alive (44), so drain a generous run looking for it. The
+    // backlog scales with the configured view distance (default 10 -> a 21x21
+    // chunk burst, ~441 packets), so the bound must comfortably exceed that.
     let mut chat_body = None;
-    for _ in 0..400 {
+    for _ in 0..1200 {
         let (id, body) = recv(&mut s);
         if id == 121 {
             chat_body = Some(body);
