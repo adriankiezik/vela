@@ -45,6 +45,7 @@ pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
         (
             systems::advance_tick,
             systems::drain_ingress,
+            systems::broadcast_movement,
             systems::keepalive,
         )
             .chain(),

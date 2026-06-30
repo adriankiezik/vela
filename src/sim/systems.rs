@@ -26,6 +26,25 @@ const SPAWN: (f64, f64, f64) = (0.0, 64.0, 0.0);
 /// via `AcceptTeleportation`.
 const SPAWN_TELEPORT_ID: i32 = 1;
 
+/// How often (in ticks) an entity's position/rotation is broadcast, matching
+/// vanilla's player `EntityType.updateInterval` of 2.
+const UPDATE_INTERVAL: u32 = 2;
+
+/// A snapshot of an already-online player, taken when someone new joins so the
+/// newcomer can be told who is already here (and vice versa).
+struct Existing {
+    uuid: Uuid,
+    name: String,
+    entity_id: i32,
+    base_x: f64,
+    base_y: f64,
+    base_z: f64,
+    yaw: i8,
+    pitch: i8,
+    head: i8,
+    outbox: OutboxTx,
+}
+
 /// Advance the tick counter. Runs first so joins seed `last_tick` with the new
 /// value and `keepalive` sees a consistent clock.
 pub fn advance_tick(mut tick: ResMut<Tick>) {
@@ -85,6 +104,73 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
 
     let tick = world.resource::<Tick>().0;
     info!(%name, entity_id, "joined");
+
+    // Snapshot everyone already online before the newcomer is spawned. Their
+    // spawn position/rotation comes from each player's `Tracking` base (the
+    // last value broadcast), so the newcomer joins the shared delta stream in
+    // sync — exactly what vanilla's entity tracker sends a new viewer.
+    let existing: Vec<Existing> = {
+        let mut q = world.query::<(&PlayerId, &Profile, &Tracking, &Conn)>();
+        q.iter(world)
+            .map(|(pid, profile, t, conn)| Existing {
+                uuid: pid.0,
+                name: profile.name.clone(),
+                entity_id: profile.entity_id,
+                base_x: t.base_x,
+                base_y: t.base_y,
+                base_z: t.base_z,
+                yaw: t.yaw,
+                pitch: t.pitch,
+                head: t.head,
+                outbox: conn.outbox.clone(),
+            })
+            .collect()
+    };
+
+    // Tell the newcomer about everyone already here: tab-list entries first
+    // (the client resolves profiles from these), then spawn their entities.
+    // The newcomer's own entry is included so they see themselves in the list.
+    let mut newcomer_view: Vec<packets::PlayerEntry> = existing
+        .iter()
+        .map(|e| packets::PlayerEntry {
+            uuid: e.uuid,
+            name: e.name.clone(),
+        })
+        .collect();
+    newcomer_view.push(packets::PlayerEntry {
+        uuid: id,
+        name: name.clone(),
+    });
+    send(&outbox, packets::player_info_update(&newcomer_view));
+    for e in &existing {
+        send(
+            &outbox,
+            packets::add_entity(
+                e.entity_id,
+                e.uuid,
+                (e.base_x, e.base_y, e.base_z),
+                e.yaw,
+                e.pitch,
+                e.head,
+            ),
+        );
+    }
+
+    // Announce the newcomer to everyone already here: tab entry, then spawn.
+    // Best-effort: if an existing player's outbox is momentarily full the send is
+    // dropped and that client won't see the newcomer until a reconciling per-
+    // player tracker exists (still pending — see ROADMAP). Acceptable while the
+    // outbox is sized comfortably above a join burst.
+    let newcomer_info = packets::player_info_update(&[packets::PlayerEntry {
+        uuid: id,
+        name: name.clone(),
+    }]);
+    let newcomer_spawn = packets::add_entity(entity_id, id, (sx, sy, sz), 0, 0, 0);
+    for e in &existing {
+        let _ = e.outbox.try_send(Outbound::Packet(newcomer_info.clone()));
+        let _ = e.outbox.try_send(Outbound::Packet(newcomer_spawn.clone()));
+    }
+
     let entity = world
         .spawn((
             PlayerId(id),
@@ -96,6 +182,17 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
                 yaw: 0.0,
                 pitch: 0.0,
                 on_ground: false,
+            },
+            Tracking {
+                base_x: sx,
+                base_y: sy,
+                base_z: sz,
+                yaw: 0,
+                pitch: 0,
+                head: 0,
+                on_ground: false,
+                teleport_delay: 0,
+                tick_count: 0,
             },
             Conn { outbox },
             KeepAlive {
@@ -146,9 +243,17 @@ fn send_join_sequence(
 fn on_left(world: &mut World, id: Uuid) {
     let entity = world.resource_mut::<PlayerIndex>().0.remove(&id);
     if let Some(e) = entity {
-        let name = world.get::<Profile>(e).map(|p| p.name.clone());
+        let profile = world.get::<Profile>(e).map(|p| (p.name.clone(), p.entity_id));
         world.despawn(e);
-        if let Some(name) = name {
+        if let Some((name, entity_id)) = profile {
+            // Drop the leaver from every remaining client's tab list and world.
+            let info_remove = packets::player_info_remove(&[id]);
+            let despawn = packets::remove_entities(&[entity_id]);
+            let mut q = world.query::<&Conn>();
+            for conn in q.iter(world) {
+                let _ = conn.outbox.try_send(Outbound::Packet(info_remove.clone()));
+                let _ = conn.outbox.try_send(Outbound::Packet(despawn.clone()));
+            }
             info!(%name, "left");
         }
     }
@@ -226,6 +331,138 @@ fn on_command(world: &mut World, sender: Entity, line: &str) {
     let bytes = packets::system_chat_component(&reply);
     if let Some(conn) = world.get::<Conn>(sender) {
         let _ = conn.outbox.try_send(Outbound::Packet(bytes));
+    }
+}
+
+/// Broadcast each player's movement to everyone else, following vanilla's
+/// `ServerEntity.sendChanges` for the player case: every `UPDATE_INTERVAL` ticks
+/// pick the cheapest packet that conveys the change (a position and/or rotation
+/// delta), fall back to an absolute resync when a delta won't do, and send head
+/// yaw separately. Deltas are relative to each entity's last-sent `Tracking`
+/// base, which is advanced only for the fields actually sent.
+pub fn broadcast_movement(world: &mut World) {
+    // Phase 1: decide each player's packets and advance their tracking state.
+    let mut pending: Vec<(Entity, Vec<bytes::Bytes>)> = Vec::new();
+    {
+        let mut q = world.query::<(Entity, &Profile, &Pos, &mut Tracking)>();
+        for (entity, profile, pos, mut t) in q.iter_mut(world) {
+            let mut packets = Vec::new();
+            let eid = profile.entity_id;
+
+            if t.tick_count % UPDATE_INTERVAL == 0 {
+                t.teleport_delay += 1;
+
+                let yaw_n = packets::pack_angle(pos.yaw);
+                let pitch_n = packets::pack_angle(pos.pitch);
+                let send_rotation = (yaw_n as i32 - t.yaw as i32).abs() >= 1
+                    || (pitch_n as i32 - t.pitch as i32).abs() >= 1;
+
+                let dx = pos.x - t.base_x;
+                let dy = pos.y - t.base_y;
+                let dz = pos.z - t.base_z;
+                let position_changed = dx * dx + dy * dy + dz * dz >= 7.629_394_5e-6;
+                // A forced position resend every 60 ticks corrects rounding drift
+                // (vanilla `flag2 = flag1 || this.tickCount % 60 == 0`).
+                let send_position = position_changed || t.tick_count % 60 == 0;
+
+                let xa = packets::enc(pos.x) - packets::enc(t.base_x);
+                let ya = packets::enc(pos.y) - packets::enc(t.base_y);
+                let za = packets::enc(pos.z) - packets::enc(t.base_z);
+                let delta_too_big = !(-32768..=32767).contains(&xa)
+                    || !(-32768..=32767).contains(&ya)
+                    || !(-32768..=32767).contains(&za);
+
+                let mut sent_position = false;
+                let mut sent_rotation = false;
+
+                if delta_too_big || t.teleport_delay > 400 || t.on_ground != pos.on_ground {
+                    // A relative delta won't do: resync absolutely.
+                    t.on_ground = pos.on_ground;
+                    t.teleport_delay = 0;
+                    packets.push(packets::entity_position_sync(
+                        eid, pos.x, pos.y, pos.z, pos.yaw, pos.pitch, pos.on_ground,
+                    ));
+                    sent_position = true;
+                    sent_rotation = true;
+                } else if !send_position || !send_rotation {
+                    if send_position {
+                        packets.push(packets::move_entity_pos(
+                            eid,
+                            xa as i16,
+                            ya as i16,
+                            za as i16,
+                            pos.on_ground,
+                        ));
+                        sent_position = true;
+                    } else if send_rotation {
+                        packets.push(packets::move_entity_rot(
+                            eid,
+                            yaw_n,
+                            pitch_n,
+                            pos.on_ground,
+                        ));
+                        sent_rotation = true;
+                    }
+                } else {
+                    packets.push(packets::move_entity_pos_rot(
+                        eid,
+                        xa as i16,
+                        ya as i16,
+                        za as i16,
+                        yaw_n,
+                        pitch_n,
+                        pos.on_ground,
+                    ));
+                    sent_position = true;
+                    sent_rotation = true;
+                }
+
+                if sent_position {
+                    t.base_x = pos.x;
+                    t.base_y = pos.y;
+                    t.base_z = pos.z;
+                }
+                if sent_rotation {
+                    t.yaw = yaw_n;
+                    t.pitch = pitch_n;
+                }
+
+                // Head yaw is independent of the body yaw in general, but we
+                // don't model a separate body yaw, so it reuses the packed look
+                // yaw the move packets already carry.
+                let head_n = yaw_n;
+                if (head_n as i32 - t.head as i32).abs() >= 1 {
+                    packets.push(packets::rotate_head(eid, head_n));
+                    t.head = head_n;
+                }
+            }
+
+            t.tick_count = t.tick_count.wrapping_add(1);
+
+            if !packets.is_empty() {
+                pending.push((entity, packets));
+            }
+        }
+    }
+
+    if pending.is_empty() {
+        return;
+    }
+
+    // Phase 2: fan each player's packets out to every other connection.
+    let conns: Vec<(Entity, OutboxTx)> = {
+        let mut q = world.query::<(Entity, &Conn)>();
+        q.iter(world).map(|(e, c)| (e, c.outbox.clone())).collect()
+    };
+    for (sender, packets) in pending {
+        for (entity, outbox) in &conns {
+            if *entity == sender {
+                continue;
+            }
+            for pkt in &packets {
+                let _ = outbox.try_send(Outbound::Packet(pkt.clone()));
+            }
+        }
     }
 }
 

@@ -21,10 +21,8 @@ pub struct PlayerId(pub Uuid);
 #[derive(Component)]
 pub struct Profile {
     pub name: String,
-    // Assigned at join and sent in the play-login packet. Read once entities are
-    // tracked across players (AddEntity/RemoveEntities); held now so the id
-    // space is owned in one place.
-    #[allow(dead_code)]
+    // Assigned at join, sent in the play-login packet, and used as the entity id
+    // when this player is spawned for / moved on other players' clients.
     pub entity_id: i32,
 }
 
@@ -37,6 +35,29 @@ pub struct Pos {
     pub yaw: f32,
     pub pitch: f32,
     pub on_ground: bool,
+}
+
+/// Per-entity broadcast state, mirroring vanilla's `ServerEntity`: the position
+/// and rotation last *sent* to tracking players. Movement packets carry deltas
+/// relative to this base, and every observer shares one delta stream — so a
+/// late observer's `AddEntity` is seeded from here to stay in sync.
+#[derive(Component)]
+pub struct Tracking {
+    /// Last-sent position base (vanilla `VecDeltaCodec` base). Packet deltas are
+    /// `round(cur * 4096) - round(base * 4096)`.
+    pub base_x: f64,
+    pub base_y: f64,
+    pub base_z: f64,
+    /// Last-sent packed angles (`Mth.packDegrees`: signed bytes).
+    pub yaw: i8,
+    pub pitch: i8,
+    pub head: i8,
+    /// Last-sent on-ground flag; a change forces a full position sync.
+    pub on_ground: bool,
+    /// Ticks since the last forced full sync (vanilla `teleportDelay`).
+    pub teleport_delay: u32,
+    /// Per-entity tick counter gating broadcast cadence (vanilla `tickCount`).
+    pub tick_count: u32,
 }
 
 /// The egress side of a player's connection — how the sim talks back. Cheap to

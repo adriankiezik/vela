@@ -93,8 +93,8 @@ marked accordingly.
 
 - `XL` — **Entity base + type registry** (~120 entity types): id, bounding box, tracking
 - `L` — **Entity metadata / data-syncher** (`network/syncher` — `SynchedEntityData`, `SetEntityData`)
-- `L` — **Entity spawn/remove/track**: `AddEntity`, `RemoveEntities`, per-player entity tracker with view distance
-- `M` — **Entity movement packets**: `MoveEntityPos/Rot/PosRot`, `TeleportEntity`, `EntityVelocity`, `SetEntityMotion`, `HeadRotation`
+- `L` — `[partial]` **Entity spawn/remove/track**: `AddEntity` (players, type `minecraft:player`) + `RemoveEntities` on join/leave. Every player tracks every other — correct here, since the whole world sits well inside the 32-chunk player tracking range. Per-player view-distance culling / dynamic add-remove on movement still pending
+- `M` — `[partial]` **Entity movement packets**: `MoveEntityPos/Rot/PosRot` + `RotateHead` + `EntityPositionSync` (absolute resync fallback), broadcast per tick via a 1:1 port of `ServerEntity.sendChanges` (update interval 2, `VecDeltaCodec` deltas, on-ground-flip / >8-block / 400-tick resync). `TeleportEntity`/`SetEntityMotion`/velocity pending (player velocity not modelled yet, so it stays zero)
 - `M` — **Entity events / status / animations**: `EntityEvent`, `Animate`, `HurtAnimation`, `TakeItemEntity`
 - `M` — **Equipment & passengers**: `SetEquipment`, `SetPassengers`, `SetEntityLink` (leash)
 - `M` — **Attributes** (`world/attribute` — `UpdateAttributes`)
@@ -106,8 +106,8 @@ marked accordingly.
 ## Player
 
 - `M` — **Player entity + `GameProfile`** (skin/properties from auth or offline)
-- `M` — **Player list** (`PlayerInfoUpdate`/`Remove`, tab list header/footer)
-- `M` — **Movement handling (serverbound)**: `MovePlayerPos/Rot/PosRot/StatusOnly`, validation, `AcceptTeleportation`
+- `M` — `[partial]` **Player list** (`PlayerInfoUpdate`/`Remove`): tab entries added on join (ADD_PLAYER + game mode + listed + latency) and removed on leave. Offline profiles (no skin properties), no header/footer or display-name/list-order yet
+- `M` — `[partial]` **Movement handling (serverbound)**: `MovePlayerPos/Rot/PosRot/StatusOnly` decoded and applied; `AcceptTeleportation` handled; the result is rebroadcast to other players. Server-side validation (move speed / clipping) still pending
 - `M` — **Player actions**: `PlayerAction` (dig), `UseItem`, `UseItemOn`, `SwingArm`, `PlayerCommand` (sneak/sprint), `Interact`
 - `M` — **Abilities & game mode**: `PlayerAbilities`, `GameMode` change, flying/creative
 - `M` — **Health / food / damage**: `SetHealth`, `DamageEvent`, death + `Respawn`, combat
