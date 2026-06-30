@@ -321,13 +321,13 @@ pub fn entity_position_sync(
     frame(CB_PLAY_ENTITY_POSITION_SYNC, &p.buf)
 }
 
-/// A flat chunk column: bedrock floor, dirt fill, grass surface at y=63, air
-/// above. The block data and heightmaps come from `crate::world` (identical for
-/// every column). Light is still sent empty — without a real light engine the
-/// client falls back to full brightness, which is fine for a flat world.
+/// A generated chunk column: bedrock floor, stone fill, dirt + grass surface
+/// following the noise heightmap, air above. The block data and heightmaps come
+/// from `crate::world` and vary per chunk `(cx, cz)`. Light is still sent empty
+/// — without a real light engine the client falls back to full brightness.
 pub fn flat_chunk(cx: i32, cz: i32) -> Bytes {
-    let section_data = crate::world::flat_column_blob();
-    let heightmaps = crate::world::flat_heightmaps();
+    let section_data = crate::world::column_blob(cx, cz);
+    let heightmaps = crate::world::heightmaps(cx, cz);
 
     let mut p = PacketWriter::new();
     p.write_i32(cx);
@@ -335,7 +335,7 @@ pub fn flat_chunk(cx: i32, cz: i32) -> Bytes {
     // --- ClientboundLevelChunkPacketData ---
     // Heightmaps: a map of type-id -> packed long[] (ByteBufCodecs.map + LONG_ARRAY).
     p.write_varint(heightmaps.len() as i32);
-    for (type_id, longs) in heightmaps {
+    for (type_id, longs) in &heightmaps {
         p.write_varint(*type_id);
         p.write_varint(longs.len() as i32);
         for &l in longs {
@@ -343,7 +343,7 @@ pub fn flat_chunk(cx: i32, cz: i32) -> Bytes {
         }
     }
     p.write_varint(section_data.len() as i32); // section blob length
-    p.write_bytes(section_data);
+    p.write_bytes(&section_data);
     p.write_varint(0); // block entities: none
     // --- ClientboundLightUpdatePacketData --- (four empty BitSets, two empty lists)
     p.write_varint(0); // sky-light mask
