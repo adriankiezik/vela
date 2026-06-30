@@ -15,6 +15,7 @@ use crate::protocol::framing::frame;
 use crate::protocol::nbt::{write_network, Nbt};
 
 const CB_PLAY_ADD_ENTITY: i32 = 1;
+const CB_PLAY_ANIMATE: i32 = 2;
 const CB_PLAY_ENTITY_POSITION_SYNC: i32 = 35;
 const CB_PLAY_GAME_EVENT: i32 = 38;
 const CB_PLAY_KEEP_ALIVE: i32 = 44;
@@ -29,6 +30,7 @@ const CB_PLAY_PLAYER_POSITION: i32 = 72;
 const CB_PLAY_REMOVE_ENTITIES: i32 = 77;
 const CB_PLAY_ROTATE_HEAD: i32 = 83;
 const CB_PLAY_SET_CHUNK_CACHE_CENTER: i32 = 94;
+const CB_PLAY_SET_ENTITY_DATA: i32 = 99;
 const CB_PLAY_SYSTEM_CHAT: i32 = 121;
 
 /// `minecraft:player` network id — index 156 in the (alphabetical) entity-type
@@ -321,6 +323,74 @@ pub fn entity_position_sync(
     frame(CB_PLAY_ENTITY_POSITION_SYNC, &p.buf)
 }
 
+/// `ClientboundAnimatePacket.SWING_MAIN_HAND` — the main-arm swing action byte.
+pub const ANIMATE_SWING_MAIN_HAND: u8 = 0;
+/// `ClientboundAnimatePacket.SWING_OFF_HAND` — the off-hand swing action byte.
+pub const ANIMATE_SWING_OFF_HAND: u8 = 3;
+
+/// ClientboundAnimatePacket — play a one-shot animation on an entity for every
+/// viewer. `entity_id` is a VarInt; `action` is an unsigned byte (vanilla
+/// `readUnsignedByte`): 0 = swing main hand, 3 = swing off hand, 2 = wake up,
+/// 4 = critical hit, 5 = magic critical hit.
+pub fn animate(entity_id: i32, action: u8) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(entity_id);
+    p.write_u8(action);
+    frame(CB_PLAY_ANIMATE, &p.buf)
+}
+
+// --- Entity metadata (`ClientboundSetEntityDataPacket`) wire constants ---
+// Accessor ids from `Entity.defineId` order: DATA_SHARED_FLAGS_ID = 0 (Byte),
+// DATA_POSE = 6 (Pose).
+const DATA_SHARED_FLAGS_ID: u8 = 0;
+const DATA_POSE: u8 = 6;
+// `EntityDataSerializers` registration order gives the serializer type ids:
+// BYTE = 0 (first registered), POSE = 20.
+const ENTITY_DATA_SERIALIZER_BYTE: i32 = 0;
+const ENTITY_DATA_SERIALIZER_POSE: i32 = 20;
+// Shared-flags bit positions (vanilla `1 << FLAG_*`): SHIFT_KEY_DOWN = bit 1,
+// SPRINTING = bit 3.
+const SHARED_FLAG_CROUCHING: u8 = 1 << 1; // 0x02
+const SHARED_FLAG_SPRINTING: u8 = 1 << 3; // 0x08
+// `Pose` ordinals (== id()): STANDING = 0, CROUCHING = 5.
+const POSE_STANDING: i32 = 0;
+const POSE_CROUCHING: i32 = 5;
+/// `ClientboundSetEntityDataPacket.EOF_MARKER` — the index byte that terminates
+/// the packed metadata list.
+const ENTITY_DATA_EOF: u8 = 0xFF;
+
+/// ClientboundSetEntityDataPacket — sync a player's action metadata to viewers.
+/// Layout: `entity_id` (VarInt), then packed `DataValue`s — each `index` (u8) +
+/// `serializer_type_id` (VarInt) + value — terminated by the index `0xFF`.
+///
+/// We emit two entries: the shared-flags byte (index 0, `Byte` serializer) with
+/// bit 0x02 = crouching and bit 0x08 = sprinting, and the pose (index 6, `Pose`
+/// serializer, a VarInt id) set to CROUCHING while sneaking else STANDING.
+pub fn set_entity_data(entity_id: i32, sneaking: bool, sprinting: bool) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(entity_id);
+
+    // DATA_SHARED_FLAGS_ID (Byte): crouching + sprinting bits.
+    let mut flags = 0u8;
+    if sneaking {
+        flags |= SHARED_FLAG_CROUCHING;
+    }
+    if sprinting {
+        flags |= SHARED_FLAG_SPRINTING;
+    }
+    p.write_u8(DATA_SHARED_FLAGS_ID);
+    p.write_varint(ENTITY_DATA_SERIALIZER_BYTE);
+    p.write_u8(flags);
+
+    // DATA_POSE (Pose): crouching while sneaking, else standing.
+    p.write_u8(DATA_POSE);
+    p.write_varint(ENTITY_DATA_SERIALIZER_POSE);
+    p.write_varint(if sneaking { POSE_CROUCHING } else { POSE_STANDING });
+
+    p.write_u8(ENTITY_DATA_EOF); // end of metadata list
+    frame(CB_PLAY_SET_ENTITY_DATA, &p.buf)
+}
+
 /// A flat chunk column: bedrock floor, dirt fill, grass surface at y=63, air
 /// above. The block data and heightmaps come from `crate::world` (identical for
 /// every column). Light is still sent empty — without a real light engine the
@@ -443,6 +513,46 @@ mod tests {
         assert_eq!(r.read_varint().unwrap(), 2);
         assert_eq!(r.read_varint().unwrap(), 3);
         assert_eq!(r.read_varint().unwrap(), 5);
+    }
+
+    #[test]
+    fn animate_layout() {
+        let (id, mut r) = unframe(animate(7, ANIMATE_SWING_OFF_HAND));
+        assert_eq!(id, CB_PLAY_ANIMATE);
+        assert_eq!(r.read_varint().unwrap(), 7); // entity id
+        assert_eq!(r.read_u8().unwrap(), 3); // action = swing off hand
+    }
+
+    #[test]
+    fn set_entity_data_standing_layout() {
+        // Neither flag set: flags byte 0, pose STANDING.
+        let (id, mut r) = unframe(set_entity_data(7, false, false));
+        assert_eq!(id, CB_PLAY_SET_ENTITY_DATA);
+        assert_eq!(r.read_varint().unwrap(), 7); // entity id
+        // Shared flags entry: index 0, serializer BYTE (0), value 0.
+        assert_eq!(r.read_u8().unwrap(), 0); // DATA_SHARED_FLAGS_ID
+        assert_eq!(r.read_varint().unwrap(), 0); // serializer BYTE
+        assert_eq!(r.read_u8().unwrap(), 0); // no bits set
+        // Pose entry: index 6, serializer POSE (20), value STANDING (0).
+        assert_eq!(r.read_u8().unwrap(), 6); // DATA_POSE
+        assert_eq!(r.read_varint().unwrap(), 20); // serializer POSE
+        assert_eq!(r.read_varint().unwrap(), 0); // STANDING
+        assert_eq!(r.read_u8().unwrap(), 0xFF); // EOF terminator
+    }
+
+    #[test]
+    fn set_entity_data_sneaking_and_sprinting_layout() {
+        // Both flags: byte has 0x02 | 0x08 = 0x0A, pose CROUCHING (5).
+        let (id, mut r) = unframe(set_entity_data(42, true, true));
+        assert_eq!(id, CB_PLAY_SET_ENTITY_DATA);
+        assert_eq!(r.read_varint().unwrap(), 42);
+        assert_eq!(r.read_u8().unwrap(), 0); // DATA_SHARED_FLAGS_ID
+        assert_eq!(r.read_varint().unwrap(), 0); // serializer BYTE
+        assert_eq!(r.read_u8().unwrap(), 0x0A); // crouching | sprinting
+        assert_eq!(r.read_u8().unwrap(), 6); // DATA_POSE
+        assert_eq!(r.read_varint().unwrap(), 20); // serializer POSE
+        assert_eq!(r.read_varint().unwrap(), 5); // CROUCHING
+        assert_eq!(r.read_u8().unwrap(), 0xFF); // EOF terminator
     }
 
     #[test]

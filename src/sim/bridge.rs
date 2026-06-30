@@ -59,4 +59,17 @@ pub enum Serverbound {
     ChatCommand(String),
     KeepAlive(i64),
     AcceptTeleport(i32),
+    /// `ServerboundSwingPacket` — an arm swing. `hand` is the `InteractionHand`
+    /// ordinal (0 = main hand, 1 = off hand).
+    Swing { hand: i32 },
+    /// `ServerboundPlayerCommandPacket` — a player state action. `action` is the
+    /// `Action` enum ordinal (26.2: 0 STOP_SLEEPING, 1 START_SPRINTING,
+    /// 2 STOP_SPRINTING, 3 START_RIDING_JUMP, 4 STOP_RIDING_JUMP,
+    /// 5 OPEN_INVENTORY, 6 START_FALL_FLYING). The leading entity id (the
+    /// sender's own) and the trailing `data` argument are dropped on decode —
+    /// none of the actions we currently act on use them.
+    PlayerCommand { action: i32 },
+    /// `ServerboundPlayerAbilitiesPacket` — the client's abilities bitset. Only
+    /// the flying bit (0x02) is meaningful serverbound.
+    PlayerAbilities { flags: u8 },
 }

@@ -60,6 +60,25 @@ pub struct Tracking {
     pub tick_count: u32,
 }
 
+/// Player action state mirrored to other clients as entity metadata
+/// (vanilla `SynchedEntityData`). `sneaking` and `sprinting` drive the shared-
+/// flags byte (`Entity.DATA_SHARED_FLAGS_ID`) and the pose (`Entity.DATA_POSE`)
+/// sent via `ClientboundSetEntityDataPacket`; `flying` records the abilities
+/// flag (stored only — no clientbound echo yet).
+///
+/// Note: in 26.2 the client no longer reports crouch via
+/// `ServerboundPlayerCommandPacket` (the `PRESS/RELEASE_SHIFT_KEY` actions were
+/// removed in 1.21.2 — sneak now travels in `ServerboundPlayerInputPacket`), so
+/// `sneaking` has no serverbound trigger yet; the metadata plumbing is in place
+/// for when that packet is wired up. `sprinting` is driven by
+/// `ServerboundPlayerCommandPacket`'s `START/STOP_SPRINTING`.
+#[derive(Component, Default)]
+pub struct Meta {
+    pub sneaking: bool,
+    pub sprinting: bool,
+    pub flying: bool,
+}
+
 /// The egress side of a player's connection — how the sim talks back. Cheap to
 /// hold: a `tokio` mpsc sender.
 #[derive(Component)]
