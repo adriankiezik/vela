@@ -34,8 +34,7 @@ use crate::protocol::buffer::PacketWriter;
 use crate::protocol::framing::frame;
 use crate::protocol::nbt::Nbt;
 
-use super::components::{PlayerId, Profile};
-use super::packets::MAX_PLAYERS;
+use super::components::{Config, PlayerId, Profile};
 use super::text;
 
 /// `ClientboundCommandsPacket` — registration index in the decompiled 26.2
@@ -296,6 +295,9 @@ fn cmd_seed(_world: &mut World, _sender: Entity, _args: &str) -> Nbt {
 /// each player's UUID as `name (uuid)`, mirroring `commands.list.nameAndId`.
 fn cmd_list(world: &mut World, _sender: Entity, args: &str) -> Nbt {
     let with_uuids = args.split_whitespace().next() == Some("uuids");
+    // The advertised max comes from `server.properties` (same source the join
+    // packet uses), read before the player query takes its mutable borrow.
+    let max = world.resource::<Config>().join_params().max_players;
     let mut q = world.query::<(&Profile, &PlayerId)>();
     let names: Vec<String> = q
         .iter(world)
@@ -311,7 +313,7 @@ fn cmd_list(world: &mut World, _sender: Entity, args: &str) -> Nbt {
         "commands.list.players",
         vec![
             text::text(names.len().to_string()),
-            text::text(MAX_PLAYERS.to_string()),
+            text::text(max.to_string()),
             text::text(names.join(", ")),
         ],
     )

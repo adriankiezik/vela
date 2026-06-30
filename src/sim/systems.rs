@@ -72,11 +72,12 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
         v
     };
     let (sx, sy, sz) = SPAWN;
+    let join = world.resource::<Config>().join_params();
 
     // The whole join sequence flows through the outbox. If it overflows mid-burst
     // (slow or hostile client) drop the connection rather than register a player
     // who never received the world.
-    if !send_join_sequence(&outbox, entity_id, sx, sy, sz) {
+    if !send_join_sequence(&outbox, entity_id, sx, sy, sz, &join) {
         warn!(%name, "outbox full during join sequence; dropping");
         let _ = outbox.try_send(Outbound::Close);
         return;
@@ -110,8 +111,15 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
 /// Build and push the join sequence. Ordering matters: the GameEvent puts the
 /// client in its "waiting for chunks" state, the chunks satisfy that wait, then
 /// the teleport settles the player. Returns `false` if any send fails.
-fn send_join_sequence(outbox: &OutboxTx, entity_id: i32, sx: f64, sy: f64, sz: f64) -> bool {
-    let mut ok = send(outbox, packets::play_login(entity_id));
+fn send_join_sequence(
+    outbox: &OutboxTx,
+    entity_id: i32,
+    sx: f64,
+    sy: f64,
+    sz: f64,
+    join: &packets::JoinParams,
+) -> bool {
+    let mut ok = send(outbox, packets::play_login(entity_id, join));
     // Advertise the command tree right after login so the client highlights and
     // tab-completes our commands as it would against a vanilla server.
     ok &= send(outbox, commands::commands_packet());
@@ -120,8 +128,11 @@ fn send_join_sequence(outbox: &OutboxTx, entity_id: i32, sx: f64, sy: f64, sz: f
         packets::game_event(packets::GAME_EVENT_LEVEL_CHUNKS_LOAD_START, 0.0),
     );
     ok &= send(outbox, packets::set_chunk_center(0, 0));
-    for cx in -packets::VIEW_RADIUS..=packets::VIEW_RADIUS {
-        for cz in -packets::VIEW_RADIUS..=packets::VIEW_RADIUS {
+    // Stream exactly the advertised view distance of chunks so the client's
+    // "Loading terrain" wait is fully satisfied.
+    let radius = join.view_distance;
+    for cx in -radius..=radius {
+        for cz in -radius..=radius {
             ok &= send(outbox, packets::flat_chunk(cx, cz));
         }
     }

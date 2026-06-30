@@ -14,9 +14,6 @@ use crate::protocol::framing::frame;
 use crate::protocol::nbt::{write_network, Nbt};
 
 const CB_PLAY_GAME_EVENT: i32 = 38;
-/// Max players we advertise in the join packet and report from `/list`. One
-/// source of truth so the two never disagree.
-pub const MAX_PLAYERS: i32 = 42;
 const CB_PLAY_KEEP_ALIVE: i32 = 44;
 const CB_PLAY_LEVEL_CHUNK: i32 = 45;
 const CB_PLAY_LOGIN: i32 = 49;
@@ -24,30 +21,39 @@ const CB_PLAY_PLAYER_POSITION: i32 = 72;
 const CB_PLAY_SET_CHUNK_CACHE_CENTER: i32 = 94;
 const CB_PLAY_SYSTEM_CHAT: i32 = 121;
 
-/// `GameType.SURVIVAL` — the player drops onto the flat world's grass surface
-/// and stands on it (client-side collision against the chunk data we stream).
-const GAME_TYPE_SURVIVAL: u8 = 0;
 /// `ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START` — tells the client to
 /// begin waiting for chunks; the "Loading terrain" screen clears once the
 /// chunks around the player arrive.
 pub const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
 
-/// Render/simulation radius we advertise. We send exactly this radius of
-/// chunks, so the client's terrain wait is fully satisfied.
-pub const VIEW_RADIUS: i32 = 5;
+/// The join parameters drawn from `server.properties`. The simulation builds one
+/// from the loaded config and hands it to [`play_login`] and the chunk-streaming
+/// loop, so the advertised view distance and the number of chunks we actually
+/// send stay in lockstep.
+#[derive(Clone, Copy)]
+pub struct JoinParams {
+    pub max_players: i32,
+    pub view_distance: i32,
+    pub simulation_distance: i32,
+    pub hardcore: bool,
+    pub online_mode: bool,
+    /// Default game mode as a wire id (0=survival … 3=spectator).
+    pub game_type: u8,
+}
 
 /// ClientboundLogin — the play "join game" packet. Spawns into a single
-/// overworld dimension in spectator mode. `entity_id` is the player's own
-/// entity id, assigned by the world.
-pub fn play_login(entity_id: i32) -> Bytes {
+/// overworld dimension. `entity_id` is the player's own entity id, assigned by
+/// the world; the rest of the join shape comes from `server.properties` via
+/// [`JoinParams`].
+pub fn play_login(entity_id: i32, p_in: &JoinParams) -> Bytes {
     let mut p = PacketWriter::new();
     p.write_i32(entity_id); // entity id
-    p.write_bool(false); // hardcore
+    p.write_bool(p_in.hardcore); // hardcore
     p.write_varint(1); // levels: 1 dimension
     p.write_identifier("minecraft:overworld");
-    p.write_varint(MAX_PLAYERS); // max players
-    p.write_varint(VIEW_RADIUS); // view distance
-    p.write_varint(VIEW_RADIUS); // simulation distance
+    p.write_varint(p_in.max_players); // max players
+    p.write_varint(p_in.view_distance); // view distance
+    p.write_varint(p_in.simulation_distance); // simulation distance
     p.write_bool(false); // reduced debug info
     p.write_bool(true); // show death screen
     p.write_bool(false); // limited crafting
@@ -55,14 +61,14 @@ pub fn play_login(entity_id: i32) -> Bytes {
     p.write_varint(1); // dimensionType holder: overworld is registry index 0 -> id+1
     p.write_identifier("minecraft:overworld"); // dimension
     p.write_i64(0); // seed (hashed, cosmetic)
-    p.write_u8(GAME_TYPE_SURVIVAL); // game type
+    p.write_u8(p_in.game_type); // game type
     p.write_u8(0xFF); // previous game type = -1 (none)
     p.write_bool(false); // is debug
     p.write_bool(true); // is flat (renders a flat horizon/fog)
     p.write_bool(false); // last death location: absent
     p.write_varint(0); // portal cooldown
     p.write_varint(63); // sea level
-    p.write_bool(false); // online mode (offline)
+    p.write_bool(p_in.online_mode); // online mode
     p.write_bool(false); // enforces secure chat
     frame(CB_PLAY_LOGIN, &p.buf)
 }

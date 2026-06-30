@@ -6,6 +6,7 @@
 //!
 //! The network layer owns sockets; the simulation owns game state.
 
+mod config;
 mod net;
 mod protocol;
 mod registries;
@@ -13,10 +14,14 @@ mod registry_tags;
 mod sim;
 mod world;
 
+use std::sync::Arc;
+
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+use config::ServerConfig;
 
 /// Ingress channel depth — packets from all connections funnel through here and
 /// the sim drains the whole queue each tick, so this only needs to cover one
@@ -30,17 +35,31 @@ async fn main() -> std::io::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    let addr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "0.0.0.0:25565".to_string());
+    // Load server.properties / eula.txt / player lists / server-icon.png from the
+    // working directory, creating files as vanilla does. A return of `None` means
+    // the EULA is not agreed: vanilla logs and exits here, so we do the same.
+    let config = match ServerConfig::load_from_cwd() {
+        Some(config) => Arc::new(config),
+        None => return Ok(()),
+    };
+
+    // The bind address comes from `server-ip`/`server-port`, but an explicit
+    // command-line argument (used by the integration test and for ad-hoc runs)
+    // overrides it.
+    let addr = std::env::args().nth(1).unwrap_or_else(|| {
+        let ip = config.properties.server_ip();
+        let host = if ip.is_empty() { "0.0.0.0" } else { ip };
+        format!("{host}:{}", config.properties.server_port())
+    });
 
     // The simulation owns all game state and runs on its own OS thread (it is
     // CPU-bound and synchronous — not a tokio worker). Every connection holds a
     // clone of `to_sim` to deliver its decoded packets.
     let (to_sim, sim_rx) = mpsc::channel(INGRESS_CAP);
+    let sim_config = Arc::clone(&config);
     std::thread::Builder::new()
         .name("vela-sim".to_string())
-        .spawn(move || sim::run(sim_rx))
+        .spawn(move || sim::run(sim_rx, sim_config))
         .expect("spawn simulation thread");
 
     let listener = TcpListener::bind(&addr).await?;
@@ -63,8 +82,9 @@ async fn main() -> std::io::Result<()> {
         };
         stream.set_nodelay(true).ok();
         let to_sim = to_sim.clone();
+        let config = Arc::clone(&config);
         tokio::spawn(async move {
-            if let Err(e) = net::handle(stream, peer, to_sim).await {
+            if let Err(e) = net::handle(stream, peer, to_sim, config).await {
                 error!(%peer, error = %e, "connection error");
             }
         });

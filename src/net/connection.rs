@@ -11,6 +11,8 @@
 //! run inline here and write straight to the stream. Once the client reaches
 //! Play, `play::play` takes over and bridges the connection to the simulation.
 
+use std::sync::Arc;
+
 use serde::Serialize;
 use tokio::io::{self, AsyncWrite};
 use tokio::net::TcpStream;
@@ -18,6 +20,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::config::ServerConfig;
 use crate::protocol::buffer::PacketWriter;
 use crate::protocol::uuid::offline_uuid;
 use crate::protocol::{Intent, State, PROTOCOL_VERSION, VERSION_NAME};
@@ -51,6 +54,7 @@ pub async fn handle(
     mut stream: TcpStream,
     peer: std::net::SocketAddr,
     to_sim: mpsc::Sender<ToSim>,
+    config: Arc<ServerConfig>,
 ) -> io::Result<()> {
     let mut state = State::Handshake;
     let mut profile_name = String::new();
@@ -77,9 +81,14 @@ pub async fn handle(
                 }
             }
 
-            // Status: request -> respond with server list JSON
+            // Status: request -> respond with server list JSON. With
+            // `enable-status=false` vanilla never answers, so we just close.
             (State::Status, 0x00) => {
-                let json = status_json();
+                if !config.properties.enable_status() {
+                    debug!(%peer, "status disabled; closing");
+                    return Ok(());
+                }
+                let json = status_json(&config);
                 let mut w = PacketWriter::new();
                 w.write_utf(&json);
                 send_packet(&mut stream, 0x00, &w.buf).await?;
@@ -241,6 +250,9 @@ struct StatusResponse {
     version: VersionInfo,
     players: Players,
     description: Description,
+    /// `data:image/png;base64,…` from `server-icon.png`; omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    favicon: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -251,7 +263,7 @@ struct VersionInfo {
 
 #[derive(Serialize)]
 struct Players {
-    max: u32,
+    max: i32,
     online: u32,
 }
 
@@ -260,17 +272,22 @@ struct Description {
     text: String,
 }
 
-/// The JSON shown in the multiplayer server list, built from typed structs.
-fn status_json() -> String {
+/// The JSON shown in the multiplayer server list. MOTD, max players, and the
+/// favicon come from the loaded config (`server.properties` / `server-icon.png`).
+fn status_json(config: &ServerConfig) -> String {
     let resp = StatusResponse {
         version: VersionInfo {
             name: format!("Vela {VERSION_NAME}"),
             protocol: PROTOCOL_VERSION,
         },
-        players: Players { max: 42, online: 0 },
-        description: Description {
-            text: "\u{00a7}bVela\u{00a7}r \u{00a7}7- a Rust Minecraft server".to_string(),
+        players: Players {
+            max: config.properties.max_players(),
+            online: 0,
         },
+        description: Description {
+            text: config.properties.motd().to_string(),
+        },
+        favicon: config.favicon.clone(),
     };
     serde_json::to_string(&resp).expect("status serializes")
 }

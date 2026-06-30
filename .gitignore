@@ -13,3 +13,14 @@ CLAUDE.md
 .DS_Store
 .idea/
 .vscode/
+
+# Runtime server config / data artifacts (generated on first run)
+/server.properties
+/eula.txt
+/ops.json
+/whitelist.json
+/banned-players.json
+/banned-ips.json
+/usercache.json
+/server-icon.png
+/world/
