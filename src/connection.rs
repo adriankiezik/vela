@@ -33,6 +33,7 @@ const SB_LOGIN_HELLO: i32 = 0;
 const SB_LOGIN_ACK: i32 = 3;
 
 // --- Configuration ---
+const CB_CFG_CUSTOM_PAYLOAD: i32 = 1;
 const CB_CFG_FINISH: i32 = 3;
 const CB_CFG_REGISTRY_DATA: i32 = 7;
 const CB_CFG_UPDATE_FEATURES: i32 = 12;
@@ -210,9 +211,14 @@ async fn send_login_finished<W: AsyncWrite + Unpin>(
     send_packet(w, CB_LOGIN_FINISHED, &p.buf).await
 }
 
-/// On entering configuration: advertise enabled features and the core known
-/// pack. Registry data follows once the client echoes the known packs back.
+/// On entering configuration: announce the server brand (so the client's F3
+/// debug screen shows "Vela" instead of "null"), advertise enabled features and
+/// the core known pack. Registry data follows once the client echoes the known
+/// packs back. Mirrors vanilla's `startConfiguration`, which sends the brand
+/// first.
 async fn begin_configuration<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
+    send_brand(w).await?;
+
     let mut feats = PacketWriter::new();
     feats.write_varint(registries::ENABLED_FEATURES.len() as i32);
     for f in registries::ENABLED_FEATURES {
@@ -226,6 +232,17 @@ async fn begin_configuration<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()>
     packs.write_utf(registries::KNOWN_PACK_ID);
     packs.write_utf(registries::KNOWN_PACK_VERSION);
     send_packet(w, CB_CFG_SELECT_KNOWN_PACKS, &packs.buf).await
+}
+
+/// ClientboundCustomPayloadPacket carrying a `BrandPayload` on the
+/// `minecraft:brand` channel. The body is the channel identifier followed by a
+/// single UTF string — the brand the client surfaces on its F3 debug screen.
+/// Vanilla sends "vanilla" here; we send "Vela".
+async fn send_brand<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
+    let mut p = PacketWriter::new();
+    p.write_identifier("minecraft:brand");
+    p.write_utf("Vela");
+    send_packet(w, CB_CFG_CUSTOM_PAYLOAD, &p.buf).await
 }
 
 /// One ClientboundRegistryData packet per synced registry. Each entry is its
