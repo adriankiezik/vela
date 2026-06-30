@@ -358,26 +358,22 @@ async fn play(
                         // only the fields the variant actually carries, leaving the
                         // rest at their previous values, mirroring vanilla's
                         // hasPos/hasRot fallbacks.
-                        SB_PLAY_MOVE_PLAYER_POS => {
-                            if let Ok(()) = read_move(&mut reader, true, false, &mut player) {
-                                debug!(%peer, %name, x = player.x, y = player.y, z = player.z, on_ground = player.on_ground, "move pos");
-                            }
-                        }
-                        SB_PLAY_MOVE_PLAYER_POS_ROT => {
-                            if let Ok(()) = read_move(&mut reader, true, true, &mut player) {
-                                debug!(%peer, %name, x = player.x, y = player.y, z = player.z, yaw = player.yaw, pitch = player.pitch, on_ground = player.on_ground, "move pos+rot");
-                            }
-                        }
-                        SB_PLAY_MOVE_PLAYER_ROT => {
-                            if let Ok(()) = read_move(&mut reader, false, true, &mut player) {
-                                debug!(%peer, %name, yaw = player.yaw, pitch = player.pitch, on_ground = player.on_ground, "move rot");
-                            }
-                        }
-                        SB_PLAY_MOVE_PLAYER_STATUS_ONLY => {
-                            if let Ok(()) = read_move(&mut reader, false, false, &mut player) {
-                                debug!(%peer, %name, on_ground = player.on_ground, "move status");
-                            }
-                        }
+                        SB_PLAY_MOVE_PLAYER_POS => match read_move(&mut reader, true, false, &mut player) {
+                            Ok(()) => debug!(%peer, %name, x = player.x, y = player.y, z = player.z, on_ground = player.on_ground, "move pos"),
+                            Err(e) => debug!(%peer, %name, error = %e, "malformed move pos"),
+                        },
+                        SB_PLAY_MOVE_PLAYER_POS_ROT => match read_move(&mut reader, true, true, &mut player) {
+                            Ok(()) => debug!(%peer, %name, x = player.x, y = player.y, z = player.z, yaw = player.yaw, pitch = player.pitch, on_ground = player.on_ground, "move pos+rot"),
+                            Err(e) => debug!(%peer, %name, error = %e, "malformed move pos+rot"),
+                        },
+                        SB_PLAY_MOVE_PLAYER_ROT => match read_move(&mut reader, false, true, &mut player) {
+                            Ok(()) => debug!(%peer, %name, yaw = player.yaw, pitch = player.pitch, on_ground = player.on_ground, "move rot"),
+                            Err(e) => debug!(%peer, %name, error = %e, "malformed move rot"),
+                        },
+                        SB_PLAY_MOVE_PLAYER_STATUS_ONLY => match read_move(&mut reader, false, false, &mut player) {
+                            Ok(()) => debug!(%peer, %name, on_ground = player.on_ground, "move status"),
+                            Err(e) => debug!(%peer, %name, error = %e, "malformed move status"),
+                        },
                         // Abilities, chat, etc. — accepted but not yet acted upon.
                         // Ignoring keeps the connection alive.
                         _ => {}
