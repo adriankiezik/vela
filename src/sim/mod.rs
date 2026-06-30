@@ -7,9 +7,13 @@
 //! `systems`. See `docs/ARCHITECTURE.md`.
 
 pub mod bridge;
+mod chunking;
 mod commands;
 mod components;
+mod movement;
+mod packet_handlers;
 mod packets;
+mod player_lifecycle;
 mod systems;
 mod text;
 mod world_tick;
@@ -51,10 +55,10 @@ pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
             systems::advance_tick,
             systems::drain_ingress,
             world_tick::world_tick,
-            systems::broadcast_movement,
+            movement::broadcast_movement,
             // Dynamic chunk streaming: must run after movement is applied so the
             // loaded-chunk set follows the player's current position this tick.
-            systems::stream_chunks,
+            chunking::stream_chunks,
             systems::keepalive,
         )
             .chain(),

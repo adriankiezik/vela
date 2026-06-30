@@ -15,7 +15,7 @@
 //!
 //! These states are strictly request/response against a single socket, so they
 //! run inline here and write straight to the stream. Once the client reaches
-//! Play, `play::play` takes over and bridges the connection to the simulation.
+//! Play, `play_io::play` takes over and bridges the connection to the simulation.
 
 use std::sync::Arc;
 
@@ -30,11 +30,11 @@ use crate::config::ServerConfig;
 use crate::protocol::buffer::PacketWriter;
 use crate::protocol::uuid::offline_uuid;
 use crate::protocol::{Intent, State, PROTOCOL_VERSION, VERSION_NAME};
-use crate::registries;
+use crate::registry;
 use crate::sim::bridge::ToSim;
 
 use super::frame::{read_frame, send_packet};
-use super::play::play;
+use super::play_io::play;
 
 // --- Login --- (clientbound ids in `LoginProtocols` registration order:
 // disconnect=0, hello=1, login_finished=2, login_compression=3)
@@ -214,17 +214,17 @@ async fn begin_configuration<W: AsyncWrite + Unpin>(
     send_brand(w, compression).await?;
 
     let mut feats = PacketWriter::new();
-    feats.write_varint(registries::ENABLED_FEATURES.len() as i32);
-    for f in registries::ENABLED_FEATURES {
+    feats.write_varint(registry::ENABLED_FEATURES.len() as i32);
+    for f in registry::ENABLED_FEATURES {
         feats.write_identifier(f);
     }
     send_packet(w, CB_CFG_UPDATE_FEATURES, &feats.buf, compression).await?;
 
     let mut packs = PacketWriter::new();
     packs.write_varint(1);
-    packs.write_utf(registries::KNOWN_PACK_NAMESPACE);
-    packs.write_utf(registries::KNOWN_PACK_ID);
-    packs.write_utf(registries::KNOWN_PACK_VERSION);
+    packs.write_utf(registry::KNOWN_PACK_NAMESPACE);
+    packs.write_utf(registry::KNOWN_PACK_ID);
+    packs.write_utf(registry::KNOWN_PACK_VERSION);
     send_packet(w, CB_CFG_SELECT_KNOWN_PACKS, &packs.buf, compression).await
 }
 
@@ -246,7 +246,7 @@ async fn send_registry_data<W: AsyncWrite + Unpin>(
     w: &mut W,
     compression: Option<i32>,
 ) -> io::Result<()> {
-    for (registry_id, entries) in registries::SYNCED {
+    for (registry_id, entries) in registry::SYNCED {
         let mut p = PacketWriter::new();
         p.write_identifier(registry_id);
         p.write_varint(entries.len() as i32);
@@ -262,11 +262,11 @@ async fn send_registry_data<W: AsyncWrite + Unpin>(
 /// ClientboundUpdateTags: a map of registry -> (tag name -> entry ids). Every
 /// tag the client requires must be present or it aborts configuration; the
 /// `minecraft:block` and `minecraft:item` registries carry real member ids
-/// (block / item registry indices), the rest stay empty. See `registry_tags`.
+/// (block / item registry indices), the rest stay empty. See `registry::tags`.
 async fn send_tags<W: AsyncWrite + Unpin>(w: &mut W, compression: Option<i32>) -> io::Result<()> {
     let mut p = PacketWriter::new();
-    p.write_varint(crate::registry_tags::TAGS.len() as i32);
-    for registry in crate::registry_tags::TAGS {
+    p.write_varint(crate::registry::tags::TAGS.len() as i32);
+    for registry in crate::registry::tags::TAGS {
         p.write_identifier(registry.registry);
         p.write_varint(registry.tags.len() as i32);
         for tag in registry.tags {

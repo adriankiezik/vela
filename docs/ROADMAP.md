@@ -185,7 +185,7 @@ fix and were intentionally deferred (nothing silently dropped):
 
 - `S` — **Real tag ids for non-block/item registries** (review **M4**): the
   `entity_type`, `damage_type`, `enchantment`, `game_event`, `fluid`,
-  `point_of_interest_type`, … tags in `registry_tags.rs` are bound with the right
+  `point_of_interest_type`, … tags in `registry/tags.rs` are bound with the right
   *names* but **empty** id lists, because Vela does not yet enumerate those
   registries' member ids. Populate them (same generator approach as block/item)
   once each registry's registration order is enumerated. The block/item tags now

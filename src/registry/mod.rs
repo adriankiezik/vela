@@ -14,6 +14,13 @@
 //! the order sent, and other packets reference entries by that index — e.g. the
 //! spawn `dimension_type` holder and the chunk biome palette both use index 0,
 //! which is why `minecraft:overworld` and `minecraft:badlands` lead their lists.
+//!
+//! The block/item tag bindings sent alongside these registries live in [`tags`],
+//! and the numeric item-id table (a subset of `BuiltInRegistries.ITEM`) lives in
+//! [`item`].
+
+pub mod item;
+pub mod tags;
 
 /// The built-in core data pack we claim to share with the client.
 /// Source: decompiled `SharedConstants` version `26.2`, `BuiltInPackSource.CORE_PACK_INFO`.

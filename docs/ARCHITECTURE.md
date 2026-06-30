@@ -23,12 +23,20 @@ reworked without disturbing the other.
   simulation through channels and otherwise holds no game state.
 - **sim** — owns all game state. A single ECS world advanced on a fixed tick
   (20 per second) on its own thread. Players and other game objects are
-  entities; per-tick behaviour is expressed as systems.
+  entities; per-tick behaviour is expressed as systems. Its state is organized
+  into domain modules behind that one owner — **world** (chunks, terrain,
+  palettes, heightmaps), **inventory** (containers, item stacks), and
+  **registry** (the clean-room static data tables and tags). These are
+  sub-domains of the simulation, not separate layers.
 
 ## Connection lifecycle
 
 A connection is one async task. It carries the client through handshake,
-status/login, and configuration as direct request/response. On entering Play it
+status/login, and configuration as direct request/response. Configuration is
+where static data is synced: the server shares the vanilla core data pack with
+the client and sends each registry (dimension types, biomes, damage types, tags)
+as entry IDs only, letting the client fill the definitions from its own built-in
+copy — so no Mojang registry assets are shipped. On entering Play the connection
 splits in two: one side decodes inbound packets and forwards them to the
 simulation, the other drains an outbox of outbound packets to the socket. The
 connection registers with the simulation once on join and signals once on
@@ -63,4 +71,5 @@ logic evolve independently.
   crates handle plumbing. High-level Minecraft frameworks are out of scope.
 - `bevy_ecs` is used as core ECS only — no rendering, reflection, or math
   features a headless server doesn't need.
-- Offline mode only: no compression or encryption.
+- Offline mode only: no encryption. Packet compression is supported and
+  negotiated mid-Login (zlib above a size threshold).

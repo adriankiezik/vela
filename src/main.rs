@@ -10,8 +10,7 @@ mod config;
 mod inventory;
 mod net;
 mod protocol;
-mod registries;
-mod registry_tags;
+mod registry;
 mod sim;
 mod world;
 
