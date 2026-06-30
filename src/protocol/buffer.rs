@@ -41,7 +41,16 @@ impl PacketReader {
         Ok(self.buf.get_i64())
     }
 
-    #[allow(dead_code)]
+    pub fn read_f32(&mut self) -> std::io::Result<f32> {
+        self.ensure(4)?;
+        Ok(self.buf.get_f32())
+    }
+
+    pub fn read_f64(&mut self) -> std::io::Result<f64> {
+        self.ensure(8)?;
+        Ok(self.buf.get_f64())
+    }
+
     pub fn read_u8(&mut self) -> std::io::Result<u8> {
         self.ensure(1)?;
         Ok(self.buf.get_u8())

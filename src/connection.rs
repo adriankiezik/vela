@@ -52,6 +52,14 @@ const CB_PLAY_PLAYER_POSITION: i32 = 72;
 const CB_PLAY_SET_CHUNK_CACHE_CENTER: i32 = 94;
 const SB_PLAY_ACCEPT_TELEPORTATION: i32 = 0;
 const SB_PLAY_KEEP_ALIVE: i32 = 28;
+const SB_PLAY_MOVE_PLAYER_POS: i32 = 30;
+const SB_PLAY_MOVE_PLAYER_POS_ROT: i32 = 31;
+const SB_PLAY_MOVE_PLAYER_ROT: i32 = 32;
+const SB_PLAY_MOVE_PLAYER_STATUS_ONLY: i32 = 33;
+
+/// `ServerboundMovePlayerPacket.FLAG_ON_GROUND` — bit 0 of the trailing flags
+/// byte the movement packets carry (bit 1 is horizontal collision, ignored).
+const MOVE_FLAG_ON_GROUND: u8 = 1;
 
 /// `GameType.SPECTATOR` — spawns the player floating, so the empty void world
 /// is viewable without fall damage or fighting gravity.
@@ -71,6 +79,19 @@ const VIEW_RADIUS: i32 = 5;
 /// `MAX_PACKET_SIZE` (2 MiB); anything larger is treated as a protocol error
 /// rather than allocated.
 const MAX_FRAME_LEN: i32 = 2 * 1024 * 1024;
+
+/// The player's last-known position and orientation in the world. Updated from
+/// the serverbound movement packets; the server is otherwise authoritative and
+/// does not yet validate or correct these values.
+#[derive(Debug, Clone, Copy)]
+struct PlayerState {
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+    pitch: f32,
+    on_ground: bool,
+}
 
 pub async fn handle(mut stream: TcpStream, peer: std::net::SocketAddr) -> io::Result<()> {
     let mut state = State::Handshake;
@@ -264,6 +285,17 @@ async fn play(
     send_player_position(&mut wr, 1, 0.0, 64.0, 0.0).await?;
     info!(%peer, %name, "play join sequence sent");
 
+    // Track where the client says it is, seeded with the spawn point we just
+    // teleported it to. Movement packets below keep this in sync.
+    let mut player = PlayerState {
+        x: 0.0,
+        y: 64.0,
+        z: 0.0,
+        yaw: 0.0,
+        pitch: 0.0,
+        on_ground: false,
+    };
+
     // Decode frames in a dedicated task over a buffered reader, handing each one
     // to the select loop through a channel. This keeps `read_frame` — which is
     // *not* cancellation-safe (it consumes bytes incrementally) — from ever
@@ -321,8 +353,33 @@ async fn play(
                             let tp = reader.read_varint().unwrap_or(-1);
                             debug!(%peer, teleport_id = tp, "teleport confirmed");
                         }
-                        // Movement, abilities, chat, etc. — accepted but not yet
-                        // acted upon. Ignoring keeps the connection alive.
+                        // Movement packets. Each is a subset of position + rotation
+                        // + a trailing flags byte (on-ground in bit 0). We update
+                        // only the fields the variant actually carries, leaving the
+                        // rest at their previous values, mirroring vanilla's
+                        // hasPos/hasRot fallbacks.
+                        SB_PLAY_MOVE_PLAYER_POS => {
+                            if let Ok(()) = read_move(&mut reader, true, false, &mut player) {
+                                debug!(%peer, %name, x = player.x, y = player.y, z = player.z, on_ground = player.on_ground, "move pos");
+                            }
+                        }
+                        SB_PLAY_MOVE_PLAYER_POS_ROT => {
+                            if let Ok(()) = read_move(&mut reader, true, true, &mut player) {
+                                debug!(%peer, %name, x = player.x, y = player.y, z = player.z, yaw = player.yaw, pitch = player.pitch, on_ground = player.on_ground, "move pos+rot");
+                            }
+                        }
+                        SB_PLAY_MOVE_PLAYER_ROT => {
+                            if let Ok(()) = read_move(&mut reader, false, true, &mut player) {
+                                debug!(%peer, %name, yaw = player.yaw, pitch = player.pitch, on_ground = player.on_ground, "move rot");
+                            }
+                        }
+                        SB_PLAY_MOVE_PLAYER_STATUS_ONLY => {
+                            if let Ok(()) = read_move(&mut reader, false, false, &mut player) {
+                                debug!(%peer, %name, on_ground = player.on_ground, "move status");
+                            }
+                        }
+                        // Abilities, chat, etc. — accepted but not yet acted upon.
+                        // Ignoring keeps the connection alive.
                         _ => {}
                     },
                 }
@@ -332,6 +389,38 @@ async fn play(
 
     reader.abort();
     result
+}
+
+/// Decode a `ServerboundMovePlayerPacket` variant into `player`. The wire layout
+/// is the present fields in order — position (3 doubles) when `has_pos`, rotation
+/// (yaw then pitch, 2 floats) when `has_rot` — followed by a single flags byte
+/// whose bit 0 is the on-ground state. Absent fields keep their prior value.
+fn read_move(
+    reader: &mut PacketReader,
+    has_pos: bool,
+    has_rot: bool,
+    player: &mut PlayerState,
+) -> io::Result<()> {
+    let (mut x, mut y, mut z) = (player.x, player.y, player.z);
+    if has_pos {
+        x = reader.read_f64()?;
+        y = reader.read_f64()?;
+        z = reader.read_f64()?;
+    }
+    let (mut yaw, mut pitch) = (player.yaw, player.pitch);
+    if has_rot {
+        yaw = reader.read_f32()?;
+        pitch = reader.read_f32()?;
+    }
+    let flags = reader.read_u8()?;
+
+    player.x = x;
+    player.y = y;
+    player.z = z;
+    player.yaw = yaw;
+    player.pitch = pitch;
+    player.on_ground = flags & MOVE_FLAG_ON_GROUND != 0;
+    Ok(())
 }
 
 /// ClientboundLogin — the play "join game" packet. Spawns into a single

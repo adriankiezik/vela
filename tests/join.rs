@@ -101,6 +101,45 @@ fn recv(s: &mut TcpStream) -> (i32, Vec<u8>) {
     (id, frame[pos..].to_vec())
 }
 
+/// Like `recv`, but returns `None` on a read error (timeout or closed
+/// connection) instead of panicking. Used to assert the server is still alive.
+fn recv_opt(s: &mut TcpStream) -> Option<(i32, Vec<u8>)> {
+    let mut first = [0u8; 1];
+    if s.read_exact(&mut first).is_err() {
+        return None;
+    }
+    // Re-read the length VarInt starting from the byte we just consumed.
+    let mut len = (first[0] & 0x7F) as i32;
+    let mut shift = 7;
+    let mut last = first[0];
+    while last & 0x80 != 0 {
+        let mut byte = [0u8; 1];
+        if s.read_exact(&mut byte).is_err() {
+            return None;
+        }
+        len |= ((byte[0] & 0x7F) as i32) << shift;
+        shift += 7;
+        last = byte[0];
+    }
+    let mut frame = vec![0u8; len as usize];
+    if s.read_exact(&mut frame).is_err() {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut id = 0i32;
+    let mut shift = 0;
+    loop {
+        let b = frame[pos];
+        id |= ((b & 0x7F) as i32) << shift;
+        pos += 1;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    Some((id, frame[pos..].to_vec()))
+}
+
 fn handshake(s: &mut TcpStream, addr: &str, intent: i32) {
     let (host, port) = addr.split_once(':').unwrap();
     let mut body = Vec::new();
@@ -226,4 +265,28 @@ fn login_through_configuration_into_play() {
         }
     }
     assert!(saw_chunk, "received at least one LevelChunkWithLight");
+
+    // Confirm the spawn teleport (teleport id 1) so the server treats us as a
+    // settled player, then report a movement. ServerboundMovePlayerPosRot (id
+    // 31): double x/y/z, float yaw/pitch, byte flags (bit 0 = on ground).
+    let mut accept = Vec::new();
+    write_varint(&mut accept, 1); // teleport id
+    send(&mut s, 0, &accept); // ServerboundAcceptTeleportation
+
+    let mut move_body = Vec::new();
+    move_body.extend_from_slice(&1.5f64.to_be_bytes()); // x
+    move_body.extend_from_slice(&72.0f64.to_be_bytes()); // y
+    move_body.extend_from_slice(&(-3.5f64).to_be_bytes()); // z
+    move_body.extend_from_slice(&90.0f32.to_be_bytes()); // yaw
+    move_body.extend_from_slice(&12.0f32.to_be_bytes()); // pitch
+    move_body.push(1); // flags: on ground
+    send(&mut s, 31, &move_body); // ServerboundMovePlayerPosRot
+
+    // The server should accept the movement and keep the connection open: it
+    // still drives keep-alives, so we expect at least one more clientbound
+    // packet (a KeepAlive, id 44) rather than an EOF/disconnect.
+    assert!(
+        recv_opt(&mut s).is_some(),
+        "server stays connected after accepting a movement packet"
+    );
 }
