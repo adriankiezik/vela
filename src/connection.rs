@@ -11,6 +11,7 @@
 //! `GameProtocols`). They are state-specific: the same number means different
 //! packets in configuration vs play.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -18,10 +19,12 @@ use serde::Serialize;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::protocol::buffer::{PacketReader, PacketWriter};
+use crate::protocol::nbt::{write_network, Nbt};
 use crate::protocol::uuid::offline_uuid;
 use crate::protocol::varint::{put_varint, read_varint, varint_len};
 use crate::protocol::{Intent, State, PROTOCOL_VERSION, VERSION_NAME};
@@ -51,7 +54,9 @@ const CB_PLAY_LEVEL_CHUNK: i32 = 45;
 const CB_PLAY_LOGIN: i32 = 49;
 const CB_PLAY_PLAYER_POSITION: i32 = 72;
 const CB_PLAY_SET_CHUNK_CACHE_CENTER: i32 = 94;
+const CB_PLAY_SYSTEM_CHAT: i32 = 121;
 const SB_PLAY_ACCEPT_TELEPORTATION: i32 = 0;
+const SB_PLAY_CHAT: i32 = 9;
 const SB_PLAY_KEEP_ALIVE: i32 = 28;
 const SB_PLAY_MOVE_PLAYER_POS: i32 = 30;
 const SB_PLAY_MOVE_PLAYER_POS_ROT: i32 = 31;
@@ -81,6 +86,11 @@ const VIEW_RADIUS: i32 = 5;
 /// rather than allocated.
 const MAX_FRAME_LEN: i32 = 2 * 1024 * 1024;
 
+/// A rendered chat line fanned out to every connected player. Pre-formatted
+/// (`<name> message`) so each receiver just wraps it in a system-chat packet.
+/// `Arc<str>` keeps the broadcast clone-per-receiver cheap.
+pub type ChatLine = Arc<str>;
+
 /// The player's last-known position and orientation in the world. Updated from
 /// the serverbound movement packets; the server is otherwise authoritative and
 /// does not yet validate or correct these values.
@@ -94,7 +104,11 @@ struct PlayerState {
     on_ground: bool,
 }
 
-pub async fn handle(mut stream: TcpStream, peer: std::net::SocketAddr) -> io::Result<()> {
+pub async fn handle(
+    mut stream: TcpStream,
+    peer: std::net::SocketAddr,
+    chat: broadcast::Sender<ChatLine>,
+) -> io::Result<()> {
     let mut state = State::Handshake;
     let mut profile_name = String::new();
     let mut profile_uuid = Uuid::nil();
@@ -178,7 +192,7 @@ pub async fn handle(mut stream: TcpStream, peer: std::net::SocketAddr) -> io::Re
             (State::Configuration, SB_CFG_FINISH) => {
                 info!(%peer, name = %profile_name, "entering play");
                 let (rd, wr) = stream.into_split();
-                return play(rd, wr, peer, profile_uuid, profile_name).await;
+                return play(rd, wr, peer, profile_uuid, profile_name, chat).await;
             }
 
             // Other configuration packets (custom-payload "brand", cookies,
@@ -288,7 +302,13 @@ async fn play(
     peer: std::net::SocketAddr,
     _uuid: Uuid,
     name: String,
+    chat: broadcast::Sender<ChatLine>,
 ) -> io::Result<()> {
+    // Subscribe before announcing the join so this player sees the lines that
+    // other players send from here on; `chat` itself is the broadcast handle we
+    // publish our own messages to.
+    let mut chat_rx = chat.subscribe();
+
     send_play_login(&mut wr).await?;
     // GameEvent first so the client enters its "waiting for chunks" state.
     send_game_event(&mut wr, GAME_EVENT_LEVEL_CHUNKS_LOAD_START, 0.0).await?;
@@ -391,10 +411,37 @@ async fn play(
                             Ok(()) => debug!(%peer, %name, on_ground = player.on_ground, "move status"),
                             Err(e) => debug!(%peer, %name, error = %e, "malformed move status"),
                         },
-                        // Abilities, chat, etc. — accepted but not yet acted upon.
-                        // Ignoring keeps the connection alive.
+                        // ServerboundChatPacket: the message string leads, then
+                        // timestamp/salt/signature/last-seen fields we ignore.
+                        // Because each frame is decoded into its own buffer, the
+                        // unread trailing fields can't desync the stream — we just
+                        // render `<name> message` and fan it out to everyone.
+                        SB_PLAY_CHAT => match reader.read_utf(256) {
+                            Ok(msg) => {
+                                info!(%peer, %name, message = %msg, "chat");
+                                let line: ChatLine = Arc::from(format!("<{name}> {msg}"));
+                                // Errs only when no players are listening; nothing to do.
+                                let _ = chat.send(line);
+                            }
+                            Err(e) => debug!(%peer, %name, error = %e, "malformed chat"),
+                        },
+                        // Abilities, commands, etc. — accepted but not yet acted
+                        // upon. Ignoring keeps the connection alive.
                         _ => {}
                     },
+                }
+            }
+            line = chat_rx.recv() => {
+                match line {
+                    Ok(line) => {
+                        if let Err(e) = send_system_chat(&mut wr, &line).await {
+                            break Err(e);
+                        }
+                    }
+                    // Slow consumer dropped some messages — skip them and stay connected.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    // All senders gone (the server is shutting down); end cleanly.
+                    Err(broadcast::error::RecvError::Closed) => break Ok(()),
                 }
             }
         }
@@ -402,6 +449,18 @@ async fn play(
 
     reader.abort();
     result
+}
+
+/// ClientboundSystemChatPacket: a text component (nameless network NBT) plus an
+/// overlay flag. We render lines as a plain `{text:"…"}` compound and clear the
+/// overlay so they land in the chat box rather than the action bar. System chat
+/// is unsigned ("trusted"), so it sidesteps the whole secure-chat apparatus.
+async fn send_system_chat<W: AsyncWrite + Unpin>(w: &mut W, text: &str) -> io::Result<()> {
+    let component = Nbt::Compound(vec![("text".to_string(), Nbt::String(text.to_string()))]);
+    let mut p = PacketWriter::new();
+    write_network(&mut p.buf, &component);
+    p.write_bool(false); // overlay: false -> chat box (true would be the action bar)
+    send_packet(w, CB_PLAY_SYSTEM_CHAT, &p.buf).await
 }
 
 /// Decode a `ServerboundMovePlayerPacket` variant into `player`. The wire layout

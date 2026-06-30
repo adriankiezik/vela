@@ -211,6 +211,7 @@ fn login_through_configuration_into_play() {
     loop {
         let (id, _) = recv(&mut s);
         match id {
+            1 => {} // ClientboundCustomPayload (server brand "Vela")
             12 => saw_features = true,
             14 => break, // ClientboundSelectKnownPacks
             other => panic!("unexpected config packet before known packs: {other}"),
@@ -288,5 +289,45 @@ fn login_through_configuration_into_play() {
     assert!(
         recv_opt(&mut s).is_some(),
         "server stays connected after accepting a movement packet"
+    );
+
+    // Send a chat message and expect it broadcast back as ClientboundSystemChat
+    // (id 121). ServerboundChatPacket (id 9): message string, then
+    // timestamp/salt/signature/last-seen fields the server ignores.
+    let mut chat = Vec::new();
+    write_utf(&mut chat, "hello vela");
+    chat.extend_from_slice(&0i64.to_be_bytes()); // timestamp
+    chat.extend_from_slice(&0i64.to_be_bytes()); // salt
+    chat.push(0); // signature: absent
+    write_varint(&mut chat, 0); // last-seen offset
+    chat.extend_from_slice(&[0, 0, 0]); // last-seen acknowledged: 20-bit bitset
+    chat.push(0); // last-seen checksum
+    send(&mut s, 9, &chat);
+
+    // A SystemChat (121) carrying the rendered "<TestPlayer> hello vela" line
+    // should come back (we're subscribed to our own broadcast). It trails the
+    // large backlog of join-sequence chunk packets (id 45) still in the stream,
+    // plus the odd keep-alive (44), so drain a generous run looking for it.
+    let mut chat_body = None;
+    for _ in 0..400 {
+        let (id, body) = recv(&mut s);
+        if id == 121 {
+            chat_body = Some(body);
+            break;
+        }
+    }
+    let chat_body = chat_body.expect("received a ClientboundSystemChat after sending chat");
+    // The content is a network-NBT `{text:"…"}` compound; rather than decode it,
+    // confirm the rendered line appears verbatim in the bytes, and that the
+    // trailing overlay flag is 0 (chat box, not action bar).
+    let needle = b"<TestPlayer> hello vela";
+    assert!(
+        chat_body.windows(needle.len()).any(|w| w == needle),
+        "system chat carries the formatted line"
+    );
+    assert_eq!(
+        *chat_body.last().unwrap(),
+        0,
+        "overlay flag is false (renders in the chat box)"
     );
 }

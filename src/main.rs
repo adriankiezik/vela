@@ -29,6 +29,11 @@ async fn main() -> std::io::Result<()> {
         "Vela listening"
     );
 
+    // Server-wide chat bus: every play connection publishes its messages here and
+    // subscribes for everyone else's. We hold the sender so the channel stays
+    // open across reconnects even when no players are currently online.
+    let (chat, _) = tokio::sync::broadcast::channel::<connection::ChatLine>(256);
+
     loop {
         // A transient accept error (e.g. EMFILE, ECONNABORTED) must not take
         // down the listener — log it and keep serving.
@@ -40,8 +45,9 @@ async fn main() -> std::io::Result<()> {
             }
         };
         stream.set_nodelay(true).ok();
+        let chat = chat.clone();
         tokio::spawn(async move {
-            if let Err(e) = connection::handle(stream, peer).await {
+            if let Err(e) = connection::handle(stream, peer, chat).await {
                 error!(%peer, error = %e, "connection error");
             }
         });
