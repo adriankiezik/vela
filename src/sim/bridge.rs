@@ -96,6 +96,24 @@ pub enum Serverbound {
         slot: i16,
         stack: Option<crate::inventory::ItemStack>,
     },
+    /// `ServerboundContainerClickPacket` — a click in an open menu. We decode the
+    /// resolution-relevant header (`containerId`, `stateId`, `slotNum`,
+    /// `buttonNum`, the `ContainerInput` mode); the client's predicted
+    /// `changedSlots`/`carriedItem` (`HashedStack`s, used only for desync
+    /// detection) are left unread on the frame, since the server re-syncs the
+    /// authoritative state after resolving the click.
+    ContainerClick {
+        container_id: i32,
+        state_id: i32,
+        slot: i16,
+        button: i8,
+        mode: i32,
+    },
+    /// `ServerboundContainerClosePacket` — the player closed the open screen. A
+    /// single VarInt container id.
+    ContainerClose {
+        container_id: i32,
+    },
     /// `ServerboundPlayerActionPacket` — block-dig (and item-drop) actions. The
     /// `BlockPos` long is unpacked to `(x, y, z)` by `net`. `action` is the
     /// `Action` enum ordinal (0 START_DESTROY_BLOCK, 1 ABORT_DESTROY_BLOCK,

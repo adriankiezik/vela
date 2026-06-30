@@ -93,6 +93,35 @@ pub fn name_of(id: i32) -> Option<&'static str> {
     ITEMS.iter().find(|(_, i)| *i == id).map(|(n, _)| *n)
 }
 
+/// Items overriding the default 64-item stack size. This is the minimal slice of
+/// the 26.x data-component model we need for inventory click-resolution parity:
+/// vanilla reads `DataComponents.MAX_STACK_SIZE` (default 64), which the item's
+/// `Item.Properties` lowers for tools/weapons (`stacksTo(1)`) and the few
+/// 16-stacking utility items. Anything not listed here defaults to 64.
+#[rustfmt::skip]
+static MAX_STACK_OVERRIDES: &[(i32, i32)] = &[
+    (682, 1),  // bow
+    (719, 1),  // iron_sword
+    (721, 1),  // iron_pickaxe
+    (724, 1),  // diamond_sword
+    (725, 1),  // diamond_shovel
+    (726, 1),  // diamond_pickaxe
+    (727, 1),  // diamond_axe
+    (800, 16), // bucket (empty buckets stack to 16)
+    (801, 1),  // water_bucket
+];
+
+/// The maximum stack size for an item id — the `DataComponents.MAX_STACK_SIZE`
+/// value (default 64), with the per-item overrides above. Drives slot/cursor
+/// merge limits in the menu click resolver.
+pub fn max_stack_size(id: i32) -> i32 {
+    MAX_STACK_OVERRIDES
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, s)| *s)
+        .unwrap_or(64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

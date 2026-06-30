@@ -31,6 +31,21 @@ pub struct Inventory {
     pub slots: [Option<ItemStack>; PLAYER_INVENTORY_SLOTS],
     /// Selected hotbar index, `0..=8` (vanilla `Inventory.selected`).
     pub selected: u8,
+    /// The cursor / carried item — what the player is holding on the pointer
+    /// while a menu is open (`AbstractContainerMenu.carried`). Persists across
+    /// clicks until the menu closes.
+    pub carried: Option<ItemStack>,
+    /// Menu state id (`AbstractContainerMenu.stateId`), bumped each sync. The
+    /// client echoes it on click; a mismatch triggers a full resync.
+    pub state_id: i32,
+    /// Quick-craft (item-drag) state carried between the `START`/`CONTINUE`/`END`
+    /// `ContainerClick` packets that make up one drag gesture
+    /// (`AbstractContainerMenu.quickcraft*`). `status` is the drag phase, `kind`
+    /// the drag type (charitable/greedy/clone), `slots` the menu-slot indices the
+    /// drag has touched.
+    pub drag_status: i32,
+    pub drag_type: i32,
+    pub drag_slots: Vec<usize>,
 }
 
 impl Inventory {
@@ -39,7 +54,18 @@ impl Inventory {
         Self {
             slots: [None; PLAYER_INVENTORY_SLOTS],
             selected: 0,
+            carried: None,
+            state_id: 0,
+            drag_status: 0,
+            drag_type: -1,
+            drag_slots: Vec::new(),
         }
+    }
+
+    /// Advance and return the menu state id (`incrementStateId`: 15-bit wrap).
+    pub fn next_state_id(&mut self) -> i32 {
+        self.state_id = (self.state_id + 1) & 32767;
+        self.state_id
     }
 
     /// Write `stack` into container `slot`, ignoring out-of-range indices (a
