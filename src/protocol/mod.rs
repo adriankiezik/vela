@@ -1,6 +1,7 @@
 //! Vela wire protocol — Minecraft Java Edition, protocol version 776 (MC 26.2).
 
 pub mod buffer;
+pub mod nbt;
 pub mod uuid;
 pub mod varint;
 
