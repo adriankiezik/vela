@@ -225,6 +225,12 @@ impl ServerProperties {
         self.bool("online-mode", true)
     }
 
+    /// `prevent-proxy-connections`: when set, the online-mode `hasJoined` call
+    /// pins authentication to the client's source IP (`DedicatedServerProperties`).
+    pub fn prevent_proxy_connections(&self) -> bool {
+        self.bool("prevent-proxy-connections", false)
+    }
+
     /// `network-compression-threshold`: the packet size (uncompressed bytes) at
     /// or above which a frame is zlib-deflated. A value `< 0` disables
     /// compression entirely (vanilla `getCompressionThreshold`); the default 256

@@ -17,6 +17,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = "1"
 md-5 = "0.10"
+# Online-mode secure transport. RSA for the login key exchange, AES (raw block
+# cipher driven in CFB8 by hand) for the stream cipher, SHA-1 for the
+# Minecraft server-id auth hash, and a CSPRNG for keygen + the verify token.
+rsa = "0.9"
+aes = "0.8"
+sha1 = "0.10"
+rand = "0.8"
+# Lightweight blocking HTTP client for the Mojang `hasJoined` session call.
+ureq = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

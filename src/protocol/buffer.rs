@@ -104,6 +104,21 @@ impl PacketReader {
         self.ensure(16)?;
         Ok(Uuid::from_u128(self.buf.get_u128()))
     }
+
+    /// A VarInt length prefix followed by that many raw bytes
+    /// (`FriendlyByteBuf.readByteArray`). `max` bounds the declared length so a
+    /// hostile prefix can't force a huge allocation.
+    pub fn read_byte_array(&mut self, max: usize) -> std::io::Result<Vec<u8>> {
+        let len = self.read_varint()? as usize;
+        if len > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "byte array longer than declared maximum",
+            ));
+        }
+        self.ensure(len)?;
+        Ok(self.buf.copy_to_bytes(len).to_vec())
+    }
 }
 
 /// Accumulates a packet body. The caller frames it (id + length) on send.
@@ -175,6 +190,25 @@ impl PacketWriter {
     /// them, e.g. a pre-serialized chunk-section blob).
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.buf.put_slice(bytes);
+    }
+
+    /// A VarInt length prefix followed by the raw bytes
+    /// (`FriendlyByteBuf.writeByteArray`).
+    pub fn write_byte_array(&mut self, bytes: &[u8]) {
+        self.write_varint(bytes.len() as i32);
+        self.buf.put_slice(bytes);
+    }
+
+    /// A nullable value: a present-bool, then the value when present
+    /// (`FriendlyByteBuf.writeNullable`). Here specialized to a UTF string.
+    pub fn write_optional_utf(&mut self, value: Option<&str>) {
+        match value {
+            Some(s) => {
+                self.write_bool(true);
+                self.write_utf(s);
+            }
+            None => self.write_bool(false),
+        }
     }
 
     #[allow(dead_code)]

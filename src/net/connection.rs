@@ -33,14 +33,20 @@ use crate::protocol::{Intent, State, PROTOCOL_VERSION, VERSION_NAME};
 use crate::registry;
 use crate::sim::bridge::ToSim;
 
+use super::crypto::{self, AuthError, AuthProfile, ProfileProperty};
 use super::frame::{read_frame, send_packet};
 use super::play_io::play;
+use super::stream::NetStream;
 
 // --- Login --- (clientbound ids in `LoginProtocols` registration order:
 // disconnect=0, hello=1, login_finished=2, login_compression=3)
+const CB_LOGIN_DISCONNECT: i32 = 0;
+const CB_LOGIN_HELLO: i32 = 1;
 const CB_LOGIN_FINISHED: i32 = 2;
 const CB_LOGIN_COMPRESSION: i32 = 3;
+// Serverbound: hello=0, key=1, custom_query_answer=2, login_acknowledged=3.
 const SB_LOGIN_HELLO: i32 = 0;
+const SB_LOGIN_KEY: i32 = 1;
 const SB_LOGIN_ACK: i32 = 3;
 
 // --- Configuration ---
@@ -59,16 +65,23 @@ const SB_CFG_SELECT_KNOWN_PACKS: i32 = 7;
 /// On reaching Play it hands off to `play`, passing the ingress sender so the
 /// connection can register with the simulation.
 pub async fn handle(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: std::net::SocketAddr,
     to_sim: mpsc::Sender<ToSim>,
     config: Arc<ServerConfig>,
 ) -> io::Result<()> {
+    // Wrapped so the framing code is oblivious to whether the AES-CFB8 stream
+    // cipher gets installed mid-Login (online mode). Starts plain.
+    let mut stream = NetStream::plain(stream);
     let mut state = State::Handshake;
     let mut profile_name = String::new();
     let mut profile_uuid = Uuid::nil();
     // `None` until the compression packet is sent mid-Login, then the threshold.
     let mut compression: Option<i32> = None;
+    // Set when an online-mode `ClientboundHello` goes out; the username we are
+    // awaiting a `ServerboundKey` for, plus the verify token we challenged with.
+    let mut requested_name = String::new();
+    let mut verify_token: Option<[u8; 4]> = None;
 
     loop {
         let (packet_id, mut reader) = match read_frame(&mut stream, compression).await? {
@@ -113,30 +126,109 @@ pub async fn handle(
                 return Ok(()); // client closes after pong
             }
 
-            // Login: ServerboundHelloPacket(name, uuid) -> ClientboundLoginFinished
+            // Login: ServerboundHelloPacket(name, uuid).
+            //
+            // Online mode (`online-mode=true`): mirror vanilla's `handleHello`
+            // and begin encryption — send a `ClientboundHello` carrying our RSA
+            // public key and a verify token, then await `ServerboundKey`.
+            //
+            // Offline mode: there is no key exchange, so go straight to finishing
+            // login with an offline profile.
             (State::Login, SB_LOGIN_HELLO) => {
                 let name = reader.read_utf(16)?;
                 let _client_uuid = reader.read_uuid()?;
-                let uuid = offline_uuid(&name);
-                info!(%peer, %name, %uuid, "login hello");
+                info!(%peer, %name, "login hello");
 
-                // Negotiate compression BEFORE LoginFinished, mirroring vanilla's
-                // `verifyLoginAndFinishConnectionSetup`: a threshold < 0 disables
-                // it. The compression packet is the last UNcompressed frame; both
-                // sides switch immediately after, so flip `compression` once it is
-                // on the wire and LoginFinished then goes out compressed.
-                let threshold = config.properties.network_compression_threshold();
-                if threshold >= 0 {
+                if config.properties.online_mode() {
+                    let token = crypto::new_verify_token();
+                    let keys = crypto::server_keys();
                     let mut w = PacketWriter::new();
-                    w.write_varint(threshold);
-                    send_packet(&mut stream, CB_LOGIN_COMPRESSION, &w.buf, None).await?;
-                    compression = Some(threshold);
-                    debug!(%peer, threshold, "compression enabled");
+                    w.write_utf(""); // serverId — empty on a modern server
+                    w.write_byte_array(keys.public_der()); // X.509 SPKI public key
+                    w.write_byte_array(&token); // verify token (challenge)
+                    w.write_bool(true); // shouldAuthenticate
+                    send_packet(&mut stream, CB_LOGIN_HELLO, &w.buf, compression).await?;
+                    requested_name = name;
+                    verify_token = Some(token);
+                    // Stay in Login awaiting the ServerboundKey.
+                } else {
+                    let uuid = offline_uuid(&name);
+                    finish_login(
+                        &mut stream,
+                        uuid,
+                        &name,
+                        &[],
+                        &config,
+                        &mut compression,
+                        peer,
+                    )
+                    .await?;
+                    profile_name = name;
+                    profile_uuid = uuid;
+                    // Stay in Login until the client acknowledges.
                 }
+            }
 
-                send_login_finished(&mut stream, uuid, &name, compression).await?;
-                profile_name = name;
-                profile_uuid = uuid;
+            // Login: ServerboundKeyPacket — the client's RSA-wrapped shared
+            // secret and verify token. Decrypt, validate the challenge, install
+            // the stream cipher, authenticate against Mojang, then finish login.
+            // Mirrors vanilla's `handleKey`.
+            (State::Login, SB_LOGIN_KEY) => {
+                let encrypted_secret = reader.read_byte_array(256)?;
+                let encrypted_token = reader.read_byte_array(256)?;
+                let token = match verify_token.take() {
+                    Some(t) => t,
+                    None => return Ok(()), // unexpected Key (no Hello issued)
+                };
+
+                let profile = match authenticate(
+                    &encrypted_secret,
+                    &encrypted_token,
+                    &token,
+                    &requested_name,
+                    &config,
+                    peer,
+                )
+                .await
+                {
+                    Ok((secret, profile)) => {
+                        // Everything from here is encrypted in both directions.
+                        stream = stream.enable_encryption(&secret);
+                        info!(%peer, name = %profile.name, uuid = %profile.uuid, "authenticated");
+                        profile
+                    }
+                    Err(e) => {
+                        let reason = match e {
+                            AuthError::Unverified => "multiplayer.disconnect.unverified_username",
+                            AuthError::Unavailable => "multiplayer.disconnect.authservers_down",
+                            AuthError::BadVerifyToken | AuthError::Crypt => {
+                                // A protocol error: vanilla throws and drops the
+                                // connection. The cipher may not be installed, so
+                                // just close without a (possibly unreadable) packet.
+                                warn!(%peer, "key exchange failed");
+                                return Ok(());
+                            }
+                        };
+                        warn!(%peer, name = %requested_name, reason, "login refused");
+                        // The encryption cipher is not installed on this failure
+                        // path, so the disconnect goes out in the clear.
+                        login_disconnect(&mut stream, reason, compression).await?;
+                        return Ok(());
+                    }
+                };
+
+                finish_login(
+                    &mut stream,
+                    profile.uuid,
+                    &profile.name,
+                    &profile.properties,
+                    &config,
+                    &mut compression,
+                    peer,
+                )
+                .await?;
+                profile_uuid = profile.uuid;
+                profile_name = profile.name;
                 // Stay in Login until the client acknowledges.
             }
 
@@ -186,20 +278,116 @@ pub async fn handle(
     }
 }
 
+/// Finish login: negotiate compression (vanilla does this in
+/// `verifyLoginAndFinishConnectionSetup`, the last UNcompressed frame — both
+/// sides switch immediately after) and then send `ClientboundLoginFinished`.
+///
+/// Shared by the offline path (straight after Hello) and the online path (after
+/// the key exchange + Mojang auth), so the ordering — compression, then the
+/// finished packet, both encrypted when online — matches vanilla exactly.
+async fn finish_login<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    uuid: Uuid,
+    name: &str,
+    properties: &[ProfileProperty],
+    config: &ServerConfig,
+    compression: &mut Option<i32>,
+    peer: std::net::SocketAddr,
+) -> io::Result<()> {
+    let threshold = config.properties.network_compression_threshold();
+    if threshold >= 0 && compression.is_none() {
+        let mut c = PacketWriter::new();
+        c.write_varint(threshold);
+        send_packet(w, CB_LOGIN_COMPRESSION, &c.buf, *compression).await?;
+        *compression = Some(threshold);
+        debug!(%peer, threshold, "compression enabled");
+    }
+    send_login_finished(w, uuid, name, properties, *compression).await
+}
+
 /// ClientboundLoginFinished: the player's GameProfile plus a chat session id.
-/// In offline mode the profile carries no signed properties.
+/// In offline mode the profile carries no signed properties; online it carries
+/// the signed skin/cape properties from `hasJoined`.
 async fn send_login_finished<W: AsyncWrite + Unpin>(
     w: &mut W,
     uuid: Uuid,
     name: &str,
+    properties: &[ProfileProperty],
     compression: Option<i32>,
 ) -> io::Result<()> {
     let mut p = PacketWriter::new();
     p.write_uuid(uuid); // GameProfile.id
     p.write_utf(name); // GameProfile.name (<=16)
-    p.write_varint(0); // GameProfile.properties: none
+    p.write_varint(properties.len() as i32); // GameProfile.properties
+    for prop in properties {
+        p.write_utf(&prop.name);
+        p.write_utf(&prop.value);
+        p.write_optional_utf(prop.signature.as_deref());
+    }
     p.write_uuid(uuid); // sessionId
     send_packet(w, CB_LOGIN_FINISHED, &p.buf, compression).await
+}
+
+/// A `ClientboundLoginDisconnectPacket` carrying a translatable reason key.
+/// In the login state the component is JSON (not network NBT), so we send a
+/// minimal `{"translate":"<key>"}` object.
+async fn login_disconnect<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    translate_key: &str,
+    compression: Option<i32>,
+) -> io::Result<()> {
+    let json = format!("{{\"translate\":\"{translate_key}\"}}");
+    let mut p = PacketWriter::new();
+    p.write_utf(&json);
+    send_packet(w, CB_LOGIN_DISCONNECT, &p.buf, compression).await
+}
+
+/// Decrypt the client's RSA-wrapped shared secret and verify token, validate the
+/// challenge, compute the server-id hash, and resolve the authenticated profile
+/// via Mojang's `hasJoined`. Returns the 16-byte AES secret and the profile.
+/// Mirrors the cryptographic core of vanilla's `handleKey`.
+async fn authenticate(
+    encrypted_secret: &[u8],
+    encrypted_token: &[u8],
+    expected_token: &[u8; 4],
+    name: &str,
+    config: &ServerConfig,
+    peer: std::net::SocketAddr,
+) -> Result<([u8; 16], AuthProfile), AuthError> {
+    let keys = crypto::server_keys();
+
+    // The verify token must round-trip through our private key unchanged.
+    let token = keys.decrypt(encrypted_token)?;
+    if token != expected_token {
+        return Err(AuthError::BadVerifyToken);
+    }
+
+    // The shared secret is a 16-byte AES-128 key.
+    let secret_bytes = keys.decrypt(encrypted_secret)?;
+    let secret: [u8; 16] = secret_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AuthError::Crypt)?;
+
+    let server_hash = crypto::server_id_hash("", &secret, keys.public_der());
+
+    // `prevent-proxy-connections` pins the auth to the client's IP, matching
+    // vanilla's optional `&ip=` parameter.
+    let ip = if config.properties.prevent_proxy_connections() {
+        Some(peer.ip().to_string())
+    } else {
+        None
+    };
+
+    // The HTTP call is blocking; keep it off the async runtime.
+    let name = name.to_string();
+    let profile = tokio::task::spawn_blocking(move || {
+        crypto::has_joined(&name, &server_hash, ip.as_deref())
+    })
+    .await
+    .map_err(|_| AuthError::Unavailable)??;
+
+    Ok((secret, profile))
 }
 
 /// On entering configuration: announce the server brand (so the client's F3

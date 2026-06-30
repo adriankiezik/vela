@@ -36,7 +36,7 @@ use std::io::{self, Read, Write};
 use bytes::{Bytes, BytesMut};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use flate2::Compression;
+use flate2::{Compress, Compression, FlushCompress, Status};
 
 use super::varint::{get_varint, put_varint, varint_len};
 
@@ -143,6 +143,89 @@ fn zlib_compress(data: &[u8]) -> Vec<u8> {
     enc.finish().expect("zlib finish into Vec is infallible")
 }
 
+/// A per-connection compressor that reuses one `Deflater` and a scratch output
+/// buffer across packets, rather than allocating both per packet as the free
+/// [`compress`]/[`encode_compressed`] functions do (review follow-up **F2**).
+/// Vanilla's `CompressionEncoder` holds exactly this: a single `Deflater` reset
+/// between packets. Used on the hot Play write path; the low-volume pre-Play
+/// handshake keeps the simpler allocating path.
+pub struct Compressor {
+    deflate: Compress,
+    /// Reused deflate-output buffer (the `dataLength`-prefixed payload).
+    scratch: Vec<u8>,
+}
+
+impl Default for Compressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Compressor {
+    pub fn new() -> Self {
+        Self {
+            deflate: Compress::new(Compression::default(), true),
+            scratch: Vec::new(),
+        }
+    }
+
+    /// Re-wrap an already-built uncompressed frame (`VarInt(len)|data`) into the
+    /// compressed layout, reusing the internal `Deflater`. Equivalent in output
+    /// to [`compress`] but without the per-packet allocations.
+    pub fn compress_frame(&mut self, uncompressed_frame: &[u8], threshold: i32) -> Bytes {
+        let mut cursor: &[u8] = uncompressed_frame;
+        get_varint(&mut cursor).expect("frame() always prefixes a valid VarInt length");
+        let data = cursor; // = VarInt(id)|body
+
+        debug_assert!(
+            data.len() <= MAX_UNCOMPRESSED_LEN as usize,
+            "Packet too big (is {}, should be less than {MAX_UNCOMPRESSED_LEN})",
+            data.len()
+        );
+
+        self.scratch.clear();
+        if (data.len() as i32) < threshold {
+            // Below the threshold: store verbatim behind a `dataLength` of 0.
+            put_varint(&mut self.scratch, 0);
+            self.scratch.extend_from_slice(data);
+        } else {
+            put_varint(&mut self.scratch, data.len() as i32);
+            self.deflate_onto_scratch(data);
+        }
+
+        let mut out = BytesMut::with_capacity(varint_len(self.scratch.len() as i32) + self.scratch.len());
+        put_varint(&mut out, self.scratch.len() as i32);
+        out.extend_from_slice(&self.scratch);
+        out.freeze()
+    }
+
+    /// Deflate `data`, appending to `self.scratch` (which already holds the
+    /// `dataLength` prefix), reusing the `Deflater` via `reset`.
+    fn deflate_onto_scratch(&mut self, data: &[u8]) {
+        self.deflate.reset();
+        // Reserve a reasonable starting estimate so the common case writes in one
+        // pass; the loop grows it if the data compresses poorly.
+        self.scratch.reserve(data.len() / 2 + 16);
+        loop {
+            let consumed = self.deflate.total_in() as usize;
+            let status = self
+                .deflate
+                .compress_vec(&data[consumed..], &mut self.scratch, FlushCompress::Finish)
+                .expect("deflate into Vec is infallible");
+            match status {
+                Status::StreamEnd => break,
+                // Output buffer full (or no progress): grant more capacity so the
+                // next call makes forward progress.
+                Status::Ok | Status::BufError => {
+                    if self.scratch.len() == self.scratch.capacity() {
+                        self.scratch.reserve(self.scratch.capacity().max(64));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// zlib-inflate `data` to exactly `expected` bytes, erroring if the stream
 /// decompresses to a different length than declared (vanilla's actual-vs-declared
 /// check in `CompressionDecoder.inflate`).
@@ -231,6 +314,30 @@ mod tests {
         let err = decode_compressed(payload.freeze(), THRESHOLD).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("below server threshold"));
+    }
+
+    /// The per-connection `Compressor` must produce byte-identical output to the
+    /// stateless `compress` free function, across both the below- and
+    /// above-threshold paths and reused across packets.
+    #[test]
+    fn compressor_matches_free_function() {
+        let mut comp = Compressor::new();
+        for body in [
+            vec![0xABu8; 1000], // above threshold, compressible
+            vec![0x07u8; 10],   // below threshold, stored verbatim
+            (0u8..=255).cycle().take(2000).collect(), // above threshold, less compressible
+        ] {
+            for id in [0x00, 0x42, 0x7FFF] {
+                let frame = frame(id, &body);
+                let free = compress(&frame, THRESHOLD);
+                let reused = comp.compress_frame(&frame, THRESHOLD);
+                assert_eq!(free, reused, "id={id} len={}", body.len());
+                // And it still decodes back to the original.
+                let (_, payload) = split(&reused);
+                let data = decode_compressed(payload, THRESHOLD).unwrap();
+                assert_data(data, id, &body);
+            }
+        }
     }
 
     /// The decoder rejects a declared size beyond the protocol maximum without
