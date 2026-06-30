@@ -20,6 +20,9 @@
 //! own block registration order (`Blocks.java`) / `--reports` block dump
 //! (observable output), not copied source.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use crate::protocol::buffer::PacketWriter;
 
 /// World floor. Sections stack upward from here; the overworld is 384 blocks
@@ -48,6 +51,13 @@ mod states {
     pub const DIRT: u32 = 10;
     pub const BEDROCK: u32 = 85;
 }
+
+/// The biome a section's biome `PalettedContainer` reports, as a *network*
+/// registry index into the biome registry we sync in `crate::registries`. Index
+/// 39 is `minecraft:plains` in that list — a sensible match for green grassy
+/// terrain (index 0 would be `badlands`, which tints grass orange). The whole
+/// world reports this single biome for now.
+const PLAINS_BIOME: u32 = 39;
 
 // ---------------------------------------------------------------------------
 // Terrain generation
@@ -143,16 +153,18 @@ pub fn surface_height(world_x: i32, world_z: i32) -> i32 {
 
 /// The block state at `world_y` in a column whose surface is at `height`:
 /// bedrock floor, stone fill, three dirt layers under the surface, a grass
-/// block on top, air above.
+/// block on top, air above. Bedrock is matched first so the floor is correct
+/// regardless of the surface height (it does not rely on `height` staying well
+/// above `MIN_Y`).
 fn state_at(world_y: i32, height: i32) -> u32 {
-    if world_y > height {
+    if world_y == MIN_Y {
+        states::BEDROCK
+    } else if world_y > height {
         states::AIR
     } else if world_y == height {
         states::GRASS_BLOCK
     } else if world_y >= height - 3 {
         states::DIRT
-    } else if world_y == MIN_Y {
-        states::BEDROCK
     } else {
         states::STONE
     }
@@ -174,14 +186,54 @@ fn chunk_heights(cx: i32, cz: i32) -> [i32; COLUMNS] {
     heights
 }
 
-/// The 24-section block blob for a specific chunk `(cx, cz)`. Each of the 256
-/// columns may have a different height, so this is computed per chunk (owned).
-pub fn column_blob(cx: i32, cz: i32) -> Vec<u8> {
+/// The generated wire data for one chunk column: the 24-section block blob and
+/// the two client-facing heightmaps. Both derive from the same 256 per-column
+/// heights, so they are produced together (computing the noise field once) and
+/// cached — terrain is static, so a chunk is generated at most once.
+pub struct ChunkColumns {
+    pub blob: Vec<u8>,
+    pub heightmaps: Vec<(i32, Vec<i64>)>,
+}
+
+/// Generate (uncached) the block blob and heightmaps for chunk `(cx, cz)` from a
+/// single evaluation of the noise heightfield.
+fn generate(cx: i32, cz: i32) -> ChunkColumns {
     let heights = chunk_heights(cx, cz);
+    ChunkColumns {
+        blob: encode_blob(&heights),
+        heightmaps: compute_heightmaps(&heights),
+    }
+}
+
+/// Process-wide cache of generated chunks, keyed by `(cx, cz)`. The world is
+/// static, so an entry is computed once and shared thereafter. Guarded by a
+/// `Mutex` because, while the simulation is single-threaded today, nothing about
+/// the signature promises that; the lock is uncontended in practice.
+type ChunkCache = Mutex<HashMap<(i32, i32), Arc<ChunkColumns>>>;
+
+fn cache() -> &'static ChunkCache {
+    static CACHE: OnceLock<ChunkCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The generated columns for chunk `(cx, cz)`, generating and caching on first
+/// request. The returned `Arc` is cheap to clone and share.
+pub fn chunk_columns(cx: i32, cz: i32) -> Arc<ChunkColumns> {
+    Arc::clone(
+        cache()
+            .lock()
+            .expect("chunk cache mutex poisoned")
+            .entry((cx, cz))
+            .or_insert_with(|| Arc::new(generate(cx, cz))),
+    )
+}
+
+/// Encode the 24-section block blob for a chunk from its 256 column heights.
+fn encode_blob(heights: &[i32; COLUMNS]) -> Vec<u8> {
     let mut out = PacketWriter::new();
     for section in 0..SECTION_COUNT {
         let base_y = MIN_Y + section * 16;
-        encode_section(base_y, &heights, &mut out);
+        encode_section(base_y, heights, &mut out);
     }
     out.buf.to_vec()
 }
@@ -211,7 +263,7 @@ fn encode_section(base_y: i32, heights: &[i32; COLUMNS], out: &mut PacketWriter)
     out.write_i16(non_air as i16); // non-empty block count
     out.write_i16(0); // fluid count
     write_block_palette(&cells, out); // block-state container
-    write_single_value(states::AIR /* biome id 0 == registry index 0 */, out);
+    write_single_value(PLAINS_BIOME, out); // biome container (single value)
 }
 
 /// Write a block-state `PalettedContainer`. A uniform section collapses to a
@@ -264,11 +316,10 @@ fn write_single_value(value: u32, out: &mut PacketWriter) {
 }
 
 /// The two client-facing heightmaps (`WORLD_SURFACE` = id 1, `MOTION_BLOCKING`
-/// = id 4) for chunk `(cx, cz)`, each a packed `long[]` of 256 column heights.
-/// With no water or non-occluding cover both equal the first free y above the
-/// surface, relative to the world floor (`firstAvailable - minY`).
-pub fn heightmaps(cx: i32, cz: i32) -> Vec<(i32, Vec<i64>)> {
-    let heights = chunk_heights(cx, cz);
+/// = id 4) for a chunk, each a packed `long[]` of 256 column heights. With no
+/// water or non-occluding cover both equal the first free y above the surface,
+/// relative to the world floor (`firstAvailable - minY`).
+fn compute_heightmaps(heights: &[i32; COLUMNS]) -> Vec<(i32, Vec<i64>)> {
     // Bits = ceil(log2(worldHeight + 1)); a 384-tall column -> 9.
     let bits = ((SECTION_COUNT * 16 + 1) as u32)
         .next_power_of_two()
@@ -370,7 +421,7 @@ mod tests {
 
     #[test]
     fn heightmap_geometry() {
-        let maps = heightmaps(0, 0);
+        let maps = generate(0, 0).heightmaps;
         assert_eq!(maps.len(), 2);
         assert_eq!(maps[0].0, 1); // WORLD_SURFACE
         assert_eq!(maps[1].0, 4); // MOTION_BLOCKING
@@ -383,16 +434,28 @@ mod tests {
     fn column_blob_is_nonempty_and_varies_by_chunk() {
         // A generated column has solid ground, so the blob exceeds the
         // all-air lower bound of 24 sections * 8 bytes.
-        let a = column_blob(0, 0);
+        let a = generate(0, 0).blob;
         assert!(a.len() > (SECTION_COUNT as usize) * 8);
         // Distant chunks have different terrain, hence different bytes.
-        let b = column_blob(50, 50);
+        let b = generate(50, 50).blob;
         assert_ne!(a, b);
     }
 
     #[test]
-    fn column_blob_is_deterministic() {
-        assert_eq!(column_blob(2, 5), column_blob(2, 5));
+    fn generation_is_deterministic() {
+        // Two independent generations of the same chunk match byte-for-byte.
+        let a = generate(2, 5);
+        let b = generate(2, 5);
+        assert_eq!(a.blob, b.blob);
+        assert_eq!(a.heightmaps, b.heightmaps);
+    }
+
+    #[test]
+    fn chunk_columns_caches_one_instance() {
+        // The cache hands back the same allocation on repeat requests.
+        let a = chunk_columns(-4, 8);
+        let b = chunk_columns(-4, 8);
+        assert!(Arc::ptr_eq(&a, &b));
     }
 
     #[test]

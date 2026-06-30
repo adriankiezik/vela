@@ -6,6 +6,10 @@
 //!
 //! Packet IDs are the registration-order indices from the decompiled 26.2
 //! `GameProtocols` builder.
+//!
+//! This module holds the general play builders (join, movement, entities, chat,
+//! metadata). Self-contained domains keep their own builders next to their data
+//! model instead — see `crate::inventory` for the inventory/container packets.
 
 use bytes::Bytes;
 use uuid::Uuid;
@@ -395,25 +399,24 @@ pub fn set_entity_data(entity_id: i32, sneaking: bool, sprinting: bool) -> Bytes
 /// following the noise heightmap, air above. The block data and heightmaps come
 /// from `crate::world` and vary per chunk `(cx, cz)`. Light is still sent empty
 /// — without a real light engine the client falls back to full brightness.
-pub fn flat_chunk(cx: i32, cz: i32) -> Bytes {
-    let section_data = crate::world::column_blob(cx, cz);
-    let heightmaps = crate::world::heightmaps(cx, cz);
+pub fn level_chunk(cx: i32, cz: i32) -> Bytes {
+    let columns = crate::world::chunk_columns(cx, cz);
 
     let mut p = PacketWriter::new();
     p.write_i32(cx);
     p.write_i32(cz);
     // --- ClientboundLevelChunkPacketData ---
     // Heightmaps: a map of type-id -> packed long[] (ByteBufCodecs.map + LONG_ARRAY).
-    p.write_varint(heightmaps.len() as i32);
-    for (type_id, longs) in &heightmaps {
+    p.write_varint(columns.heightmaps.len() as i32);
+    for (type_id, longs) in &columns.heightmaps {
         p.write_varint(*type_id);
         p.write_varint(longs.len() as i32);
         for &l in longs {
             p.write_i64(l);
         }
     }
-    p.write_varint(section_data.len() as i32); // section blob length
-    p.write_bytes(&section_data);
+    p.write_varint(columns.blob.len() as i32); // section blob length
+    p.write_bytes(&columns.blob);
     p.write_varint(0); // block entities: none
     // --- ClientboundLightUpdatePacketData --- (four empty BitSets, two empty lists)
     p.write_varint(0); // sky-light mask

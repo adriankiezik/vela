@@ -250,7 +250,7 @@ fn send_join_sequence(
     let radius = join.view_distance;
     for cx in -radius..=radius {
         for cz in -radius..=radius {
-            ok &= send(outbox, packets::flat_chunk(cx, cz));
+            ok &= send(outbox, packets::level_chunk(cx, cz));
         }
     }
     ok &= send(
@@ -390,25 +390,13 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         // untouched.
         Serverbound::SetCarriedItem { slot } => {
             if (0..9).contains(&slot) {
-                let mut ent = world.entity_mut(entity);
-                if !ent.contains::<crate::inventory::Inventory>() {
-                    ent.insert(crate::inventory::Inventory::new());
-                }
-                if let Some(mut inv) = ent.get_mut::<crate::inventory::Inventory>() {
-                    inv.selected = slot as u8;
-                }
+                inventory_mut(world, entity).selected = slot as u8;
             }
         }
         // Creative-mode slot set: write the stack into the addressed inventory
         // slot (server-side state only for now).
         Serverbound::SetCreativeSlot { slot, stack } => {
-            let mut ent = world.entity_mut(entity);
-            if !ent.contains::<crate::inventory::Inventory>() {
-                ent.insert(crate::inventory::Inventory::new());
-            }
-            if let Some(mut inv) = ent.get_mut::<crate::inventory::Inventory>() {
-                inv.set_slot(slot, stack);
-            }
+            inventory_mut(world, entity).set_slot(slot, stack);
         }
     }
 }
@@ -436,6 +424,20 @@ fn broadcast_meta(world: &mut World, entity: Entity) {
         return;
     };
     broadcast_to_others(world, entity, packets::set_entity_data(eid, sneaking, sprinting));
+}
+
+/// Borrow a player's `Inventory`, attaching a fresh empty one on first use. The
+/// component is added lazily (rather than at join) so the inventory module stays
+/// out of the join path; both serverbound inventory packets funnel through here.
+fn inventory_mut(world: &mut World, entity: Entity) -> Mut<'_, crate::inventory::Inventory> {
+    if world.get::<crate::inventory::Inventory>(entity).is_none() {
+        world
+            .entity_mut(entity)
+            .insert(crate::inventory::Inventory::new());
+    }
+    world
+        .get_mut::<crate::inventory::Inventory>(entity)
+        .expect("inventory just inserted")
 }
 
 /// Run a `/command` for `sender`. Like vanilla's `sendSuccess(..., false)`, the

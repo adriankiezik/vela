@@ -8,6 +8,13 @@
 //! Wire formats are taken 1:1 from the decompiled 26.2 reference — see the
 //! per-item citations below. Nothing here copies Mojang code; the layouts are
 //! transcribed from the `StreamCodec` definitions.
+//!
+//! **Packet placement.** Unlike the player/movement/chat builders in
+//! `sim::packets`, this module owns *its own* inventory packet builders and ids.
+//! That is deliberate: inventory/containers are a self-contained domain that
+//! will keep growing (menu types, clicks, recipes), so the `ItemStack` codec,
+//! the registry, and the packets that carry them live together rather than
+//! leaking into the shared packet module. `sim::packets` notes the same split.
 
 use bevy_ecs::prelude::*;
 use bytes::Bytes;
