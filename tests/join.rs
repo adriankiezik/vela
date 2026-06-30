@@ -1,0 +1,229 @@
+//! End-to-end framing test: drives a byte-level fake client through the full
+//! handshake -> status and login -> configuration -> play pipeline against the
+//! real server binary, asserting the expected clientbound packet ids appear.
+//!
+//! This does not validate that a *real* Minecraft client renders the world
+//! (that needs the actual 26.2 client) — it validates our framing, state
+//! transitions, and packet ids, which are the parts most likely to regress.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command};
+use std::time::Duration;
+
+/// Spawns the built server bound to a test port; killed on drop.
+struct Server(Child);
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start_server(addr: &str) -> Server {
+    let child = Command::new(env!("CARGO_BIN_EXE_vela"))
+        .arg(addr)
+        .spawn()
+        .expect("spawn vela");
+    // Give it a moment to bind the listener.
+    for _ in 0..50 {
+        if TcpStream::connect(addr).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Server(child)
+}
+
+fn write_varint(buf: &mut Vec<u8>, mut v: i32) {
+    loop {
+        let mut b = (v as u32 & 0x7F) as u8;
+        v = ((v as u32) >> 7) as i32;
+        if v != 0 {
+            b |= 0x80;
+        }
+        buf.push(b);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+fn read_varint(s: &mut TcpStream) -> i32 {
+    let mut value = 0i32;
+    let mut pos = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        s.read_exact(&mut byte).expect("read varint byte");
+        value |= ((byte[0] & 0x7F) as i32) << pos;
+        if byte[0] & 0x80 == 0 {
+            break;
+        }
+        pos += 7;
+    }
+    value
+}
+
+fn write_utf(buf: &mut Vec<u8>, s: &str) {
+    write_varint(buf, s.len() as i32);
+    buf.extend_from_slice(s.as_bytes());
+}
+
+/// Send a framed packet: VarInt(len) | VarInt(id) | body.
+fn send(s: &mut TcpStream, id: i32, body: &[u8]) {
+    let mut idbuf = Vec::new();
+    write_varint(&mut idbuf, id);
+    let mut frame = Vec::new();
+    write_varint(&mut frame, (idbuf.len() + body.len()) as i32);
+    frame.extend_from_slice(&idbuf);
+    frame.extend_from_slice(body);
+    s.write_all(&frame).expect("send packet");
+}
+
+/// Read one frame, returning (packet_id, body).
+fn recv(s: &mut TcpStream) -> (i32, Vec<u8>) {
+    let len = read_varint(s) as usize;
+    let mut frame = vec![0u8; len];
+    s.read_exact(&mut frame).expect("read frame body");
+    // Split the id varint off the front of the frame.
+    let mut pos = 0usize;
+    let mut id = 0i32;
+    let mut shift = 0;
+    loop {
+        let b = frame[pos];
+        id |= ((b & 0x7F) as i32) << shift;
+        pos += 1;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    (id, frame[pos..].to_vec())
+}
+
+fn handshake(s: &mut TcpStream, addr: &str, intent: i32) {
+    let (host, port) = addr.split_once(':').unwrap();
+    let mut body = Vec::new();
+    write_varint(&mut body, 776); // protocol version
+    write_utf(&mut body, host);
+    body.extend_from_slice(&port.parse::<u16>().unwrap().to_be_bytes());
+    write_varint(&mut body, intent);
+    send(s, 0x00, &body);
+}
+
+#[test]
+fn status_ping_roundtrip() {
+    let addr = "127.0.0.1:25591";
+    let _server = start_server(addr);
+    let mut s = TcpStream::connect(addr).expect("connect");
+
+    handshake(&mut s, addr, 1); // status
+    send(&mut s, 0x00, &[]); // status request
+    let (id, body) = recv(&mut s);
+    assert_eq!(id, 0x00, "status response id");
+    assert!(
+        String::from_utf8_lossy(&body).contains("\"protocol\":776"),
+        "status JSON advertises protocol 776"
+    );
+
+    send(&mut s, 0x01, &1234567890i64.to_be_bytes()); // ping
+    let (id, body) = recv(&mut s);
+    assert_eq!(id, 0x01, "pong id");
+    assert_eq!(
+        i64::from_be_bytes(body.try_into().unwrap()),
+        1234567890,
+        "pong echoes the ping payload"
+    );
+}
+
+#[test]
+fn login_through_configuration_into_play() {
+    let addr = "127.0.0.1:25592";
+    let _server = start_server(addr);
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    handshake(&mut s, addr, 2); // login
+
+    // ServerboundHello(name, uuid)
+    let mut hello = Vec::new();
+    write_utf(&mut hello, "TestPlayer");
+    hello.extend_from_slice(&[0u8; 16]); // client uuid
+    send(&mut s, 0x00, &hello);
+
+    // Expect ClientboundLoginFinished (id 2).
+    let (id, _) = recv(&mut s);
+    assert_eq!(id, 2, "ClientboundLoginFinished");
+
+    // Acknowledge login -> server enters configuration.
+    send(&mut s, 3, &[]); // ServerboundLoginAcknowledged
+
+    // A real client sends its brand (ServerboundCustomPayload, id 2) early in
+    // configuration, before the known-packs response. The server must tolerate
+    // it rather than disconnect.
+    let mut brand = Vec::new();
+    write_utf(&mut brand, "minecraft:brand");
+    write_utf(&mut brand, "vanilla");
+    send(&mut s, 2, &brand);
+
+    // The server should now push UpdateEnabledFeatures (12) and
+    // SelectKnownPacks (14). Read until we see the known-packs request.
+    let mut saw_features = false;
+    loop {
+        let (id, _) = recv(&mut s);
+        match id {
+            12 => saw_features = true,
+            14 => break, // ClientboundSelectKnownPacks
+            other => panic!("unexpected config packet before known packs: {other}"),
+        }
+    }
+    assert!(saw_features, "UpdateEnabledFeatures precedes known packs");
+
+    // Echo the core pack back: ServerboundSelectKnownPacks(minecraft:core/26.2).
+    let mut packs = Vec::new();
+    write_varint(&mut packs, 1);
+    write_utf(&mut packs, "minecraft");
+    write_utf(&mut packs, "core");
+    write_utf(&mut packs, "26.2");
+    send(&mut s, 7, &packs);
+
+    // Now expect a run of RegistryData packets (7), an UpdateTags packet (13),
+    // terminated by FinishConfiguration (3).
+    let mut registry_packets = 0;
+    let mut saw_tags = false;
+    loop {
+        let (id, _) = recv(&mut s);
+        match id {
+            7 => registry_packets += 1,
+            13 => saw_tags = true, // ClientboundUpdateTags
+            3 => break,            // ClientboundFinishConfiguration
+            other => panic!("unexpected packet during registry sync: {other}"),
+        }
+    }
+    assert_eq!(
+        registry_packets, 29,
+        "one RegistryData packet per synced registry"
+    );
+    assert!(saw_tags, "UpdateTags sent before FinishConfiguration");
+
+    // Acknowledge finish -> server enters play and sends the join sequence.
+    send(&mut s, 3, &[]); // ServerboundFinishConfiguration
+
+    // First play packet must be ClientboundLogin (id 49).
+    let (id, body) = recv(&mut s);
+    assert_eq!(id, 49, "ClientboundLogin (play)");
+    // entity id is the first field: int 1.
+    assert_eq!(&body[0..4], &1i32.to_be_bytes(), "entity id");
+
+    // The join sequence also includes a level chunk (45). Confirm at least one
+    // arrives without the connection dropping.
+    let mut saw_chunk = false;
+    for _ in 0..60 {
+        let (id, _) = recv(&mut s);
+        if id == 45 {
+            saw_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_chunk, "received at least one LevelChunkWithLight");
+}

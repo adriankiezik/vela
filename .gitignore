@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+
+# Backtraces emitted on panic
+*.rs.bk
+
+# Local AI assistant guidance (not part of the project)
+CLAUDE.md
+
+# Editor / OS cruft
+*.swp
+.DS_Store
+.idea/
+.vscode/
