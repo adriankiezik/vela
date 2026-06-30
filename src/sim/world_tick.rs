@@ -40,12 +40,15 @@ use super::packets::{self, ClockUpdate};
 #[allow(dead_code)]
 pub const DAY_LENGTH: i64 = 24_000;
 
-/// Default starting time of day (1000 ticks ≈ just after sunrise) so a fresh
-/// world spawns in daylight rather than at midnight.
-const DEFAULT_DAY_TIME: i64 = 1_000;
+/// Default starting time of day. A fresh vanilla world starts at `0` (midnight
+/// of day 0); we match that for 1:1 parity rather than offsetting into daylight.
+const DEFAULT_DAY_TIME: i64 = 0;
 
 /// How often the gameTime-only resync is broadcast, matching vanilla's
 /// `MinecraftServer.tickChildren` `tickCount % 20 == 0` (`forceGameTimeSynchronization`).
+/// Vanilla increments `tickCount` *before* this gate, so the first sync lands on
+/// tick 20; `world_tick` advances `game_time` first and gates on it identically,
+/// so the phase matches (first periodic sync at game_time 20, then every 20).
 const TIME_SYNC_INTERVAL: i64 = 20;
 
 /// World game rules. Models the subset the world tick reads plus a few common
@@ -214,11 +217,18 @@ impl Weather {
         events
     }
 
-    /// Whether it is currently raining (rain level non-zero), matching
-    /// `Level.isRaining` (`getRainLevel(1.0) > 0.2` for gameplay, but the
-    /// transition broadcast keys off the discrete `raining` flag via the level).
+    /// Whether it is currently raining, matching `Level.isRaining()` =
+    /// `getRainLevel(1.0) > 0.2` (`Level.java`). This drives both the
+    /// START/STOP_RAINING transition broadcast and the join-time weather guard.
     pub fn is_raining(&self) -> bool {
-        self.rain_level > 0.0
+        self.rain_level > 0.2
+    }
+
+    /// Whether it is currently thundering, matching `Level.isThundering()` =
+    /// `getThunderLevel(1.0) > 0.9` (`Level.java`).
+    #[allow(dead_code)]
+    pub fn is_thundering(&self) -> bool {
+        self.thunder_level > 0.9
     }
 }
 
@@ -339,9 +349,29 @@ mod tests {
             raining: true,
             ..Default::default()
         };
-        // First tick lifts rain_level off 0.0 -> START_RAINING + level changes.
-        let events = w.advance(true);
-        assert!(!events.is_empty());
+        // While the rain level ramps up every tick emits a RAIN_LEVEL_CHANGE.
+        assert!(!w.advance(true).is_empty());
+        // `is_raining()` flips only once the level passes the vanilla 0.2 gate
+        // (~21 ticks at +0.01/tick), and the START_RAINING transition fires there.
+        let mut saw_start = false;
+        for _ in 0..25 {
+            for pkt in w.advance(true) {
+                if pkt == packets::game_event(packets::GAME_EVENT_START_RAINING, 0.0) {
+                    saw_start = true;
+                }
+            }
+        }
         assert!(w.is_raining());
+        assert!(saw_start, "START_RAINING fires when rain_level crosses 0.2");
+    }
+
+    #[test]
+    fn thundering_uses_0_9_threshold() {
+        let mut w = Weather::default();
+        assert!(!w.is_thundering());
+        w.thunder_level = 0.95;
+        assert!(w.is_thundering());
+        w.thunder_level = 0.9;
+        assert!(!w.is_thundering()); // strictly greater
     }
 }

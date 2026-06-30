@@ -119,15 +119,19 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
     // rain/thunder GameEvents if it is currently raining.
     send_world_state(world, &outbox);
 
-    // Seed the loaded-chunk set to exactly the `(2R+1)²` square the join just
-    // streamed, centered on (0, 0). The streaming system (`stream_chunks`) keys
-    // off this center, so it sends only deltas as the player moves and never
-    // re-sends a chunk the join already delivered.
+    // Seed the loaded-chunk set to exactly the rounded view region the join just
+    // streamed, centered on the spawn chunk (derived from `SPAWN_XZ`). Using the
+    // same `in_view` predicate the streaming diff uses means the seeded set equals
+    // what `send_join_sequence` streamed — no double-send, no gap — and the
+    // streaming system (`stream_chunks`) sends only deltas as the player moves.
     let radius = join.view_distance;
+    let spawn_center = ((sx.floor() as i32) >> 4, (sz.floor() as i32) >> 4);
     let mut loaded = std::collections::HashSet::new();
-    for cx in -radius..=radius {
-        for cz in -radius..=radius {
-            loaded.insert((cx, cz));
+    for cx in (spawn_center.0 - radius - 1)..=(spawn_center.0 + radius + 1) {
+        for cz in (spawn_center.1 - radius - 1)..=(spawn_center.1 + radius + 1) {
+            if in_view(spawn_center, cx, cz, radius) {
+                loaded.insert((cx, cz));
+            }
         }
     }
 
@@ -237,7 +241,7 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
             },
             Meta::default(),
             LoadedChunks {
-                center: (0, 0),
+                center: spawn_center,
                 loaded,
             },
             Conn { outbox },
@@ -270,13 +274,18 @@ fn send_join_sequence(
         outbox,
         packets::game_event(packets::GAME_EVENT_LEVEL_CHUNKS_LOAD_START, 0.0),
     );
-    ok &= send(outbox, packets::set_chunk_center(0, 0));
-    // Stream exactly the advertised view distance of chunks so the client's
-    // "Loading terrain" wait is fully satisfied.
+    // Center on the spawn chunk (derived from the spawn position) so the streamed
+    // region tracks spawn automatically and matches the seeded `LoadedChunks`.
+    let center = ((sx.floor() as i32) >> 4, (sz.floor() as i32) >> 4);
+    ok &= send(outbox, packets::set_chunk_center(center.0, center.1));
+    // Stream exactly the rounded view region (vanilla `ChunkTrackingView`) so the
+    // client's "Loading terrain" wait is fully satisfied — no more, no less.
     let radius = join.view_distance;
-    for cx in -radius..=radius {
-        for cz in -radius..=radius {
-            ok &= send(outbox, packets::level_chunk(cx, cz));
+    for cx in (center.0 - radius - 1)..=(center.0 + radius + 1) {
+        for cz in (center.1 - radius - 1)..=(center.1 + radius + 1) {
+            if in_view(center, cx, cz, radius) {
+                ok &= send(outbox, packets::level_chunk(cx, cz));
+            }
         }
     }
     ok &= send(
@@ -455,10 +464,18 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         Serverbound::SetCreativeSlot { slot, stack } => {
             inventory_mut(world, entity).set_slot(slot, stack);
         }
-        // Block dig. Creative is instant-break (the client sends only
-        // START_DESTROY_BLOCK); survival sends START then STOP — we break on
-        // either and the second is a no-op once the cell is already air. ABORT
-        // and the non-dig actions only need their sequence acknowledged.
+        // Block dig. The server advertises SURVIVAL (`GAME_TYPE_SURVIVAL`), so we
+        // mirror `ServerPlayerGameMode.handleBlockBreakAction` for a non-instabuild
+        // player: the block is destroyed on STOP_DESTROY_BLOCK (the completion
+        // signal the client sends when the dig finishes), not on START. ABORT and
+        // the non-dig actions only need their sequence acknowledged.
+        //
+        // KNOWN GAP: vanilla survival *also* destroys instantly on START when the
+        // block's destroy progress reaches 1 in a single tick (0-hardness blocks
+        // like flowers/torches). We have no block-hardness model yet, so every
+        // block waits for STOP. (A creative client would send only START and break
+        // instantly; we don't advertise creative or track a per-player game mode,
+        // so that path isn't modelled here.)
         Serverbound::PlayerAction {
             action,
             x,
@@ -467,12 +484,14 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
             face: _,
             sequence,
         } => {
-            // 0 = START_DESTROY_BLOCK, 2 = STOP_DESTROY_BLOCK.
-            if action == 0 || action == 2 {
+            // 2 = STOP_DESTROY_BLOCK (dig completed).
+            if action == 2 {
                 let prev = crate::world::set_block(x, y, z, crate::world::AIR_STATE);
                 if prev != crate::world::AIR_STATE {
-                    broadcast_to_all(
+                    broadcast_block_update(
                         world,
+                        x,
+                        z,
                         packets::block_update(x, y, z, crate::world::AIR_STATE),
                     );
                 }
@@ -501,7 +520,10 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
                 // (loosely — air is the one replaceable state we model).
                 if crate::world::block_state_at(px, py, pz) == crate::world::AIR_STATE {
                     crate::world::set_block(px, py, pz, state);
-                    broadcast_to_all(world, packets::block_update(px, py, pz, state));
+                    // Simplified placement: the held stack is NOT decremented and
+                    // there is no reach/cursor validation — this is infinite-blocks
+                    // demo placement, not survival inventory logic.
+                    broadcast_block_update(world, px, pz, packets::block_update(px, py, pz, state));
                 }
             }
             ack_block_change(world, entity, sequence);
@@ -543,12 +565,17 @@ fn ack_block_change(world: &mut World, entity: Entity, sequence: i32) {
     }
 }
 
-/// Fan a single framed packet out to every connection, including the sender —
-/// the model `Serverbound::Chat` uses, for world edits everyone must observe.
-fn broadcast_to_all(world: &mut World, bytes: bytes::Bytes) {
-    let mut q = world.query::<&Conn>();
-    for conn in q.iter(world) {
-        let _ = conn.outbox.try_send(Outbound::Packet(bytes.clone()));
+/// Fan a block-change packet out to exactly the players tracking the affected
+/// column `(bx>>4, bz>>4)`, mirroring vanilla — `ServerLevel.blockUpdated` routes
+/// `ClientboundBlockUpdatePacket` through the chunk's tracking players, not every
+/// connection. The actor is included (they observe their own edit).
+fn broadcast_block_update(world: &mut World, bx: i32, bz: i32, bytes: bytes::Bytes) {
+    let cc = (bx >> 4, bz >> 4);
+    let mut q = world.query::<(&Conn, &LoadedChunks)>();
+    for (conn, loaded) in q.iter(world) {
+        if loaded.loaded.contains(&cc) {
+            let _ = conn.outbox.try_send(Outbound::Packet(bytes.clone()));
+        }
     }
 }
 
@@ -780,28 +807,44 @@ pub fn stream_chunks(config: Res<Config>, mut players: Query<(&Pos, &Conn, &mut 
     }
 }
 
-/// Pure diff between two `(2R+1)²` chunk squares. Returns `(added, removed)`:
-/// columns within `radius` of `new` but not of `old` (added), and columns within
-/// `radius` of `old` but not of `new` (removed). `added` is ordered nearest-first
-/// (by Chebyshev distance to `new`) to match vanilla's distance-ordered send.
-fn chunk_diff(old: ChunkCoord, new: ChunkCoord, radius: i32) -> (Vec<ChunkCoord>, Vec<ChunkCoord>) {
-    let in_square =
-        |c: (i32, i32), x: i32, z: i32| (x - c.0).abs() <= radius && (z - c.1).abs() <= radius;
+/// Vanilla `ChunkTrackingView` membership with `includeNeighbors = true`
+/// (`bufferRange = 2`, `ChunkTrackingView.isWithinDistance`): a chunk `(x, z)` is
+/// tracked by a player centered at `center` with server view-distance `radius`
+/// iff `max(0, |dx|-2)² + max(0, |dz|-2)² < radius²`. This reaches `radius+1` on
+/// the axes and rounds the far corners off — the exact shape vanilla streams,
+/// which is neither the plain `|dx|≤R ∧ |dz|≤R` square (it misses the `R+1` ring
+/// and over-sends corners) nor a circle. The enclosing bounding box is
+/// `center ± (radius+1)`.
+fn in_view(center: ChunkCoord, x: i32, z: i32, radius: i32) -> bool {
+    let dx = ((x - center.0).abs() - 2).max(0) as i64;
+    let dz = ((z - center.1).abs() - 2).max(0) as i64;
+    dx * dx + dz * dz < (radius as i64) * (radius as i64)
+}
 
+/// Pure diff between two rounded `ChunkTrackingView` regions (see [`in_view`]).
+/// Returns `(added, removed)`: columns tracked from `new` but not `old` (added),
+/// and tracked from `old` but not `new` (removed). `added` is ordered
+/// nearest-first by *squared Euclidean* chunk distance to `new`, matching
+/// `PlayerChunkSender.collectChunksToSend`'s `playerPos.distanceSquared` sort.
+fn chunk_diff(old: ChunkCoord, new: ChunkCoord, radius: i32) -> (Vec<ChunkCoord>, Vec<ChunkCoord>) {
     let mut added = Vec::new();
-    for x in (new.0 - radius)..=(new.0 + radius) {
-        for z in (new.1 - radius)..=(new.1 + radius) {
-            if !in_square(old, x, z) {
+    for x in (new.0 - radius - 1)..=(new.0 + radius + 1) {
+        for z in (new.1 - radius - 1)..=(new.1 + radius + 1) {
+            if in_view(new, x, z, radius) && !in_view(old, x, z, radius) {
                 added.push((x, z));
             }
         }
     }
-    added.sort_by_key(|&(x, z)| (x - new.0).abs().max((z - new.1).abs()));
+    added.sort_by_key(|&(x, z)| {
+        let dx = (x - new.0) as i64;
+        let dz = (z - new.1) as i64;
+        dx * dx + dz * dz
+    });
 
     let mut removed = Vec::new();
-    for x in (old.0 - radius)..=(old.0 + radius) {
-        for z in (old.1 - radius)..=(old.1 + radius) {
-            if !in_square(new, x, z) {
+    for x in (old.0 - radius - 1)..=(old.0 + radius + 1) {
+        for z in (old.1 - radius - 1)..=(old.1 + radius + 1) {
+            if in_view(old, x, z, radius) && !in_view(new, x, z, radius) {
                 removed.push((x, z));
             }
         }
@@ -860,18 +903,33 @@ fn send(outbox: &OutboxTx, bytes: bytes::Bytes) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::chunk_diff;
+    use super::{chunk_diff, in_view};
     use std::collections::HashSet;
 
-    /// The full `(2R+1)²` square of chunks around a center.
-    fn square(center: (i32, i32), radius: i32) -> HashSet<(i32, i32)> {
+    /// The rounded `ChunkTrackingView` region around a center — the same
+    /// predicate (`in_view`) the production diff uses, enumerated over its
+    /// bounding box `center ± (radius+1)`.
+    fn view_set(center: (i32, i32), radius: i32) -> HashSet<(i32, i32)> {
         let mut s = HashSet::new();
-        for x in (center.0 - radius)..=(center.0 + radius) {
-            for z in (center.1 - radius)..=(center.1 + radius) {
-                s.insert((x, z));
+        for x in (center.0 - radius - 1)..=(center.0 + radius + 1) {
+            for z in (center.1 - radius - 1)..=(center.1 + radius + 1) {
+                if in_view(center, x, z, radius) {
+                    s.insert((x, z));
+                }
             }
         }
         s
+    }
+
+    #[test]
+    fn view_reaches_axis_plus_one_and_rounds_corners() {
+        // bufferRange=2: on-axis a chunk is in view out to radius+1, but the far
+        // corner is rounded off. Use a realistic view distance where the rounding
+        // is visible: max(0,7)²+max(0,7)² = 98 ≥ 64, so (9,9) is clipped at R=8.
+        let radius = 8;
+        assert!(in_view((0, 0), radius + 1, 0, radius)); // axis: reaches R+1
+        assert!(!in_view((0, 0), radius + 2, 0, radius)); // but not R+2
+        assert!(!in_view((0, 0), radius + 1, radius + 1, radius)); // corner clipped
     }
 
     #[test]
@@ -882,33 +940,32 @@ mod tests {
     }
 
     #[test]
-    fn diff_single_step_is_two_strips() {
-        // Moving one chunk in +x with radius R adds one column-strip on the new
-        // leading edge and removes one on the old trailing edge: (2R+1) each.
+    fn diff_single_step_is_symmetric_and_consistent() {
+        // Moving one chunk in +x: added are exactly the columns newly in view and
+        // removed exactly those that left, and (by the shape's symmetry) the two
+        // sets have equal size.
         let radius = 3;
         let (added, removed) = chunk_diff((0, 0), (1, 0), radius);
-        let strip = (2 * radius + 1) as usize;
-        assert_eq!(added.len(), strip);
-        assert_eq!(removed.len(), strip);
-        // Every added column is the new leading edge x = new.x + radius.
-        assert!(added.iter().all(|&(x, _)| x == 1 + radius));
-        // Every removed column is the old trailing edge x = old.x - radius.
-        assert!(removed.iter().all(|&(x, _)| x == -radius));
+        assert!(!added.is_empty());
+        assert_eq!(added.len(), removed.len());
+        // Added are all leading-edge (x > 0 side), removed all trailing-edge.
+        assert!(added.iter().all(|&(x, _)| x > 0));
+        assert!(removed.iter().all(|&(x, _)| x <= 0));
     }
 
     #[test]
     fn diff_matches_set_difference() {
-        // The diff must equal the set-theoretic difference of the two squares,
-        // for an arbitrary jump that partially overlaps.
+        // The diff must equal the set-theoretic difference of the two rounded
+        // view regions, for an arbitrary jump that partially overlaps.
         let old = (2, -1);
         let new = (4, 1);
         let radius = 3;
         let (added, removed) = chunk_diff(old, new, radius);
 
-        let old_sq = square(old, radius);
-        let new_sq = square(new, radius);
-        let expect_added: HashSet<_> = new_sq.difference(&old_sq).copied().collect();
-        let expect_removed: HashSet<_> = old_sq.difference(&new_sq).copied().collect();
+        let old_v = view_set(old, radius);
+        let new_v = view_set(new, radius);
+        let expect_added: HashSet<_> = new_v.difference(&old_v).copied().collect();
+        let expect_removed: HashSet<_> = old_v.difference(&new_v).copied().collect();
 
         assert_eq!(added.iter().copied().collect::<HashSet<_>>(), expect_added);
         assert_eq!(
@@ -918,22 +975,22 @@ mod tests {
     }
 
     #[test]
-    fn diff_disjoint_jump_swaps_whole_squares() {
-        // A jump farther than the diameter shares no chunks: the whole old square
-        // is forgotten and the whole new square is loaded.
+    fn diff_disjoint_jump_swaps_whole_regions() {
+        // A jump farther than the diameter shares no chunks: the whole old region
+        // is forgotten and the whole new region is loaded.
         let radius = 2;
         let (added, removed) = chunk_diff((0, 0), (100, 100), radius);
-        let area = ((2 * radius + 1) * (2 * radius + 1)) as usize;
+        let area = view_set((0, 0), radius).len();
         assert_eq!(added.len(), area);
         assert_eq!(removed.len(), area);
     }
 
     #[test]
     fn diff_added_is_nearest_first() {
-        // Added chunks are ordered by Chebyshev distance to the new center, so
-        // the closest ring streams first (vanilla's distance-ordered send).
+        // Added chunks are ordered by squared Euclidean distance to the new
+        // center, matching PlayerChunkSender's distanceSquared sort.
         let (added, _) = chunk_diff((0, 0), (5, 0), 3);
-        let dist = |&(x, z): &(i32, i32)| (x - 5).abs().max(z.abs());
+        let dist = |&(x, z): &(i32, i32)| ((x - 5) * (x - 5) + z * z) as i64;
         for w in added.windows(2) {
             assert!(dist(&w[0]) <= dist(&w[1]));
         }
