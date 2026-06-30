@@ -181,19 +181,29 @@ pub async fn handle(
                     None => return Ok(()), // unexpected Key (no Hello issued)
                 };
 
-                let profile = match authenticate(
-                    &encrypted_secret,
-                    &encrypted_token,
-                    &token,
-                    &requested_name,
-                    &config,
-                    peer,
-                )
-                .await
+                // Decrypt + validate the key exchange. A failure here is a
+                // protocol error: vanilla throws *before* encryption is set up
+                // and drops the connection, so just close — the cipher is not
+                // installed on either side, and there is nothing useful to send.
+                let secret = match decrypt_key_exchange(&encrypted_secret, &encrypted_token, &token)
                 {
-                    Ok((secret, profile)) => {
-                        // Everything from here is encrypted in both directions.
-                        stream = stream.enable_encryption(&secret);
+                    Ok(secret) => secret,
+                    Err(_) => {
+                        warn!(%peer, "key exchange failed");
+                        return Ok(());
+                    }
+                };
+
+                // Install the stream cipher NOW, before authenticating. The
+                // client enabled its own cipher the instant it sent the Key, so
+                // everything we send from here — including an auth-failure
+                // disconnect — must be encrypted or the client decrypts plaintext
+                // into garbage and shows a blank "Disconnected" screen. Mirrors
+                // vanilla `setupEncryption` running ahead of the auth thread.
+                stream = stream.enable_encryption(&secret);
+
+                let profile = match resolve_profile(&secret, &requested_name, &config, peer).await {
+                    Ok(profile) => {
                         info!(%peer, name = %profile.name, uuid = %profile.uuid, "authenticated");
                         profile
                     }
@@ -201,17 +211,16 @@ pub async fn handle(
                         let reason = match e {
                             AuthError::Unverified => "multiplayer.disconnect.unverified_username",
                             AuthError::Unavailable => "multiplayer.disconnect.authservers_down",
+                            // The crypto already succeeded above, so these cannot
+                            // surface here; treat any straggler as a drop.
                             AuthError::BadVerifyToken | AuthError::Crypt => {
-                                // A protocol error: vanilla throws and drops the
-                                // connection. The cipher may not be installed, so
-                                // just close without a (possibly unreadable) packet.
                                 warn!(%peer, "key exchange failed");
                                 return Ok(());
                             }
                         };
                         warn!(%peer, name = %requested_name, reason, "login refused");
-                        // The encryption cipher is not installed on this failure
-                        // path, so the disconnect goes out in the clear.
+                        // The cipher is installed, so this goes out encrypted —
+                        // which is exactly what the client now expects to read.
                         login_disconnect(&mut stream, reason, compression).await?;
                         return Ok(());
                     }
@@ -342,18 +351,15 @@ async fn login_disconnect<W: AsyncWrite + Unpin>(
     send_packet(w, CB_LOGIN_DISCONNECT, &p.buf, compression).await
 }
 
-/// Decrypt the client's RSA-wrapped shared secret and verify token, validate the
-/// challenge, compute the server-id hash, and resolve the authenticated profile
-/// via Mojang's `hasJoined`. Returns the 16-byte AES secret and the profile.
-/// Mirrors the cryptographic core of vanilla's `handleKey`.
-async fn authenticate(
+/// Decrypt the client's RSA-wrapped shared secret and verify token and validate
+/// the challenge. Returns the 16-byte AES secret. A failure is a pre-encryption
+/// protocol error (`BadVerifyToken`/`Crypt`); vanilla `handleKey` throws here
+/// before any cipher is installed. Mirrors the cryptographic core of `handleKey`.
+fn decrypt_key_exchange(
     encrypted_secret: &[u8],
     encrypted_token: &[u8],
     expected_token: &[u8; 4],
-    name: &str,
-    config: &ServerConfig,
-    peer: std::net::SocketAddr,
-) -> Result<([u8; 16], AuthProfile), AuthError> {
+) -> Result<[u8; 16], AuthError> {
     let keys = crypto::server_keys();
 
     // The verify token must round-trip through our private key unchanged.
@@ -364,12 +370,24 @@ async fn authenticate(
 
     // The shared secret is a 16-byte AES-128 key.
     let secret_bytes = keys.decrypt(encrypted_secret)?;
-    let secret: [u8; 16] = secret_bytes
+    secret_bytes
         .as_slice()
         .try_into()
-        .map_err(|_| AuthError::Crypt)?;
+        .map_err(|_| AuthError::Crypt)
+}
 
-    let server_hash = crypto::server_id_hash("", &secret, keys.public_der());
+/// Compute the server-id hash from the now-known shared secret and resolve the
+/// authenticated profile via Mojang's `hasJoined`. Runs *after* the stream
+/// cipher is installed, so its `Unverified`/`Unavailable` failures are reported
+/// to the client over the encrypted connection — matching vanilla's auth thread.
+async fn resolve_profile(
+    secret: &[u8; 16],
+    name: &str,
+    config: &ServerConfig,
+    peer: std::net::SocketAddr,
+) -> Result<AuthProfile, AuthError> {
+    let keys = crypto::server_keys();
+    let server_hash = crypto::server_id_hash("", secret, keys.public_der());
 
     // `prevent-proxy-connections` pins the auth to the client's IP, matching
     // vanilla's optional `&ip=` parameter.
@@ -381,13 +399,9 @@ async fn authenticate(
 
     // The HTTP call is blocking; keep it off the async runtime.
     let name = name.to_string();
-    let profile = tokio::task::spawn_blocking(move || {
-        crypto::has_joined(&name, &server_hash, ip.as_deref())
-    })
-    .await
-    .map_err(|_| AuthError::Unavailable)??;
-
-    Ok((secret, profile))
+    tokio::task::spawn_blocking(move || crypto::has_joined(&name, &server_hash, ip.as_deref()))
+        .await
+        .map_err(|_| AuthError::Unavailable)?
 }
 
 /// On entering configuration: announce the server brand (so the client's F3
