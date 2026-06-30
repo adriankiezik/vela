@@ -5,105 +5,62 @@ Vela is split into two halves joined by channels:
 > **`tokio` owns sockets. `bevy_ecs` owns the game. One channel each way.**
 
 The network layer never touches game state; the simulation never touches a
-socket. Everything crossing between them is a message.
+socket. Everything crossing between them is a message, so either side can be
+reworked without disturbing the other.
 
 ```
-tokio tasks (per connection)            bevy_ecs world (single owner, 20 TPS)
-  read_frame → decode                     ── tick ──► systems
-       │  ToSim                                            │ framed bytes
-       └──────────► mpsc ───► [ drain_ingress ] ──► per-conn mpsc ──► write task
-                                                                          │
-                                                                       socket
+  connections (async, one task each)        game world (one owner, fixed tick)
+      decode inbound  ──►  ingress channel  ──►  apply + simulate
+      write outbound  ◄──  per-connection outbox  ◄──  produce
 ```
 
-## Modules
+## Layers
 
-```
-src/
-  main.rs              spawn the sim thread + the accept loop; wire the channels
-  protocol/            the hand-written wire codec
-    varint.rs            VarInt read/write
-    framing.rs           frame(id, body) → length-prefixed bytes
-    buffer.rs            PacketReader / PacketWriter field accessors
-    nbt.rs               binary NBT (named + network framings)
-    uuid.rs              offline-mode player UUIDs
-    mod.rs               protocol version, State / Intent enums
-  net/                 owns sockets (async)
-    connection.rs        pre-Play state machine: handshake → status | login → config
-    play.rs              Play phase: read task, write task, serverbound decode
-    frame.rs             async read_frame / send_packet
-    mod.rs               net::handle entry point
-  sim/                 owns game state (synchronous, one thread)
-    bridge.rs            ToSim / Outbound / Serverbound — the only shared types
-    components.rs        ECS components + resources
-    systems.rs           per-tick systems
-    packets.rs           clientbound Play packet builders → framed bytes
-    mod.rs               build the World + Schedule, drive the 20 TPS loop
-  registries.rs        network-synced registry entry ids (known-pack passthrough)
-  registry_tags.rs     registry tag names, bound empty during configuration
-```
+- **protocol** — the hand-written wire codec: framing, VarInt, NBT, and the
+  connection state machine. Pure and synchronous; no I/O.
+- **net** — owns sockets. One async task per connection. Pre-Play states are
+  plain request/response and run inline; in Play the connection bridges to the
+  simulation through channels and otherwise holds no game state.
+- **sim** — owns all game state. A single ECS world advanced on a fixed tick
+  (20 per second) on its own thread. Players and other game objects are
+  entities; per-tick behaviour is expressed as systems.
 
 ## Connection lifecycle
 
-A connection is one `tokio` task running `net::handle`:
-
-1. **Handshake / Status / Login / Configuration** run inline in `connection.rs`,
-   reading and writing the socket directly. These states are strict
-   request/response, so no shared state is involved.
-2. On reaching **Play**, the socket splits into two tasks (`play.rs`):
-   - a **read task** decodes frames into `Serverbound` values and forwards them
-     to the sim as `ToSim::Packet`;
-   - a **write task** drains this connection's outbox and pumps framed bytes to
-     the socket, batching a burst into one flush.
-3. `play` registers the player (`ToSim::Joined`, handing over the outbox), waits
-   for either task to finish, tears down the other, and emits one
-   `ToSim::Left`.
-
-`read_frame` is not cancellation-safe, so it lives alone in the read task and is
-only ever aborted wholesale on teardown — never raced against a timer.
+A connection is one async task. It carries the client through handshake,
+status/login, and configuration as direct request/response. On entering Play it
+splits in two: one side decodes inbound packets and forwards them to the
+simulation, the other drains an outbox of outbound packets to the socket. The
+connection registers with the simulation once on join and signals once on
+disconnect; in between it is a pure conduit.
 
 ## Simulation
 
-The sim is a single `bevy_ecs` world ticked at 20 TPS on its own OS thread (it
-is CPU-bound and synchronous, so not a tokio worker). Each tick runs a chained
-schedule:
-
-- **`advance_tick`** — bump the tick counter.
-- **`drain_ingress`** — exclusive system: drain the ingress channel and apply
-  each message. Joins spawn an entity and push the join sequence; leaves
-  despawn; packets mutate components (movement) or fan out (chat). Spawn/despawn
-  and cross-entity broadcast don't fit the parallel `Query` model, so this stage
-  owns `&mut World` directly.
-- **`keepalive`** — ordinary system: send a keep-alive every 200 ticks (10 s)
-  and despawn anyone who missed the previous one.
-
-A player is an entity carrying `PlayerId` + `Profile` + `Pos` + `Conn` (its
-outbox) + `KeepAlive`. World-wide state lives in resources: `Tick`,
-`NextEntityId`, `PlayerIndex` (`Uuid → Entity`), `Ingress` (the receiving end of
-the channel), and `Control` (shutdown flag).
+The simulation runs on its own thread — not the async runtime — because it is
+CPU-bound and synchronous. Each tick it drains everything the network delivered
+since the previous tick, applies it, then advances the world. It performs no
+I/O: inbound work arrives as messages and outbound packets leave through
+per-connection outboxes. Because all game state sits behind a single owner,
+there is no shared mutable state between connections and nothing to lock on the
+hot path.
 
 ## The bridge
 
-`sim/bridge.rs` is the entire contract between the halves:
+A small set of message types is the entire contract between the halves:
 
-- **`ToSim`** (net → sim, one shared channel): `Joined { id, name, outbox }`,
-  `Left { id }`, `Packet { id, packet }`.
-- **`Outbound`** (sim → net, one channel per connection): `Packet(Bytes)` to
-  write, or `Close` to tear the connection down.
-- **`Serverbound`**: the decoded Play packets the sim acts on (movement, chat,
-  keep-alive, teleport-accept). The `net` layer owns the wire codec; the sim
-  stays protocol-shape-agnostic.
+- **net → sim**: a player joined (with the handle to reach them), a player
+  left, or a decoded packet from a player.
+- **sim → net**: a packet to send, or a request to close the connection.
 
-Clientbound bytes are framed by the sim (synchronously, in `packets.rs`) and the
-write task only writes them — so all encoding lives on one side and the boundary
-carries plain `Bytes`.
+The simulation produces fully encoded packets; the network side only moves
+bytes. All protocol knowledge stays on one side of the boundary and the channel
+between them carries opaque bytes — which is what lets the codec and the game
+logic evolve independently.
 
 ## Conventions
 
-- The protocol layer is hand-written (VarInt, framing, NBT, state machine);
-  general-purpose crates handle plumbing (`tokio`, `bytes`, `serde`,
-  `bevy_ecs`). High-level Minecraft frameworks are out of scope.
-- `bevy_ecs` is used with `default-features = false` (core ECS only) — no
-  rendering, reflection, or math crates a headless server doesn't need.
-- Offline mode only: no compression, no encryption. Every frame is
-  `VarInt(length) | VarInt(id) | body`.
+- The protocol layer is built by hand (the part worth owning); general-purpose
+  crates handle plumbing. High-level Minecraft frameworks are out of scope.
+- `bevy_ecs` is used as core ECS only — no rendering, reflection, or math
+  features a headless server doesn't need.
+- Offline mode only: no compression or encryption.
