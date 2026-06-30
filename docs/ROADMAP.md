@@ -41,7 +41,7 @@ marked accordingly.
 - `M` — **SNBT / text-component parsing** (chat components as NBT in 26.2, not JSON)
 - `M` — **Text component model**: styles, colors, translations, hover/click events, serialization to network NBT
 - `S` — **Resource location / identifier** type (`namespace:path`) with validation
-- `M` — **Bit-packed `PalettedContainer`** (block states + biomes storage, the core chunk encoding primitive)
+- `M` — `[partial]` **Bit-packed `PalettedContainer`** (block states + biomes storage, the core chunk encoding primitive): wire serialization done (single-value + 4-bit linear palette, non-spanning `SimpleBitStorage` packing) for static columns in `src/world`. No mutable container / resize / hashmap+global palette read path yet
 
 ## Login → Configuration → Play handshake
 
@@ -70,10 +70,10 @@ marked accordingly.
 
 - `L` — **Block-state model**: `Block` registry, `BlockState` with properties, global palette IDs
 - `L` — **Chunk data structures**: `LevelChunk`, 16×16×16 sections, heightmaps, biome storage
-- `XL` — `[partial]` **Chunk serialization** (`ClientboundLevelChunkWithLight`): packet wire format implemented for **all-air void columns** (single-valued block/biome palettes, empty heightmaps, empty light). Real paletted block/biome data and block entities pending
+- `XL` — `[partial]` **Chunk serialization** (`ClientboundLevelChunkWithLight`): packet wire format implemented for a **static flat column** (bedrock/dirt/grass via single-value + 4-bit linear block palettes, single-value biome, real `WORLD_SURFACE`/`MOTION_BLOCKING` heightmaps, empty light). Block-state ids derived from the server's own `--reports` dump. Per-chunk variation, block entities, and dynamic edits pending
 - `M` — `[partial]` **Light engine**: empty-light payload sent (four empty BitSets + two empty arrays); no real sky/block light propagation yet
 - `M` — `[partial]` **Chunk streaming**: `SetChunkCacheCenter` + a fixed view-radius batch of chunks sent on join. Dynamic load/unload by movement and `ForgetLevelChunk` pending
-- `M` — **Heightmaps** computation & maintenance
+- `M` — `[partial]` **Heightmaps** computation & maintenance: flat-profile `WORLD_SURFACE`/`MOTION_BLOCKING` computed and sent; live recomputation on block change pending
 - `S` — **Block-change packets**: `BlockUpdate`, `SectionBlocksUpdate`
 - `M` — **Block entities** (`BlockEntityData`, chests/signs/etc. NBT) — model + per-type data
 - `M` — **Region / `.mca` persistence** (Anvil format) — or start with in-memory only and defer

@@ -11,6 +11,7 @@ mod protocol;
 mod registries;
 mod registry_tags;
 mod sim;
+mod world;
 
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;

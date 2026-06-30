@@ -118,7 +118,7 @@ fn send_join_sequence(outbox: &OutboxTx, entity_id: i32, sx: f64, sy: f64, sz: f
     ok &= send(outbox, packets::set_chunk_center(0, 0));
     for cx in -packets::VIEW_RADIUS..=packets::VIEW_RADIUS {
         for cz in -packets::VIEW_RADIUS..=packets::VIEW_RADIUS {
-            ok &= send(outbox, packets::empty_chunk(cx, cz));
+            ok &= send(outbox, packets::flat_chunk(cx, cz));
         }
     }
     ok &= send(

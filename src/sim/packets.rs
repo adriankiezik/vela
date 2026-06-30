@@ -21,16 +21,14 @@ const CB_PLAY_PLAYER_POSITION: i32 = 72;
 const CB_PLAY_SET_CHUNK_CACHE_CENTER: i32 = 94;
 const CB_PLAY_SYSTEM_CHAT: i32 = 121;
 
-/// `GameType.SPECTATOR` — spawns the player floating, so the empty void world
-/// is viewable without fall damage or fighting gravity.
-const GAME_TYPE_SPECTATOR: u8 = 3;
+/// `GameType.SURVIVAL` — the player drops onto the flat world's grass surface
+/// and stands on it (client-side collision against the chunk data we stream).
+const GAME_TYPE_SURVIVAL: u8 = 0;
 /// `ClientboundGameEventPacket.LEVEL_CHUNKS_LOAD_START` — tells the client to
 /// begin waiting for chunks; the "Loading terrain" screen clears once the
 /// chunks around the player arrive.
 pub const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
 
-/// Overworld column height: 384 blocks / 16 = 24 sections (min_y -64).
-const SECTION_COUNT: usize = 24;
 /// Render/simulation radius we advertise. We send exactly this radius of
 /// chunks, so the client's terrain wait is fully satisfied.
 pub const VIEW_RADIUS: i32 = 5;
@@ -54,10 +52,10 @@ pub fn play_login(entity_id: i32) -> Bytes {
     p.write_varint(1); // dimensionType holder: overworld is registry index 0 -> id+1
     p.write_identifier("minecraft:overworld"); // dimension
     p.write_i64(0); // seed (hashed, cosmetic)
-    p.write_u8(GAME_TYPE_SPECTATOR); // game type
+    p.write_u8(GAME_TYPE_SURVIVAL); // game type
     p.write_u8(0xFF); // previous game type = -1 (none)
     p.write_bool(false); // is debug
-    p.write_bool(false); // is flat
+    p.write_bool(true); // is flat (renders a flat horizon/fog)
     p.write_bool(false); // last death location: absent
     p.write_varint(0); // portal cooldown
     p.write_varint(63); // sea level
@@ -114,20 +112,29 @@ pub fn system_chat(text: &str) -> Bytes {
     frame(CB_PLAY_SYSTEM_CHAT, &p.buf)
 }
 
-/// An all-air chunk column with empty light. Each of the 24 sections is 8 zero
-/// bytes: non-empty block count (short 0), fluid count (short 0), a single-value
-/// air block-state palette (bits=0, VarInt 0, no data array), and a single-value
-/// biome palette (bits=0, VarInt 0).
-pub fn empty_chunk(cx: i32, cz: i32) -> Bytes {
-    let section_data = [0u8; SECTION_COUNT * 8];
+/// A flat chunk column: bedrock floor, dirt fill, grass surface at y=63, air
+/// above. The block data and heightmaps come from `crate::world` (identical for
+/// every column). Light is still sent empty — without a real light engine the
+/// client falls back to full brightness, which is fine for a flat world.
+pub fn flat_chunk(cx: i32, cz: i32) -> Bytes {
+    let section_data = crate::world::flat_column_blob();
+    let heightmaps = crate::world::flat_heightmaps();
 
     let mut p = PacketWriter::new();
     p.write_i32(cx);
     p.write_i32(cz);
     // --- ClientboundLevelChunkPacketData ---
-    p.write_varint(0); // heightmaps: empty map
+    // Heightmaps: a map of type-id -> packed long[] (ByteBufCodecs.map + LONG_ARRAY).
+    p.write_varint(heightmaps.len() as i32);
+    for (type_id, longs) in heightmaps {
+        p.write_varint(*type_id);
+        p.write_varint(longs.len() as i32);
+        for &l in longs {
+            p.write_i64(l);
+        }
+    }
     p.write_varint(section_data.len() as i32); // section blob length
-    p.write_bytes(&section_data);
+    p.write_bytes(section_data);
     p.write_varint(0); // block entities: none
     // --- ClientboundLightUpdatePacketData --- (four empty BitSets, two empty lists)
     p.write_varint(0); // sky-light mask
