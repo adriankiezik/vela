@@ -315,6 +315,31 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         Serverbound::AcceptTeleport(tp) => {
             debug!(teleport_id = tp, "teleport confirmed");
         }
+        // Update the player's selected hotbar slot. The `Inventory` component is
+        // attached lazily on the first inventory packet so the join path stays
+        // untouched.
+        Serverbound::SetCarriedItem { slot } => {
+            if (0..9).contains(&slot) {
+                let mut ent = world.entity_mut(entity);
+                if !ent.contains::<crate::inventory::Inventory>() {
+                    ent.insert(crate::inventory::Inventory::new());
+                }
+                if let Some(mut inv) = ent.get_mut::<crate::inventory::Inventory>() {
+                    inv.selected = slot as u8;
+                }
+            }
+        }
+        // Creative-mode slot set: write the stack into the addressed inventory
+        // slot (server-side state only for now).
+        Serverbound::SetCreativeSlot { slot, stack } => {
+            let mut ent = world.entity_mut(entity);
+            if !ent.contains::<crate::inventory::Inventory>() {
+                ent.insert(crate::inventory::Inventory::new());
+            }
+            if let Some(mut inv) = ent.get_mut::<crate::inventory::Inventory>() {
+                inv.set_slot(slot, stack);
+            }
+        }
     }
 }
 

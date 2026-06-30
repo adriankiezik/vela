@@ -31,6 +31,8 @@ const SB_PLAY_MOVE_PLAYER_POS: i32 = 30;
 const SB_PLAY_MOVE_PLAYER_POS_ROT: i32 = 31;
 const SB_PLAY_MOVE_PLAYER_ROT: i32 = 32;
 const SB_PLAY_MOVE_PLAYER_STATUS_ONLY: i32 = 33;
+const SB_PLAY_SET_CARRIED_ITEM: i32 = 53;
+const SB_PLAY_SET_CREATIVE_MODE_SLOT: i32 = 56;
 
 /// `ServerboundMovePlayerPacket.FLAG_ON_GROUND` — bit 0 of the trailing flags
 /// byte the movement packets carry (bit 1 is horizontal collision, ignored).
@@ -144,6 +146,18 @@ fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbound> {
         // unsigned form for commands without signable arguments (all of ours).
         SB_PLAY_CHAT_COMMAND | SB_PLAY_CHAT_COMMAND_SIGNED => {
             Some(Serverbound::ChatCommand(reader.read_utf(256).ok()?))
+        }
+        // ServerboundSetCarriedItemPacket: a single signed short hotbar slot.
+        SB_PLAY_SET_CARRIED_ITEM => Some(Serverbound::SetCarriedItem {
+            slot: reader.read_u16().ok()? as i16,
+        }),
+        // ServerboundSetCreativeModeSlotPacket: a signed short slot index then an
+        // ItemStack (decoded here via the inventory codec; an unsupported data
+        // component makes `read_item_stack` fail and the packet is dropped).
+        SB_PLAY_SET_CREATIVE_MODE_SLOT => {
+            let slot = reader.read_u16().ok()? as i16;
+            let stack = crate::inventory::read_item_stack(reader).ok()?;
+            Some(Serverbound::SetCreativeSlot { slot, stack })
         }
         _ => None,
     }
