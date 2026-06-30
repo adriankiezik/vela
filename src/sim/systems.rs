@@ -20,8 +20,10 @@ use super::packets;
 /// is considered unresponsive and disconnected.
 const KEEPALIVE_TICKS: u64 = 200;
 
-/// Spawn point every player is teleported to on join.
-const SPAWN: (f64, f64, f64) = (0.0, 64.0, 0.0);
+/// Spawn column (X/Z). The Y is derived per-join from the generated surface
+/// height (see [`on_joined`]) so the player lands on top of the terrain rather
+/// than inside it.
+const SPAWN_XZ: (f64, f64) = (0.0, 0.0);
 /// Teleport id for the initial spawn synchronization; the client echoes it back
 /// via `AcceptTeleportation`.
 const SPAWN_TELEPORT_ID: i32 = 1;
@@ -92,7 +94,10 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
         next.0 += 1;
         v
     };
-    let (sx, sy, sz) = SPAWN;
+    let (sx, sz) = SPAWN_XZ;
+    // The column places grass at `surface_height` with air above, so stand the
+    // player one block higher (their feet rest on top of the grass block).
+    let sy = (crate::world::surface_height(sx as i32, sz as i32) + 1) as f64;
     let join = world.resource::<Config>().join_params();
 
     // The whole join sequence flows through the outbox. If it overflows mid-burst
