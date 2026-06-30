@@ -149,42 +149,12 @@ impl ServerProperties {
         props
     }
 
-    /// Parse the `key=value` body of a properties file. Lines that are blank or
-    /// start with `#`/`!` are comments; a backslash escapes the next char (so
-    /// `\=`, `\:`, `\\`, `\n` round-trip). Unknown keys are retained.
+    /// Parse the `key=value` body of a properties file. See [`parse_properties`].
+    /// Unknown keys are retained so they survive a load/store round-trip.
     fn parse(text: &str) -> Self {
-        let mut values = HashMap::new();
-        for raw in text.lines() {
-            let line = raw.trim_start();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-                continue;
-            }
-            // Split on the first unescaped '=' or ':'.
-            let mut key = String::new();
-            let mut chars = line.chars().peekable();
-            let mut split = false;
-            while let Some(c) = chars.next() {
-                match c {
-                    '\\' => {
-                        if let Some(&n) = chars.peek() {
-                            key.push(unescape(n));
-                            chars.next();
-                        }
-                    }
-                    '=' | ':' => {
-                        split = true;
-                        break;
-                    }
-                    _ => key.push(c),
-                }
-            }
-            if !split {
-                continue;
-            }
-            let value: String = chars.collect();
-            values.insert(key.trim_end().to_string(), unescape_value(value.trim_start()));
+        Self {
+            values: parse_properties(text),
         }
-        Self { values }
     }
 
     /// Write the canonical key set (then any extra unknown keys, sorted) back to
@@ -283,6 +253,49 @@ impl ServerProperties {
             }
         }
     }
+}
+
+/// Parse the body of a `java.util.Properties` file into key/value pairs, shared
+/// by `server.properties` and `eula.txt` (both are Properties files in vanilla).
+///
+/// Lines that are blank or start with `#`/`!` are comments. The key is split from
+/// the value on the first unescaped `=` or `:`; a backslash escapes the next char
+/// (so `\=`, `\:`, `\\`, `\n` round-trip). Java's line-continuation (trailing
+/// `\`) and `\uXXXX` escapes are intentionally unsupported — they never appear in
+/// a real `server.properties`/`eula.txt`.
+pub(super) fn parse_properties(text: &str) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+            continue;
+        }
+        // Split on the first unescaped '=' or ':'.
+        let mut key = String::new();
+        let mut chars = line.chars().peekable();
+        let mut split = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    if let Some(&n) = chars.peek() {
+                        key.push(unescape(n));
+                        chars.next();
+                    }
+                }
+                '=' | ':' => {
+                    split = true;
+                    break;
+                }
+                _ => key.push(c),
+            }
+        }
+        if !split {
+            continue;
+        }
+        let value: String = chars.collect();
+        values.insert(key.trim_end().to_string(), unescape_value(value.trim_start()));
+    }
+    values
 }
 
 /// Map an escaped char to its literal (`\n` -> newline, `\t` -> tab, else self).

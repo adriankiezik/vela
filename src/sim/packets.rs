@@ -41,19 +41,6 @@ pub struct JoinParams {
     pub game_type: u8,
 }
 
-impl Default for JoinParams {
-    fn default() -> Self {
-        Self {
-            max_players: 20,
-            view_distance: 10,
-            simulation_distance: 10,
-            hardcore: false,
-            online_mode: false,
-            game_type: 0,
-        }
-    }
-}
-
 /// ClientboundLogin — the play "join game" packet. Spawns into a single
 /// overworld dimension. `entity_id` is the player's own entity id, assigned by
 /// the world; the rest of the join shape comes from `server.properties` via

@@ -57,21 +57,13 @@ fn save_defaults(path: &Path) {
     }
 }
 
-/// Parse the `eula` key. Only the literal `true` (case-insensitive) counts as
-/// agreed, matching Java's `Boolean.parseBoolean`.
+/// Parse the `eula` key. Vanilla loads `eula.txt` as a `java.util.Properties`
+/// file, so we use the shared properties parser. Only the literal `true`
+/// (case-insensitive) counts as agreed, matching Java's `Boolean.parseBoolean`.
 fn parse_eula(text: &str) -> bool {
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim() == "eula" {
-                return value.trim().eq_ignore_ascii_case("true");
-            }
-        }
-    }
-    false
+    super::properties::parse_properties(text)
+        .get("eula")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]
