@@ -19,9 +19,99 @@ pub struct ItemStack {
 }
 
 impl ItemStack {
-    #[allow(dead_code)] // scaffolding: convenience constructor for future callers/tests.
+    #[allow(dead_code)] // convenience constructor for tests/callers building stacks by id.
     pub fn new(id: i32, count: i32) -> Self {
         Self { id, count }
+    }
+
+    /// The empty stack sentinel (`ItemStack.EMPTY`). Modelled as a zero-count air
+    /// stack so the click-resolution port can pass items by value the way vanilla
+    /// passes `ItemStack.EMPTY`; slot storage still uses `Option<ItemStack>`/`None`.
+    pub const EMPTY: ItemStack = ItemStack { id: 0, count: 0 };
+
+    /// Whether this stack is empty (`ItemStack.isEmpty`): air or a non-positive
+    /// count.
+    pub fn is_empty(&self) -> bool {
+        self.id == crate::registry::item::AIR || self.count <= 0
+    }
+
+    /// The per-item maximum stack size (`ItemStack.getMaxStackSize` →
+    /// `DataComponents.MAX_STACK_SIZE`, default 64). Sourced from the item
+    /// registry's minimal component table.
+    pub fn max_stack_size(&self) -> i32 {
+        crate::registry::item::max_stack_size(self.id)
+    }
+
+    /// `ItemStack.isStackable`: a present stack whose max size exceeds one. (We do
+    /// not model durability, so the damage clause is always satisfied.)
+    pub fn is_stackable(&self) -> bool {
+        !self.is_empty() && self.max_stack_size() > 1
+    }
+
+    /// `ItemStack.isSameItem`: same item id (components ignored — not modelled).
+    pub fn same_item(a: &ItemStack, b: &ItemStack) -> bool {
+        a.id == b.id
+    }
+
+    /// `ItemStack.isSameItemSameComponents`: same item and same data components.
+    /// We model no components beyond count yet, so this collapses to a same-item
+    /// check — documented in [`super`].
+    pub fn same_item_same_components(a: &ItemStack, b: &ItemStack) -> bool {
+        a.id == b.id
+    }
+
+    /// `ItemStack.matches`: equal item, count and components (used by the change
+    /// detector). Components unmodelled, so id + count.
+    #[allow(dead_code)] // change-detector helper for incremental sync (not on the path yet).
+    pub fn matches(a: &ItemStack, b: &ItemStack) -> bool {
+        a.id == b.id && a.count == b.count
+    }
+
+    /// `ItemStack.setCount`.
+    pub fn set_count(&mut self, count: i32) {
+        self.count = count;
+    }
+
+    /// `ItemStack.grow`.
+    pub fn grow(&mut self, amount: i32) {
+        self.count += amount;
+    }
+
+    /// `ItemStack.shrink`.
+    pub fn shrink(&mut self, amount: i32) {
+        self.count -= amount;
+    }
+
+    /// `ItemStack.copyWithCount`.
+    pub fn copy_with_count(&self, count: i32) -> ItemStack {
+        ItemStack { id: self.id, count }
+    }
+
+    /// `ItemStack.split`: remove up to `amount` items into a new stack, reducing
+    /// this one. An empty result (or empty self) yields [`ItemStack::EMPTY`].
+    pub fn split(&mut self, amount: i32) -> ItemStack {
+        let take = amount.min(self.count);
+        if take <= 0 || self.is_empty() {
+            return ItemStack::EMPTY;
+        }
+        let out = self.copy_with_count(take);
+        self.shrink(take);
+        out
+    }
+
+    /// Normalize a possibly-empty value stack to `Option` for slot storage:
+    /// `None` when empty, else `Some(self)`.
+    pub fn to_option(self) -> Option<ItemStack> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+
+    /// The value form of an optional slot: `None` → [`ItemStack::EMPTY`].
+    pub fn from_option(slot: Option<ItemStack>) -> ItemStack {
+        slot.unwrap_or(ItemStack::EMPTY)
     }
 }
 

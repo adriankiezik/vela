@@ -24,17 +24,18 @@
 
 mod container;
 mod item_stack;
+mod menu;
 mod packets;
 
-pub use container::{Inventory, HOTBAR_START};
+pub use container::{Inventory, HOTBAR_START, PLAYER_INVENTORY_SLOTS};
 pub use item_stack::{read_item_stack, ItemStack};
+pub use menu::{ClickType, Menu, OpenContainer};
+pub use packets::container_set_content;
 
 // Scaffolding surface: re-exported for a complete public API but not yet consumed
 // elsewhere in the crate. The underlying items carry their own `dead_code` allows;
 // silence the matching unused-re-export warnings here.
 #[allow(unused_imports)]
-pub use container::PLAYER_INVENTORY_SLOTS;
-#[allow(unused_imports)]
 pub use item_stack::write_item_stack;
 #[allow(unused_imports)]
-pub use packets::{container_set_content, set_held_slot};
+pub use packets::{container_close, container_set_slot, open_screen, set_held_slot};

@@ -131,6 +131,18 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         Serverbound::SetCreativeSlot { slot, stack } => {
             inventory_mut(world, entity).set_slot(slot, stack);
         }
+        // A click in an open menu (player inventory id 0, or an open chest).
+        Serverbound::ContainerClick {
+            container_id,
+            state_id,
+            slot,
+            button,
+            mode,
+        } => on_container_click(world, entity, container_id, state_id, slot, button, mode),
+        // The player closed the open screen.
+        Serverbound::ContainerClose { container_id } => {
+            on_container_close(world, entity, container_id)
+        }
         // Block dig. The server advertises SURVIVAL (`GAME_TYPE_SURVIVAL`), so we
         // mirror `ServerPlayerGameMode.handleBlockBreakAction` for a non-instabuild
         // player: the block is destroyed on STOP_DESTROY_BLOCK (the completion
@@ -269,6 +281,187 @@ fn broadcast_meta(world: &mut World, entity: Entity) {
         return;
     };
     broadcast_to_others(world, entity, packets::set_entity_data(eid, sneaking, sprinting));
+}
+
+/// Resolve a `ContainerClick` against the player's open menu and re-sync the
+/// authoritative result to that player.
+///
+/// Mirrors `ServerGamePacketListenerImpl.handleContainerClick`: the click only
+/// applies when its `containerId` matches the open menu. We then run the ported
+/// `Menu` click state machine over a snapshot, write the result back, and send a
+/// full `ContainerSetContent` (always-correct superset of vanilla's incremental
+/// `broadcastChanges` — vanilla itself falls back to a full sync on a state-id
+/// mismatch). The client's predicted slots are ignored; the server is the source
+/// of truth.
+fn on_container_click(
+    world: &mut World,
+    entity: Entity,
+    container_id: i32,
+    _state_id: i32,
+    slot: i16,
+    button: i8,
+    mode: i32,
+) {
+    use crate::inventory::{ClickType, Menu, OpenContainer};
+
+    let click = ClickType::from_id(mode);
+    // Snapshot the inventory (and drag state) up front so we can build the menu
+    // without holding a borrow across the menu run.
+    let (slots, carried, drag_status, drag_type, drag_slots) = {
+        let inv = inventory_mut(world, entity);
+        (
+            inv.slots,
+            inv.carried,
+            inv.drag_status,
+            inv.drag_type,
+            inv.drag_slots.clone(),
+        )
+    };
+
+    if container_id == 0 {
+        // The always-open player inventory menu.
+        let mut menu = Menu::player(&slots, carried);
+        menu.set_drag(drag_status, drag_type, drag_slots);
+        if !menu.is_valid_slot_index(slot as i32) {
+            return;
+        }
+        menu.clicked(slot as i32, button as i32, click, false);
+
+        let new_slots = menu.player_slots();
+        let new_carried = menu.carried();
+        let (ds, dt, dl) = menu.drag();
+        let content = menu.content();
+
+        let state_id = {
+            let mut inv = inventory_mut(world, entity);
+            inv.slots = new_slots;
+            inv.carried = new_carried;
+            inv.drag_status = ds;
+            inv.drag_type = dt;
+            inv.drag_slots = dl;
+            inv.next_state_id()
+        };
+        send_to_self(
+            world,
+            entity,
+            crate::inventory::container_set_content(0, state_id, &content, new_carried.as_ref()),
+        );
+        return;
+    }
+
+    // An open chest (or other non-zero container).
+    let Some((rows, chest_items)) = world
+        .get::<OpenContainer>(entity)
+        .filter(|oc| oc.container_id == container_id)
+        .map(|oc| (oc.rows, oc.items.clone()))
+    else {
+        return; // no such menu open
+    };
+
+    let mut menu = Menu::chest(rows, &chest_items, &slots, carried);
+    menu.set_drag(drag_status, drag_type, drag_slots);
+    if !menu.is_valid_slot_index(slot as i32) {
+        return;
+    }
+    menu.clicked(slot as i32, button as i32, click, false);
+
+    let new_player = menu.player_slots();
+    let new_chest = menu.chest_slots();
+    let new_carried = menu.carried();
+    let (ds, dt, dl) = menu.drag();
+    let content = menu.content();
+
+    let state_id = {
+        let mut inv = inventory_mut(world, entity);
+        inv.slots = new_player;
+        inv.carried = new_carried;
+        inv.drag_status = ds;
+        inv.drag_type = dt;
+        inv.drag_slots = dl;
+        inv.next_state_id()
+    };
+    if let Some(mut oc) = world.get_mut::<OpenContainer>(entity) {
+        oc.items = new_chest;
+    }
+    send_to_self(
+        world,
+        entity,
+        crate::inventory::container_set_content(container_id, state_id, &content, new_carried.as_ref()),
+    );
+}
+
+/// Handle a menu close: mirror `AbstractContainerMenu.removed` for the cursor
+/// (place it back into the inventory, or discard if there's no room — we have no
+/// item-drop entities), drop the open-container state, and re-sync the player
+/// inventory.
+fn on_container_close(world: &mut World, entity: Entity, _container_id: i32) {
+    let state_id = {
+        let mut inv = inventory_mut(world, entity);
+        if let Some(carried) = inv.carried.take() {
+            place_into_inventory(&mut inv.slots, carried);
+        }
+        inv.drag_status = 0;
+        inv.drag_type = -1;
+        inv.drag_slots.clear();
+        inv.next_state_id()
+    };
+    world.entity_mut(entity).remove::<crate::inventory::OpenContainer>();
+
+    let slots = inventory_mut(world, entity).slots;
+    let items: Vec<_> = slots.to_vec();
+    send_to_self(
+        world,
+        entity,
+        crate::inventory::container_set_content(0, state_id, &items, None),
+    );
+}
+
+/// Place a stack into the player inventory (menu-ordered): merge into matching
+/// hotbar (36..45) then main (9..36) slots, then the first empty one. Leftovers
+/// are discarded (no item-drop entities yet). A minimal `Inventory.add`.
+fn place_into_inventory(
+    slots: &mut [Option<crate::inventory::ItemStack>; crate::inventory::PLAYER_INVENTORY_SLOTS],
+    mut stack: crate::inventory::ItemStack,
+) {
+    let regions = [(36usize, 45usize), (9, 36)];
+    // Merge pass: top up matching stacks.
+    for &(s, e) in &regions {
+        for slot in slots[s..e].iter_mut() {
+            if stack.count <= 0 {
+                return;
+            }
+            if let Some(existing) = slot {
+                if existing.id == stack.id {
+                    let max = 64.min(stack.max_stack_size());
+                    let room = max - existing.count;
+                    if room > 0 {
+                        let moved = room.min(stack.count);
+                        existing.count += moved;
+                        stack.count -= moved;
+                    }
+                }
+            }
+        }
+    }
+    // Placement pass: drop the remainder into the first empty slot.
+    for &(s, e) in &regions {
+        for slot in slots[s..e].iter_mut() {
+            if stack.count <= 0 {
+                return;
+            }
+            if slot.is_none() {
+                *slot = Some(stack);
+                stack.count = 0;
+            }
+        }
+    }
+}
+
+/// Send a framed packet to a single player's own connection.
+fn send_to_self(world: &mut World, entity: Entity, bytes: bytes::Bytes) {
+    if let Some(conn) = world.get::<Conn>(entity) {
+        let _ = conn.outbox.try_send(Outbound::Packet(bytes));
+    }
 }
 
 /// Borrow a player's `Inventory`, attaching a fresh empty one on first use. The

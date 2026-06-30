@@ -87,7 +87,10 @@ marked accordingly.
 - `M` — **Fluids** (water/lava state, levels)
 - `L` — **Block behavior**: collision shapes (`phys/shapes` voxel shapes), hardness, placement rules, `BlockState` neighbor updates
 - `M` — **Recipes** (`item/crafting`) + recipe book sync (`UpdateRecipes`, `RecipeBookAdd/Remove/Settings`)
-- `M` — **Creative inventory / creative-mode item set** (`SetCreativeModeSlot`)
+- `M` — `[partial]` **Creative inventory / creative-mode item set**
+  (`SetCreativeModeSlot`): the packet is decoded and writes the stack straight
+  into the addressed inventory-menu slot (server-side state). The creative
+  item-group/search palette the client requests is not modelled
 
 ## Entities
 
@@ -111,13 +114,29 @@ marked accordingly.
 - `M` — `[partial]` **Player actions**: `PlayerAction` (dig, breaks on STOP), `UseItemOn` (simplified block placement), `SwingArm` handled (`src/sim/packet_handlers.rs`). `UseItem`, `PlayerCommand` (sneak/sprint), `Interact`, and dig-timing/hardness pending
 - `M` — **Abilities & game mode**: `PlayerAbilities`, `GameMode` change, flying/creative
 - `M` — **Health / food / damage**: `SetHealth`, `DamageEvent`, death + `Respawn`, combat
-- `S` — **Held-item / hotbar**: `SetCarriedItem` ↔ `SetHeldSlot`
-- `M` — **Inventory state**: player inventory container, `ContainerSetContent/Slot`, pick-item
+- `S` — `[partial]` **Held-item / hotbar**: `SetCarriedItem` ↔ `SetHeldSlot` —
+  serverbound `SetCarriedItem` decoded and applied to the per-player selected
+  hotbar slot (`Inventory.selected`); the clientbound `SetHeldSlot` builder
+  exists but is not yet pushed on a server-initiated change (e.g. respawn)
+- `M` — `[partial]` **Inventory state**: 46-slot player inventory container with
+  cursor + state id, `ContainerSetContent` resync on click/close, and
+  `ContainerSetSlot`/`ContainerClose`/`OpenScreen` builders. Pick-item and
+  block-place stack decrement still pending
 
 ## Inventory / containers / crafting
 
-- `L` — **Menu framework** (`AbstractContainerMenu`): slots, click handling (`ContainerClick` with all click modes), `ContainerSetData`, cursor item
-- `L` — **~30 menu types**: chest, furnace family, crafting, anvil, enchanting, brewing, beacon, loom, smithing, stonecutter, merchant, etc.
+- `L` — `[partial]` **Menu framework** (`AbstractContainerMenu`): slots, click
+  handling (`ContainerClick` with all click modes), cursor item — a 1:1 port of
+  `doClick`/`moveItemStackTo`/`Slot` covering PICKUP, QUICK_MOVE (shift),
+  SWAP, CLONE, THROW, QUICK_CRAFT (drag) and PICKUP_ALL, with the
+  `InventoryMenu` and `ChestMenu` shift-move routing, over a snapshot-and-resync
+  model. Gaps: `ContainerSetData` (data slots), incremental `ContainerSetSlot`
+  diffs (a full `ContainerSetContent` is sent instead), `HashedStack` desync
+  detection, real item-drop entities (THROW/outside discard), and armor
+  auto-equip routing
+- `L` — `[partial]` **~30 menu types**: the player inventory menu and a generic
+  `9×N` chest menu are implemented; furnace family, crafting, anvil, enchanting,
+  brewing, beacon, loom, smithing, stonecutter, merchant, etc. pending
 - `M` — **Crafting resolution** (shaped/shapeless/special recipes) + `PlaceRecipe`
 - `M` — **Enchantments** (`item/enchantment`) + **anvil/grindstone** logic
 - `M` — **Trading / villager merchant** (`item/trading`, `MerchantOffers`)
@@ -170,7 +189,12 @@ marked accordingly.
 - `M` — **Math & geometry**: `BlockPos`, `ChunkPos`, `Vec3`, AABB, direction, rotation helpers
 - `S` — `[done]` **Position/angle wire encoding** (`pack_block_pos`/`unpack_block_pos` in `src/protocol/buffer.rs`, `pack_angle` in `src/sim/packets.rs`, tested)
 - `M` — **Registry framework** (`core/Registry`, `Holder`, `ResourceKey`, tags) — underpins almost everything
-- `M` — **DataComponent framework** (`core/component`) — the 26.x replacement for item NBT
+- `M` — `[partial]` **DataComponent framework** (`core/component`) — the 26.x
+  replacement for item NBT. The slot wire codec carries the empty
+  `DataComponentPatch`, and the one component the menu logic needs —
+  `MAX_STACK_SIZE` — is modelled via a per-item override table in
+  `registry/item.rs`. Full typed component map (read/write of arbitrary
+  components) still pending
 - `S` — **Damage sources** (`world/damagesource`)
 - `S` — `[partial]` **UUID / GameProfile utilities**: offline UUID done (MD5 `OfflinePlayer:<name>`, tested); online-mode profiles resolved via `hasJoined` carry their UUID and signed skin/cape properties (forwarded in `LoginFinished`). Threading those properties through to the in-game player list / entity skin still to add
 - `M` — **Region/chunk coordinate + seed-based RNG utilities** (`util/random`, `valueproviders`)

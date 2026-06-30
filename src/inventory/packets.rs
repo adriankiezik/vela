@@ -27,6 +27,20 @@ const CB_PLAY_CONTAINER_SET_CONTENT: i32 = 18;
 /// selected.
 const CB_PLAY_SET_HELD_SLOT: i32 = 105;
 
+/// `ClientboundContainerSetSlotPacket` — index 20 (sits two after
+/// `CONTAINER_SET_CONTENT` at 18, past `CONTAINER_SET_DATA` at 19).
+#[allow(dead_code)] // builder counterpart not yet on the gameplay path.
+const CB_PLAY_CONTAINER_SET_SLOT: i32 = 20;
+
+/// `ClientboundContainerClosePacket` — index 17 (just before
+/// `CONTAINER_SET_CONTENT`).
+#[allow(dead_code)]
+const CB_PLAY_CONTAINER_CLOSE: i32 = 17;
+
+/// `ClientboundOpenScreenPacket` — index 59 in the clientbound PLAY flow.
+#[allow(dead_code)]
+const CB_PLAY_OPEN_SCREEN: i32 = 59;
+
 /// `ClientboundContainerSetContentPacket` — overwrite a whole container's
 /// contents. Layout (`StreamCodec.composite`):
 ///
@@ -61,6 +75,42 @@ pub fn set_held_slot(slot: i32) -> Bytes {
     let mut p = PacketWriter::new();
     p.write_varint(slot);
     frame(CB_PLAY_SET_HELD_SLOT, &p.buf)
+}
+
+/// `ClientboundContainerSetSlotPacket` — set one slot of a container. Layout
+/// (`ClientboundContainerSetSlotPacket.write`): `containerId` (VarInt),
+/// `stateId` (VarInt), `slot` (short), then a single optional `ItemStack`.
+#[allow(dead_code)] // incremental-slot sync builder; full ContainerSetContent is used today.
+pub fn container_set_slot(window_id: i32, state_id: i32, slot: i16, stack: Option<&ItemStack>) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(window_id);
+    p.write_varint(state_id);
+    p.write_i16(slot);
+    write_item_stack(&mut p, stack);
+    frame(CB_PLAY_CONTAINER_SET_SLOT, &p.buf)
+}
+
+/// `ClientboundContainerClosePacket` — close the open screen. A single VarInt
+/// container id (`ByteBufCodecs.CONTAINER_ID`).
+#[allow(dead_code)] // server-initiated close; gameplay close is client-driven today.
+pub fn container_close(window_id: i32) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(window_id);
+    frame(CB_PLAY_CONTAINER_CLOSE, &p.buf)
+}
+
+/// `ClientboundOpenScreenPacket` — open a menu screen. Layout
+/// (`StreamCodec.composite`): `containerId` (VarInt), `menuType` (VarInt registry
+/// id over `Registries.MENU`), then the title text component as network NBT
+/// (`ComponentSerialization.TRUSTED_STREAM_CODEC`).
+#[allow(dead_code)] // chest-open builder; no gameplay open trigger (needs block entities) yet.
+pub fn open_screen(window_id: i32, menu_type: i32, title: &str) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(window_id);
+    p.write_varint(menu_type);
+    let component = crate::protocol::text::TextComponent::text(title).to_nbt();
+    crate::protocol::nbt::write_network(&mut p.buf, &component);
+    frame(CB_PLAY_OPEN_SCREEN, &p.buf)
 }
 
 #[cfg(test)]

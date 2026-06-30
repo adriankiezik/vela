@@ -34,6 +34,9 @@ const SB_PLAY_USE_ITEM_ON: i32 = 66;
 // Inventory ids: SetCarriedItem (53), SetCreativeModeSlot (56).
 const SB_PLAY_SET_CARRIED_ITEM: i32 = 53;
 const SB_PLAY_SET_CREATIVE_MODE_SLOT: i32 = 56;
+// Menu ids: ContainerClick (18), ContainerClose (19) in SERVERBOUND_TEMPLATE.
+const SB_PLAY_CONTAINER_CLICK: i32 = 18;
+const SB_PLAY_CONTAINER_CLOSE: i32 = 19;
 
 /// `ServerboundMovePlayerPacket.FLAG_ON_GROUND` — bit 0 of the trailing flags
 /// byte the movement packets carry (bit 1 is horizontal collision, ignored).
@@ -147,6 +150,29 @@ pub(super) fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbo
             let stack = crate::inventory::read_item_stack(reader).ok()?;
             Some(Serverbound::SetCreativeSlot { slot, stack })
         }
+        // ServerboundContainerClickPacket: containerId (VarInt), stateId (VarInt),
+        // slotNum (short), buttonNum (byte), containerInput (VarInt enum id). The
+        // trailing predicted `changedSlots` map and `carriedItem` HashedStack are
+        // left unread — the server re-syncs authoritative state after the click,
+        // and each frame is its own buffer so the unread tail can't desync.
+        SB_PLAY_CONTAINER_CLICK => {
+            let container_id = reader.read_varint().ok()?;
+            let state_id = reader.read_varint().ok()?;
+            let slot = reader.read_u16().ok()? as i16;
+            let button = reader.read_u8().ok()? as i8;
+            let mode = reader.read_varint().ok()?;
+            Some(Serverbound::ContainerClick {
+                container_id,
+                state_id,
+                slot,
+                button,
+                mode,
+            })
+        }
+        // ServerboundContainerClosePacket: a single VarInt container id.
+        SB_PLAY_CONTAINER_CLOSE => Some(Serverbound::ContainerClose {
+            container_id: reader.read_varint().ok()?,
+        }),
         _ => None,
     }
 }
