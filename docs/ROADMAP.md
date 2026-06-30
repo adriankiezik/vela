@@ -26,9 +26,9 @@ marked accordingly.
 
 ## Network / transport layer
 
-- `S` — **VarLong codec** (have VarInt; VarLong still needed for some fields)
+- `S` — `[done]` **VarLong codec** (`src/protocol/varint.rs`, with tests)
 - `S` — `[done]` **Packet framing polish**: length-prefix done; max-size guard (`MAX_FRAME_LEN`, 2 MiB) and read-side buffering (`BufReader` feeding the play loop) added
-- `M` — **Compression** (`SetCompression` / zlib): threshold negotiation, compress/decompress framing once bodies grow
+- `M` — `[done]` **Compression** (`SetCompression` / zlib): threshold negotiation (`src/net/connection.rs`), compress/decompress framing (`src/protocol/framing.rs`, used in `src/net/frame.rs`)
 - `L` — **Encryption** (online mode): RSA keypair, `Hello`→`Key` exchange, AES-CFB8 stream cipher, Mojang session-server `hasJoined` auth, encrypted profile
 - `M` — **Cookie store** (`cookie/` — 6 packets): request/response/store for transfers
 - `M` — **Transfer / cross-server** support (`Intent::Transfer` path, `ClientboundTransfer`)
@@ -37,11 +37,11 @@ marked accordingly.
 
 ## NBT & data formats
 
-- `L` — **NBT codec** (read + write, all tag types, network "nameless" variant) — needed almost everywhere downstream
+- `L` — `[done]` **NBT codec** (read + write, all 12 tag types, named/nameless root framing, modified-UTF-8, depth guards — `src/protocol/nbt.rs`, tested)
 - `M` — **SNBT / text-component parsing** (chat components as NBT in 26.2, not JSON)
-- `M` — **Text component model**: styles, colors, translations, hover/click events, serialization to network NBT
+- `M` — `[done]` **Text component model**: typed Style/Color, hover/click events, serialization to network NBT (`src/protocol/text.rs`, tested)
 - `S` — **Resource location / identifier** type (`namespace:path`) with validation
-- `M` — `[partial]` **Bit-packed `PalettedContainer`** (block states + biomes storage, the core chunk encoding primitive): wire serialization done (single-value + 4-bit linear palette, non-spanning `SimpleBitStorage` packing) for static columns in `src/world`. No mutable container / resize / hashmap+global palette read path yet
+- `M` — `[partial]` **Bit-packed `PalettedContainer`** (block states + biomes storage, the core chunk encoding primitive): wire serialization done incl. palette growth (single-value → 4–8 bit indirect → direct/global palette ≥256 states, `src/world/encoding.rs`). Mutable edits supported via a sparse per-cell edit map (`set_block`/`block_state_at`, `src/world/chunk_data.rs`). Remaining gap: the network *read* path for incoming/foreign palettes
 
 ## Login → Configuration → Play handshake
 
@@ -50,7 +50,7 @@ marked accordingly.
 - `S` — `[done]` **State enum + listener split**: `Handshake/Status/Login/Configuration/Play` (play owns the split stream)
 - `L` — `[partial]` **Registry data sync** (`ClientboundRegistryDataPacket`): reaches Play via **known-packs passthrough** — entry IDs sent with data absent, client fills definitions from its core pack. Full network-NBT serialization of the ~60 registries still pending (needs the NBT codec)
 - `S` — `[done]` **`UpdateEnabledFeatures`** + **feature flags** (`minecraft:vanilla`)
-- `S` — `[partial]` **Tags sync** (`UpdateTags`): packet implemented; all required tags bound **empty** to satisfy the client's presence check. Real tag contents pending
+- `S` — `[partial]` **Tags sync** (`UpdateTags`): packet implemented; **block & item tags carry real generated member ids** (`src/registry/tags.rs`). Only non-block/item registry tags (entity_type, damage_type, …) remain bound empty — see the deferred follow-up note below
 - `S` — `[done]` **Known packs negotiation** (`SelectKnownPacks`, vanilla `minecraft:core/26.2`)
 - `S` — **Code-of-conduct** packets (new in 26.x: `CodeOfConduct` / `AcceptCodeOfConduct`)
 - `S` — `[done]` **`FinishConfiguration`** ↔ `ServerboundFinishConfiguration` handoff to Play
@@ -70,14 +70,14 @@ marked accordingly.
 
 - `L` — **Block-state model**: `Block` registry, `BlockState` with properties, global palette IDs
 - `L` — **Chunk data structures**: `LevelChunk`, 16×16×16 sections, heightmaps, biome storage
-- `XL` — `[partial]` **Chunk serialization** (`ClientboundLevelChunkWithLight`): packet wire format implemented for a **static flat column** (bedrock/dirt/grass via single-value + 4-bit linear block palettes, single-value biome, real `WORLD_SURFACE`/`MOTION_BLOCKING` heightmaps, empty light). Block-state ids derived from the server's own `--reports` dump. Per-chunk variation, block entities, and dynamic edits pending
+- `XL` — `[partial]` **Chunk serialization** (`ClientboundLevelChunkWithLight`): packet wire format implemented with **per-chunk-varying terrain** (noise heightmap) and the full indirect (4–8 bit) + direct/global palette path (`src/world/encoding.rs`), real `WORLD_SURFACE`/`MOTION_BLOCKING` heightmaps, empty light. Dynamic edits supported. Block entities still pending
 - `M` — `[partial]` **Light engine**: empty-light payload sent (four empty BitSets + two empty arrays); no real sky/block light propagation yet
-- `M` — `[partial]` **Chunk streaming**: `SetChunkCacheCenter` + a fixed view-radius batch of chunks sent on join. Dynamic load/unload by movement and `ForgetLevelChunk` pending
-- `M` — `[partial]` **Heightmaps** computation & maintenance: flat-profile `WORLD_SURFACE`/`MOTION_BLOCKING` computed and sent; live recomputation on block change pending
-- `S` — **Block-change packets**: `BlockUpdate`, `SectionBlocksUpdate`
+- `M` — `[done]` **Chunk streaming**: `SetChunkCacheCenter` + dynamic load/unload by movement with a rounded-corner tracking-view diff (`src/sim/chunking.rs`)
+- `M` — `[done]` **Heightmaps** computation & maintenance: `WORLD_SURFACE`/`MOTION_BLOCKING` computed and sent; live recomputation of edited columns on block change (`src/world/heightmap.rs`)
+- `S` — `[partial]` **Block-change packets**: `BlockUpdate` implemented and broadcast on edits (`src/sim/packets.rs`); `SectionBlocksUpdate` built + tested but not yet wired into a batched-edit path
 - `M` — **Block entities** (`BlockEntityData`, chests/signs/etc. NBT) — model + per-type data
 - `M` — **Region / `.mca` persistence** (Anvil format) — or start with in-memory only and defer
-- `L` — `[partial]` **World generation**: the **void generator** (`S`) is effectively in place (server streams all-air columns). Real `levelgen` (noise, biomes, carvers, features, structures) is `XL` and still out of early scope
+- `L` — `[partial]` **World generation**: a real per-chunk noise heightmap generator is in place (fbm value noise, continuous across chunk boundaries — `src/world/terrain.rs`). Full `levelgen` (biomes, carvers, features, structures) is `XL` and still out of early scope
 - `S` — **World border** (`world/level/border`, `SetBorder*` packets)
 
 ## Blocks, items, registries (content)
@@ -95,7 +95,7 @@ marked accordingly.
 - `L` — **Entity metadata / data-syncher** (`network/syncher` — `SynchedEntityData`, `SetEntityData`)
 - `L` — `[partial]` **Entity spawn/remove/track**: `AddEntity` (players, type `minecraft:player`) + `RemoveEntities` on join/leave. Every player tracks every other — correct here, since the whole world sits well inside the 32-chunk player tracking range. Per-player view-distance culling / dynamic add-remove on movement still pending
 - `M` — `[partial]` **Entity movement packets**: `MoveEntityPos/Rot/PosRot` + `RotateHead` + `EntityPositionSync` (absolute resync fallback), broadcast per tick via a 1:1 port of `ServerEntity.sendChanges` (update interval 2, `VecDeltaCodec` deltas, on-ground-flip / >8-block / 400-tick resync). `TeleportEntity`/`SetEntityMotion`/velocity pending (player velocity not modelled yet, so it stays zero)
-- `M` — **Entity events / status / animations**: `EntityEvent`, `Animate`, `HurtAnimation`, `TakeItemEntity`
+- `M` — `[partial]` **Entity events / status / animations**: arm-swing `Animate` wired (`src/sim/packets.rs`, broadcast from `packet_handlers.rs`); `EntityEvent`, `HurtAnimation`, `TakeItemEntity` pending
 - `M` — **Equipment & passengers**: `SetEquipment`, `SetPassengers`, `SetEntityLink` (leash)
 - `M` — **Attributes** (`world/attribute` — `UpdateAttributes`)
 - `M` — **Mob effects / potions** (`world/effect`, `UpdateMobEffect`/`RemoveMobEffect`)
@@ -108,7 +108,7 @@ marked accordingly.
 - `M` — **Player entity + `GameProfile`** (skin/properties from auth or offline)
 - `M` — `[partial]` **Player list** (`PlayerInfoUpdate`/`Remove`): tab entries added on join (ADD_PLAYER + game mode + listed + latency) and removed on leave. Offline profiles (no skin properties), no header/footer or display-name/list-order yet
 - `M` — `[partial]` **Movement handling (serverbound)**: `MovePlayerPos/Rot/PosRot/StatusOnly` decoded and applied; `AcceptTeleportation` handled; the result is rebroadcast to other players. Server-side validation (move speed / clipping) still pending
-- `M` — **Player actions**: `PlayerAction` (dig), `UseItem`, `UseItemOn`, `SwingArm`, `PlayerCommand` (sneak/sprint), `Interact`
+- `M` — `[partial]` **Player actions**: `PlayerAction` (dig, breaks on STOP), `UseItemOn` (simplified block placement), `SwingArm` handled (`src/sim/packet_handlers.rs`). `UseItem`, `PlayerCommand` (sneak/sprint), `Interact`, and dig-timing/hardness pending
 - `M` — **Abilities & game mode**: `PlayerAbilities`, `GameMode` change, flying/creative
 - `M` — **Health / food / damage**: `SetHealth`, `DamageEvent`, death + `Respawn`, combat
 - `S` — **Held-item / hotbar**: `SetCarriedItem` ↔ `SetHeldSlot`
@@ -124,12 +124,12 @@ marked accordingly.
 
 ## World simulation / tick loop
 
-- `L` — **Server tick loop** (20 TPS scheduler, per-world ticking, tick budget)
+- `L` — `[partial]` **Server tick loop** (20 TPS scheduler in `src/sim/mod.rs`, spawned from `main.rs`); per-world ticking / tick-budget refinements pending
 - `M` — **Block ticks / scheduled ticks** (`world/ticks` — random & scheduled updates)
 - `L` — **Redstone** (`world/level/redstone`) — defer, large
 - `M` — **Fluid flow simulation**
 - `M` — **Random tick** (crop growth, leaf decay, fire spread)
-- `M` — **Day/night time + weather** (`SetTime`, `GameEvent` rain, `world/clock`)
+- `M` — `[done]` **Day/night time + weather** (`SetTime`, rain `GameEvent`, clock — `src/sim/world_tick.rs`, tested)
 - `M` — **Mob spawning** (natural spawn rules, `poi`)
 - `S` — **Game rules** (`world/level/gamerules`)
 - `M` — **Block events / piston & note block** (`BlockEvent`)
@@ -153,9 +153,9 @@ marked accordingly.
 ## Server infrastructure
 
 - `M` — `[partial]` **Player connection manager**: accept loop + per-connection async task + (in play) a buffered reader task feeding the select loop over a channel. Per-player session state, dispatch queues, and graceful disconnect still to add
-- `M` — **`server.properties` / config loading** (`server/dedicated`)
-- `M` — **Server status with player sample, favicon, secure-chat enforcement**
-- `S` — **Ban/whitelist/op lists** (`server/players`, JSON files)
+- `M` — `[done]` **`server.properties` / config loading** with backfill/rewrite (`src/config/properties.rs`, tested)
+- `M` — `[partial]` **Server status**: favicon implemented (`src/net/connection.rs`); player count hardcoded 0, no player sample / secure-chat enforcement yet
+- `S` — `[partial]` **Ban/whitelist/op lists**: loads/creates `ops.json`/`whitelist.json`/`banned-players.json`/`banned-ips.json`/`usercache.json` (`src/config/players.rs`); login-time enforcement still pending
 - `M` — **Permissions** (`server/permissions`, op levels)
 - `M` — **RCON** (`server/rcon`) — optional remote console
 - `S` — **Query protocol** (legacy UDP server query) — optional
@@ -163,12 +163,12 @@ marked accordingly.
 - `L` — **World save/load** (`world/level/storage` — `level.dat`, player data, region files)
 - `S` — `[partial]` **Console / log handling, command-line args, ticking watchdog**: `tracing` logging (`RUST_LOG`) and a bind-address CLI arg in place; ticking watchdog pending
 - `M` — **Datapack / tag loading** (`server/packs`, `tags`) — feed registry & tag sync
-- `S` — **Brand & version reporting, ping debug charts** (`util/debugchart`)
+- `S` — `[partial]` **Brand & version reporting**: brand send + version reporting wired (`src/net/connection.rs`); ping debug charts (`util/debugchart`) pending
 
 ## Cross-cutting / foundational
 
 - `M` — **Math & geometry**: `BlockPos`, `ChunkPos`, `Vec3`, AABB, direction, rotation helpers
-- `S` — **Position/angle wire encoding** (packed long positions, byte angles)
+- `S` — `[done]` **Position/angle wire encoding** (`pack_block_pos`/`unpack_block_pos` in `src/protocol/buffer.rs`, `pack_angle` in `src/sim/packets.rs`, tested)
 - `M` — **Registry framework** (`core/Registry`, `Holder`, `ResourceKey`, tags) — underpins almost everything
 - `M` — **DataComponent framework** (`core/component`) — the 26.x replacement for item NBT
 - `S` — **Damage sources** (`world/damagesource`)
