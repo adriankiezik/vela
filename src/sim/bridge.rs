@@ -61,29 +61,75 @@ pub enum Serverbound {
     AcceptTeleport(i32),
     /// `ServerboundSwingPacket` — an arm swing. `hand` is the `InteractionHand`
     /// ordinal (0 = main hand, 1 = off hand).
-    Swing { hand: i32 },
+    Swing {
+        hand: i32,
+    },
     /// `ServerboundPlayerCommandPacket` — a player state action. `action` is the
     /// `Action` enum ordinal (26.2: 0 STOP_SLEEPING, 1 START_SPRINTING,
     /// 2 STOP_SPRINTING, 3 START_RIDING_JUMP, 4 STOP_RIDING_JUMP,
     /// 5 OPEN_INVENTORY, 6 START_FALL_FLYING). The leading entity id (the
     /// sender's own) and the trailing `data` argument are dropped on decode —
     /// none of the actions we currently act on use them.
-    PlayerCommand { action: i32 },
+    PlayerCommand {
+        action: i32,
+    },
     /// `ServerboundPlayerAbilitiesPacket` — the client's abilities bitset. Only
     /// the flying bit (0x02) is meaningful serverbound.
-    PlayerAbilities { flags: u8 },
+    PlayerAbilities {
+        flags: u8,
+    },
     /// `ServerboundPlayerInputPacket` — the player's movement-key state as a
     /// single `Input` flags byte. In 26.2 this is how the client reports crouch
     /// (the SHIFT bit); we extract only `shift` (sneaking) and ignore the rest.
-    PlayerInput { sneaking: bool },
+    PlayerInput {
+        sneaking: bool,
+    },
     /// `ServerboundSetCarriedItemPacket` — the selected hotbar slot (0..8). The
     /// wire field is a signed short; the sim validates the range.
-    SetCarriedItem { slot: i16 },
+    SetCarriedItem {
+        slot: i16,
+    },
     /// `ServerboundSetCreativeModeSlotPacket` — a container slot index plus the
     /// stack to place there. The `net` layer decodes the `ItemStack` so the sim
     /// stays protocol-shape-agnostic; `None` is the empty stack.
     SetCreativeSlot {
         slot: i16,
         stack: Option<crate::inventory::ItemStack>,
+    },
+    /// `ServerboundPlayerActionPacket` — block-dig (and item-drop) actions. The
+    /// `BlockPos` long is unpacked to `(x, y, z)` by `net`. `action` is the
+    /// `Action` enum ordinal (0 START_DESTROY_BLOCK, 1 ABORT_DESTROY_BLOCK,
+    /// 2 STOP_DESTROY_BLOCK, …); `face` is the `Direction` 3D-data value;
+    /// `sequence` is the block-change sequence to acknowledge.
+    // `face` is decoded for protocol completeness but unused by the dig handler
+    // (digging targets the block itself, not a neighbour).
+    #[allow(dead_code)]
+    PlayerAction {
+        action: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: i32,
+        sequence: i32,
+    },
+    /// `ServerboundUseItemOnPacket` — place/use against a block face. Carries the
+    /// hit `BlockHitResult`: the targeted `(x, y, z)`, the `face` hit (Direction
+    /// 3D-data value), the in-cell cursor offset, and the `inside` flag; plus the
+    /// interaction `hand` ordinal and the `sequence` to acknowledge. The
+    /// world-border flag is dropped on decode (unused).
+    // `hand`, the cursor offset, and `inside` are decoded for protocol
+    // completeness; placement only needs the target, face, and sequence so far.
+    #[allow(dead_code)]
+    UseItemOn {
+        hand: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: i32,
+        cursor_x: f32,
+        cursor_y: f32,
+        cursor_z: f32,
+        inside: bool,
+        sequence: i32,
     },
 }

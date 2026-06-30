@@ -27,6 +27,15 @@ fn start_server(addr: &str) -> Server {
     // tests run with `IS_RUNNING_IN_IDE`.
     let workdir = std::env::temp_dir().join(format!("vela-it-{}", addr.replace(':', "_")));
     std::fs::create_dir_all(&workdir).expect("create server workdir");
+    // This byte-level fake client speaks only the plain `VarInt(len)|id|body`
+    // framing, so disable the mid-Login compression negotiation (default 256) for
+    // it: `-1` is vanilla's "compression off". The compressed framing itself is
+    // covered by the round-trip unit tests in `protocol::framing`.
+    std::fs::write(
+        workdir.join("server.properties"),
+        "network-compression-threshold=-1\n",
+    )
+    .expect("write server.properties");
     let child = Command::new(env!("CARGO_BIN_EXE_vela"))
         .arg(addr)
         .current_dir(&workdir)

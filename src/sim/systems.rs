@@ -1,5 +1,6 @@
 //! The simulation systems, run once per tick in order:
-//! `advance_tick` → `drain_ingress` → `keepalive`.
+//! `advance_tick` → `drain_ingress` → `world_tick` → `broadcast_movement` →
+//! `stream_chunks` → `keepalive`.
 //!
 //! `drain_ingress` is an exclusive system (`&mut World`) because it spawns and
 //! despawns entities and fans chat out across every connection — work that
@@ -31,6 +32,9 @@ const SPAWN_TELEPORT_ID: i32 = 1;
 /// How often (in ticks) an entity's position/rotation is broadcast, matching
 /// vanilla's player `EntityType.updateInterval` of 2.
 const UPDATE_INTERVAL: u32 = 2;
+
+/// A chunk column coordinate `(cx, cz)`, used by the chunk-streaming diff.
+type ChunkCoord = (i32, i32);
 
 /// A snapshot of an already-online player, taken when someone new joins so the
 /// newcomer can be told who is already here (and vice versa).
@@ -107,6 +111,24 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
         warn!(%name, "outbox full during join sequence; dropping");
         let _ = outbox.try_send(Outbound::Close);
         return;
+    }
+
+    // Sync the world clock and current weather to the newcomer, mirroring
+    // vanilla `PlayerList.sendLevelInfo`: a full SetTime (gameTime + the overworld
+    // clock state, including its rate so frozen daylight is conveyed), then the
+    // rain/thunder GameEvents if it is currently raining.
+    send_world_state(world, &outbox);
+
+    // Seed the loaded-chunk set to exactly the `(2R+1)²` square the join just
+    // streamed, centered on (0, 0). The streaming system (`stream_chunks`) keys
+    // off this center, so it sends only deltas as the player moves and never
+    // re-sends a chunk the join already delivered.
+    let radius = join.view_distance;
+    let mut loaded = std::collections::HashSet::new();
+    for cx in -radius..=radius {
+        for cz in -radius..=radius {
+            loaded.insert((cx, cz));
+        }
     }
 
     let tick = world.resource::<Tick>().0;
@@ -214,6 +236,10 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
                 tick_count: 0,
             },
             Meta::default(),
+            LoadedChunks {
+                center: (0, 0),
+                loaded,
+            },
             Conn { outbox },
             KeepAlive {
                 id: 0,
@@ -258,6 +284,37 @@ fn send_join_sequence(
         packets::player_position(SPAWN_TELEPORT_ID, sx, sy, sz),
     );
     ok
+}
+
+/// Send a joining player the current world clock and weather (vanilla
+/// `PlayerList.sendLevelInfo`). The clock is a full SetTime carrying the
+/// overworld clock state (rate 0 if daylight is frozen); rain/thunder GameEvents
+/// follow only when it is raining, matching the vanilla guard.
+fn send_world_state(world: &World, outbox: &OutboxTx) {
+    let rules = world.resource::<super::world_tick::GameRules>();
+    let time = world.resource::<super::world_tick::WorldTime>();
+    let weather = world.resource::<super::world_tick::Weather>();
+
+    let clock = time.clock_update(rules.advance_time);
+    send(outbox, packets::set_time(time.game_time, &[clock]));
+
+    if weather.is_raining() {
+        send(
+            outbox,
+            packets::game_event(packets::GAME_EVENT_START_RAINING, 0.0),
+        );
+        send(
+            outbox,
+            packets::game_event(packets::GAME_EVENT_RAIN_LEVEL_CHANGE, weather.rain_level),
+        );
+        send(
+            outbox,
+            packets::game_event(
+                packets::GAME_EVENT_THUNDER_LEVEL_CHANGE,
+                weather.thunder_level,
+            ),
+        );
+    }
 }
 
 fn on_left(world: &mut World, id: Uuid) {
@@ -398,6 +455,100 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         Serverbound::SetCreativeSlot { slot, stack } => {
             inventory_mut(world, entity).set_slot(slot, stack);
         }
+        // Block dig. Creative is instant-break (the client sends only
+        // START_DESTROY_BLOCK); survival sends START then STOP — we break on
+        // either and the second is a no-op once the cell is already air. ABORT
+        // and the non-dig actions only need their sequence acknowledged.
+        Serverbound::PlayerAction {
+            action,
+            x,
+            y,
+            z,
+            face: _,
+            sequence,
+        } => {
+            // 0 = START_DESTROY_BLOCK, 2 = STOP_DESTROY_BLOCK.
+            if action == 0 || action == 2 {
+                let prev = crate::world::set_block(x, y, z, crate::world::AIR_STATE);
+                if prev != crate::world::AIR_STATE {
+                    broadcast_to_all(
+                        world,
+                        packets::block_update(x, y, z, crate::world::AIR_STATE),
+                    );
+                }
+            }
+            ack_block_change(world, entity, sequence);
+        }
+        // Block place. Resolve the held hotbar item to a block-state, place it on
+        // the face the player clicked (target + face step), broadcast the change,
+        // and acknowledge the sequence so the client keeps its prediction.
+        Serverbound::UseItemOn {
+            hand: _,
+            x,
+            y,
+            z,
+            face,
+            cursor_x: _,
+            cursor_y: _,
+            cursor_z: _,
+            inside: _,
+            sequence,
+        } => {
+            if let Some(state) = held_block_state(world, entity) {
+                let (dx, dy, dz) = face_step(face);
+                let (px, py, pz) = (x + dx, y + dy, z + dz);
+                // Only place into air, mirroring vanilla's replaceable check
+                // (loosely — air is the one replaceable state we model).
+                if crate::world::block_state_at(px, py, pz) == crate::world::AIR_STATE {
+                    crate::world::set_block(px, py, pz, state);
+                    broadcast_to_all(world, packets::block_update(px, py, pz, state));
+                }
+            }
+            ack_block_change(world, entity, sequence);
+        }
+    }
+}
+
+/// The block-state the player would place: their selected hotbar item mapped
+/// through the item→block table. `None` if no inventory, an empty slot, or a
+/// non-placeable item.
+fn held_block_state(world: &World, entity: Entity) -> Option<u32> {
+    let inv = world.get::<crate::inventory::Inventory>(entity)?;
+    let slot = crate::inventory::HOTBAR_START + inv.selected as usize;
+    let item_id = inv.slots[slot]?.id;
+    crate::world::block_state_for_item(item_id)
+}
+
+/// The unit step of a `Direction` 3D-data value (`Direction.java`): 0 DOWN,
+/// 1 UP, 2 NORTH, 3 SOUTH, 4 WEST, 5 EAST. Unknown values don't move.
+fn face_step(face: i32) -> (i32, i32, i32) {
+    match face {
+        0 => (0, -1, 0),
+        1 => (0, 1, 0),
+        2 => (0, 0, -1),
+        3 => (0, 0, 1),
+        4 => (-1, 0, 0),
+        5 => (1, 0, 0),
+        _ => (0, 0, 0),
+    }
+}
+
+/// Acknowledge a block-change sequence to the acting player so the client
+/// confirms (rather than rolls back) its predicted edit.
+fn ack_block_change(world: &mut World, entity: Entity, sequence: i32) {
+    if let Some(conn) = world.get::<Conn>(entity) {
+        let _ = conn
+            .outbox
+            .try_send(Outbound::Packet(packets::block_changed_ack(sequence)));
+    }
+}
+
+/// Fan a single framed packet out to every connection, including the sender —
+/// the model `Serverbound::Chat` uses, for world edits everyone must observe.
+fn broadcast_to_all(world: &mut World, bytes: bytes::Bytes) {
+    let mut q = world.query::<&Conn>();
+    for conn in q.iter(world) {
+        let _ = conn.outbox.try_send(Outbound::Packet(bytes.clone()));
     }
 }
 
@@ -588,6 +739,77 @@ pub fn broadcast_movement(world: &mut World) {
     }
 }
 
+/// Dynamic chunk streaming: keep each player's loaded-chunk set following them,
+/// mirroring vanilla's `ChunkMap`/`PlayerChunkSender`. Runs after
+/// `broadcast_movement` so it sees the position `drain_ingress` applied this
+/// tick. Per-player (each player streams to its *own* outbox), so a single
+/// mutable `Query` suffices — no exclusive-`World` access needed.
+///
+/// Each tick, compute the player's chunk center `(floor(x)>>4, floor(z)>>4)`. If
+/// it is unchanged, do nothing. Otherwise send `SetChunkCacheCenter`, then diff
+/// the new view-distance square against the old one: stream `level_chunk` for
+/// newly-in-range columns (nearest-first, like vanilla's distance ordering) and
+/// `forget_chunk` for columns that left range, updating the `LoadedChunks` set.
+pub fn stream_chunks(config: Res<Config>, mut players: Query<(&Pos, &Conn, &mut LoadedChunks)>) {
+    let radius = config.0.properties.view_distance();
+    for (pos, conn, mut loaded) in players.iter_mut() {
+        let center = ((pos.x.floor() as i32) >> 4, (pos.z.floor() as i32) >> 4);
+        if center == loaded.center {
+            continue;
+        }
+        let (added, removed) = chunk_diff(loaded.center, center, radius);
+
+        let _ = conn
+            .outbox
+            .try_send(Outbound::Packet(packets::set_chunk_center(
+                center.0, center.1,
+            )));
+        for &(cx, cz) in &added {
+            let _ = conn
+                .outbox
+                .try_send(Outbound::Packet(packets::level_chunk(cx, cz)));
+            loaded.loaded.insert((cx, cz));
+        }
+        for &(cx, cz) in &removed {
+            let _ = conn
+                .outbox
+                .try_send(Outbound::Packet(packets::forget_chunk(cx, cz)));
+            loaded.loaded.remove(&(cx, cz));
+        }
+        loaded.center = center;
+    }
+}
+
+/// Pure diff between two `(2R+1)²` chunk squares. Returns `(added, removed)`:
+/// columns within `radius` of `new` but not of `old` (added), and columns within
+/// `radius` of `old` but not of `new` (removed). `added` is ordered nearest-first
+/// (by Chebyshev distance to `new`) to match vanilla's distance-ordered send.
+fn chunk_diff(old: ChunkCoord, new: ChunkCoord, radius: i32) -> (Vec<ChunkCoord>, Vec<ChunkCoord>) {
+    let in_square =
+        |c: (i32, i32), x: i32, z: i32| (x - c.0).abs() <= radius && (z - c.1).abs() <= radius;
+
+    let mut added = Vec::new();
+    for x in (new.0 - radius)..=(new.0 + radius) {
+        for z in (new.1 - radius)..=(new.1 + radius) {
+            if !in_square(old, x, z) {
+                added.push((x, z));
+            }
+        }
+    }
+    added.sort_by_key(|&(x, z)| (x - new.0).abs().max((z - new.1).abs()));
+
+    let mut removed = Vec::new();
+    for x in (old.0 - radius)..=(old.0 + radius) {
+        for z in (old.1 - radius)..=(old.1 + radius) {
+            if !in_square(new, x, z) {
+                removed.push((x, z));
+            }
+        }
+    }
+
+    (added, removed)
+}
+
 /// Send keep-alives and disconnect anyone who missed the last one.
 pub fn keepalive(
     tick: Res<Tick>,
@@ -634,4 +856,86 @@ fn drop_player(
 /// Push a framed packet to an outbox, reporting whether it was accepted.
 fn send(outbox: &OutboxTx, bytes: bytes::Bytes) -> bool {
     outbox.try_send(Outbound::Packet(bytes)).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chunk_diff;
+    use std::collections::HashSet;
+
+    /// The full `(2R+1)²` square of chunks around a center.
+    fn square(center: (i32, i32), radius: i32) -> HashSet<(i32, i32)> {
+        let mut s = HashSet::new();
+        for x in (center.0 - radius)..=(center.0 + radius) {
+            for z in (center.1 - radius)..=(center.1 + radius) {
+                s.insert((x, z));
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn diff_no_move_is_empty() {
+        let (added, removed) = chunk_diff((0, 0), (0, 0), 3);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_single_step_is_two_strips() {
+        // Moving one chunk in +x with radius R adds one column-strip on the new
+        // leading edge and removes one on the old trailing edge: (2R+1) each.
+        let radius = 3;
+        let (added, removed) = chunk_diff((0, 0), (1, 0), radius);
+        let strip = (2 * radius + 1) as usize;
+        assert_eq!(added.len(), strip);
+        assert_eq!(removed.len(), strip);
+        // Every added column is the new leading edge x = new.x + radius.
+        assert!(added.iter().all(|&(x, _)| x == 1 + radius));
+        // Every removed column is the old trailing edge x = old.x - radius.
+        assert!(removed.iter().all(|&(x, _)| x == -radius));
+    }
+
+    #[test]
+    fn diff_matches_set_difference() {
+        // The diff must equal the set-theoretic difference of the two squares,
+        // for an arbitrary jump that partially overlaps.
+        let old = (2, -1);
+        let new = (4, 1);
+        let radius = 3;
+        let (added, removed) = chunk_diff(old, new, radius);
+
+        let old_sq = square(old, radius);
+        let new_sq = square(new, radius);
+        let expect_added: HashSet<_> = new_sq.difference(&old_sq).copied().collect();
+        let expect_removed: HashSet<_> = old_sq.difference(&new_sq).copied().collect();
+
+        assert_eq!(added.iter().copied().collect::<HashSet<_>>(), expect_added);
+        assert_eq!(
+            removed.iter().copied().collect::<HashSet<_>>(),
+            expect_removed
+        );
+    }
+
+    #[test]
+    fn diff_disjoint_jump_swaps_whole_squares() {
+        // A jump farther than the diameter shares no chunks: the whole old square
+        // is forgotten and the whole new square is loaded.
+        let radius = 2;
+        let (added, removed) = chunk_diff((0, 0), (100, 100), radius);
+        let area = ((2 * radius + 1) * (2 * radius + 1)) as usize;
+        assert_eq!(added.len(), area);
+        assert_eq!(removed.len(), area);
+    }
+
+    #[test]
+    fn diff_added_is_nearest_first() {
+        // Added chunks are ordered by Chebyshev distance to the new center, so
+        // the closest ring streams first (vanilla's distance-ordered send).
+        let (added, _) = chunk_diff((0, 0), (5, 0), 3);
+        let dist = |&(x, z): &(i32, i32)| (x - 5).abs().max(z.abs());
+        for w in added.windows(2) {
+            assert!(dist(&w[0]) <= dist(&w[1]));
+        }
+    }
 }

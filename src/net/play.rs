@@ -17,6 +17,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::protocol::buffer::PacketReader;
+use crate::protocol::framing::compress;
 use crate::sim::bridge::{Outbound, Serverbound, ToSim};
 
 use super::frame::read_frame;
@@ -35,11 +36,17 @@ const SB_PLAY_MOVE_PLAYER_STATUS_ONLY: i32 = 33;
 // SERVERBOUND_TEMPLATE: PlayerAbilities (line 101 → 40), PlayerCommand
 // (line 103 → 42), Swing (line 124 → 63).
 const SB_PLAY_PLAYER_ABILITIES: i32 = 40;
+// PlayerAction sits between PlayerAbilities and PlayerCommand in
+// SERVERBOUND_TEMPLATE (line 102 → 41); it carries block-dig actions.
+const SB_PLAY_PLAYER_ACTION: i32 = 41;
 const SB_PLAY_PLAYER_COMMAND: i32 = 42;
 // PlayerInput follows PlayerCommand in SERVERBOUND_TEMPLATE (line 104 → 43); it
 // carries the `Input` flags byte that reports crouch in 26.2.
 const SB_PLAY_PLAYER_INPUT: i32 = 43;
 const SB_PLAY_SWING: i32 = 63;
+// UseItemOn (block place) follows TestInstanceBlockAction in SERVERBOUND_TEMPLATE
+// (line 127 → 66).
+const SB_PLAY_USE_ITEM_ON: i32 = 66;
 // Inventory ids: SetCarriedItem (53), SetCreativeModeSlot (56).
 const SB_PLAY_SET_CARRIED_ITEM: i32 = 53;
 const SB_PLAY_SET_CREATIVE_MODE_SLOT: i32 = 56;
@@ -60,6 +67,13 @@ const INPUT_FLAG_SHIFT: u8 = 32;
 const OUTBOX_CAP: usize = 1024;
 
 /// Drive a connection through the Play phase. Returns when the player leaves.
+///
+/// `compression` is the threshold negotiated in Login (`None` if disabled). The
+/// `sim` builds plain `frame()` bytes with no notion of compression; when a
+/// threshold is set the write task re-wraps each outbound frame through
+/// `framing::compress` before it hits the socket, and the read task inflates
+/// inbound frames via `read_frame`. This keeps the compression transform wholly
+/// inside `net`.
 pub async fn play(
     rd: OwnedReadHalf,
     wr: OwnedWriteHalf,
@@ -67,6 +81,7 @@ pub async fn play(
     uuid: Uuid,
     name: String,
     to_sim: mpsc::Sender<ToSim>,
+    compression: Option<i32>,
 ) -> io::Result<()> {
     let (out_tx, out_rx) = mpsc::channel::<Outbound>(OUTBOX_CAP);
 
@@ -84,8 +99,8 @@ pub async fn play(
         return Ok(()); // simulation is gone
     }
 
-    let mut read = tokio::spawn(read_loop(rd, uuid, to_sim.clone()));
-    let mut write = tokio::spawn(write_loop(wr, out_rx));
+    let mut read = tokio::spawn(read_loop(rd, uuid, to_sim.clone(), compression));
+    let mut write = tokio::spawn(write_loop(wr, out_rx, compression));
 
     // Whichever side finishes first, stop the other. The reader ends on client
     // disconnect or decode error; the writer ends on `Close`, a write error, or
@@ -102,10 +117,15 @@ pub async fn play(
 }
 
 /// Decode frames and forward them to the sim until EOF or a decode error.
-async fn read_loop(rd: OwnedReadHalf, uuid: Uuid, to_sim: mpsc::Sender<ToSim>) {
+async fn read_loop(
+    rd: OwnedReadHalf,
+    uuid: Uuid,
+    to_sim: mpsc::Sender<ToSim>,
+    compression: Option<i32>,
+) {
     // Buffered so the per-byte VarInt reads collapse into far fewer syscalls.
     let mut rd = BufReader::new(rd);
-    while let Ok(Some((id, mut reader))) = read_frame(&mut rd).await {
+    while let Ok(Some((id, mut reader))) = read_frame(&mut rd, compression).await {
         if let Some(packet) = decode_play(id, &mut reader) {
             if to_sim.send(ToSim::Packet { id: uuid, packet }).await.is_err() {
                 break; // simulation is gone
@@ -114,18 +134,29 @@ async fn read_loop(rd: OwnedReadHalf, uuid: Uuid, to_sim: mpsc::Sender<ToSim>) {
     }
 }
 
-/// Pump framed bytes to the socket, batching a burst into one flush.
-async fn write_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::Receiver<Outbound>) -> io::Result<()> {
+/// Pump framed bytes to the socket, batching a burst into one flush. The sim
+/// emits plain `frame()` bytes; once compression is active we re-wrap each frame
+/// through `framing::compress` here, so the sim never deals with compression.
+async fn write_loop(
+    mut wr: OwnedWriteHalf,
+    mut rx: mpsc::Receiver<Outbound>,
+    compression: Option<i32>,
+) -> io::Result<()> {
+    // Apply the compressed framing to a sim-built frame iff a threshold is set.
+    let wrap = |b: bytes::Bytes| match compression {
+        Some(threshold) => compress(&b, threshold),
+        None => b,
+    };
     while let Some(first) = rx.recv().await {
         match first {
-            Outbound::Packet(b) => wr.write_all(&b).await?,
+            Outbound::Packet(b) => wr.write_all(&wrap(b)).await?,
             Outbound::Close => break,
         }
         // Drain whatever else is already queued before flushing — this collapses
         // the join-sequence burst from ~127 flushes down to one.
         loop {
             match rx.try_recv() {
-                Ok(Outbound::Packet(b)) => wr.write_all(&b).await?,
+                Ok(Outbound::Packet(b)) => wr.write_all(&wrap(b)).await?,
                 Ok(Outbound::Close) => {
                     wr.flush().await?;
                     return Ok(());
@@ -184,6 +215,51 @@ fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbound> {
         SB_PLAY_PLAYER_INPUT => Some(Serverbound::PlayerInput {
             sneaking: reader.read_u8().ok()? & INPUT_FLAG_SHIFT != 0,
         }),
+        // ServerboundPlayerActionPacket: action (VarInt enum ordinal),
+        // blockPos (packed long), direction (unsigned byte 3D-data value),
+        // sequence (VarInt). Reference: `ServerboundPlayerActionPacket.<init>`.
+        SB_PLAY_PLAYER_ACTION => {
+            let action = reader.read_varint().ok()?;
+            let (x, y, z) = reader.read_block_pos().ok()?;
+            let face = reader.read_u8().ok()? as i32;
+            let sequence = reader.read_varint().ok()?;
+            Some(Serverbound::PlayerAction {
+                action,
+                x,
+                y,
+                z,
+                face,
+                sequence,
+            })
+        }
+        // ServerboundUseItemOnPacket: hand (VarInt enum ordinal), then the
+        // BlockHitResult — blockPos (packed long), direction (VarInt enum
+        // ordinal, *not* a byte here, per `FriendlyByteBuf.readBlockHitResult`),
+        // cursor x/y/z (floats), inside (bool), worldBorder (bool) — then
+        // sequence (VarInt). The world-border flag is read and dropped.
+        SB_PLAY_USE_ITEM_ON => {
+            let hand = reader.read_varint().ok()?;
+            let (x, y, z) = reader.read_block_pos().ok()?;
+            let face = reader.read_varint().ok()?;
+            let cursor_x = reader.read_f32().ok()?;
+            let cursor_y = reader.read_f32().ok()?;
+            let cursor_z = reader.read_f32().ok()?;
+            let inside = reader.read_bool().ok()?;
+            let _world_border = reader.read_bool().ok()?;
+            let sequence = reader.read_varint().ok()?;
+            Some(Serverbound::UseItemOn {
+                hand,
+                x,
+                y,
+                z,
+                face,
+                cursor_x,
+                cursor_y,
+                cursor_z,
+                inside,
+                sequence,
+            })
+        }
         // ServerboundSetCarriedItemPacket: a single signed short hotbar slot.
         SB_PLAY_SET_CARRIED_ITEM => Some(Serverbound::SetCarriedItem {
             slot: reader.read_u16().ok()? as i16,

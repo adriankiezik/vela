@@ -225,6 +225,14 @@ impl ServerProperties {
         self.bool("online-mode", true)
     }
 
+    /// `network-compression-threshold`: the packet size (uncompressed bytes) at
+    /// or above which a frame is zlib-deflated. A value `< 0` disables
+    /// compression entirely (vanilla `getCompressionThreshold`); the default 256
+    /// matches `DedicatedServerProperties`.
+    pub fn network_compression_threshold(&self) -> i32 {
+        self.int("network-compression-threshold", 256)
+    }
+
     pub fn hardcore(&self) -> bool {
         self.bool("hardcore", false)
     }

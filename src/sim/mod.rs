@@ -12,6 +12,7 @@ mod components;
 mod packets;
 mod systems;
 mod text;
+mod world_tick;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,13 +40,21 @@ pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
     world.insert_resource(NextEntityId(1));
     world.init_resource::<PlayerIndex>();
     world.init_resource::<Control>();
+    // World clock / weather / game rules (day-night cycle, weather, rules).
+    world.init_resource::<world_tick::GameRules>();
+    world.init_resource::<world_tick::WorldTime>();
+    world.init_resource::<world_tick::Weather>();
 
     let mut schedule = Schedule::default();
     schedule.add_systems(
         (
             systems::advance_tick,
             systems::drain_ingress,
+            world_tick::world_tick,
             systems::broadcast_movement,
+            // Dynamic chunk streaming: must run after movement is applied so the
+            // loaded-chunk set follows the player's current position this tick.
+            systems::stream_chunks,
             systems::keepalive,
         )
             .chain(),

@@ -1,11 +1,17 @@
 //! Per-connection pre-Play state machine: handshake -> status | (login ->
 //! configuration -> Play handoff).
 //!
-//! Uncompressed, unencrypted framing (offline mode). A frame is:
+//! Unencrypted framing (offline mode). A plain frame is:
 //!   VarInt(length) | VarInt(packet_id) | body...
-//! where `length` covers the id plus the body. We never negotiate compression
-//! (`SetCompression`) or encryption, so every frame stays in this plain form
-//! for the whole session.
+//! where `length` covers the id plus the body.
+//!
+//! Compression *is* negotiated, mid-Login, exactly as vanilla does: just before
+//! `ClientboundLoginFinished` the server sends `ClientboundLoginCompressionPacket`
+//! (login id 3) carrying the `network-compression-threshold`. That packet itself
+//! goes out uncompressed; from the byte after it, both directions switch to the
+//! compressed layout. We track this with a local `compression: Option<i32>` that
+//! flips from `None` to `Some(threshold)` at that point and is threaded into
+//! every `read_frame`/`send_packet`, then handed to `play`.
 //!
 //! These states are strictly request/response against a single socket, so they
 //! run inline here and write straight to the stream. Once the client reaches
@@ -30,8 +36,10 @@ use crate::sim::bridge::ToSim;
 use super::frame::{read_frame, send_packet};
 use super::play::play;
 
-// --- Login ---
+// --- Login --- (clientbound ids in `LoginProtocols` registration order:
+// disconnect=0, hello=1, login_finished=2, login_compression=3)
 const CB_LOGIN_FINISHED: i32 = 2;
+const CB_LOGIN_COMPRESSION: i32 = 3;
 const SB_LOGIN_HELLO: i32 = 0;
 const SB_LOGIN_ACK: i32 = 3;
 
@@ -59,9 +67,11 @@ pub async fn handle(
     let mut state = State::Handshake;
     let mut profile_name = String::new();
     let mut profile_uuid = Uuid::nil();
+    // `None` until the compression packet is sent mid-Login, then the threshold.
+    let mut compression: Option<i32> = None;
 
     loop {
-        let (packet_id, mut reader) = match read_frame(&mut stream).await? {
+        let (packet_id, mut reader) = match read_frame(&mut stream, compression).await? {
             Some(frame) => frame,
             None => return Ok(()), // clean EOF
         };
@@ -91,7 +101,7 @@ pub async fn handle(
                 let json = status_json(&config);
                 let mut w = PacketWriter::new();
                 w.write_utf(&json);
-                send_packet(&mut stream, 0x00, &w.buf).await?;
+                send_packet(&mut stream, 0x00, &w.buf, compression).await?;
             }
 
             // Status: ping -> echo the same i64 back as pong
@@ -99,7 +109,7 @@ pub async fn handle(
                 let payload = reader.read_i64()?;
                 let mut w = PacketWriter::new();
                 w.write_i64(payload);
-                send_packet(&mut stream, 0x01, &w.buf).await?;
+                send_packet(&mut stream, 0x01, &w.buf, compression).await?;
                 return Ok(()); // client closes after pong
             }
 
@@ -110,7 +120,21 @@ pub async fn handle(
                 let uuid = offline_uuid(&name);
                 info!(%peer, %name, %uuid, "login hello");
 
-                send_login_finished(&mut stream, uuid, &name).await?;
+                // Negotiate compression BEFORE LoginFinished, mirroring vanilla's
+                // `verifyLoginAndFinishConnectionSetup`: a threshold < 0 disables
+                // it. The compression packet is the last UNcompressed frame; both
+                // sides switch immediately after, so flip `compression` once it is
+                // on the wire and LoginFinished then goes out compressed.
+                let threshold = config.properties.network_compression_threshold();
+                if threshold >= 0 {
+                    let mut w = PacketWriter::new();
+                    w.write_varint(threshold);
+                    send_packet(&mut stream, CB_LOGIN_COMPRESSION, &w.buf, None).await?;
+                    compression = Some(threshold);
+                    debug!(%peer, threshold, "compression enabled");
+                }
+
+                send_login_finished(&mut stream, uuid, &name, compression).await?;
                 profile_name = name;
                 profile_uuid = uuid;
                 // Stay in Login until the client acknowledges.
@@ -120,7 +144,7 @@ pub async fn handle(
             (State::Login, SB_LOGIN_ACK) => {
                 info!(%peer, "login acknowledged -> configuration");
                 state = State::Configuration;
-                begin_configuration(&mut stream).await?;
+                begin_configuration(&mut stream, compression).await?;
             }
 
             // Configuration: client tells us which data packs it has. We claim
@@ -128,9 +152,9 @@ pub async fn handle(
             // ids only, data absent) and hand off to play.
             (State::Configuration, SB_CFG_SELECT_KNOWN_PACKS) => {
                 debug!(%peer, "client known packs received");
-                send_registry_data(&mut stream).await?;
-                send_tags(&mut stream).await?;
-                send_packet(&mut stream, CB_CFG_FINISH, &[]).await?;
+                send_registry_data(&mut stream, compression).await?;
+                send_tags(&mut stream, compression).await?;
+                send_packet(&mut stream, CB_CFG_FINISH, &[], compression).await?;
                 debug!(%peer, "configuration finished, awaiting ack");
             }
 
@@ -144,7 +168,7 @@ pub async fn handle(
             (State::Configuration, SB_CFG_FINISH) => {
                 info!(%peer, name = %profile_name, "entering play");
                 let (rd, wr) = stream.into_split();
-                return play(rd, wr, peer, profile_uuid, profile_name, to_sim).await;
+                return play(rd, wr, peer, profile_uuid, profile_name, to_sim, compression).await;
             }
 
             // Other configuration packets (custom-payload "brand", cookies,
@@ -168,13 +192,14 @@ async fn send_login_finished<W: AsyncWrite + Unpin>(
     w: &mut W,
     uuid: Uuid,
     name: &str,
+    compression: Option<i32>,
 ) -> io::Result<()> {
     let mut p = PacketWriter::new();
     p.write_uuid(uuid); // GameProfile.id
     p.write_utf(name); // GameProfile.name (<=16)
     p.write_varint(0); // GameProfile.properties: none
     p.write_uuid(uuid); // sessionId
-    send_packet(w, CB_LOGIN_FINISHED, &p.buf).await
+    send_packet(w, CB_LOGIN_FINISHED, &p.buf, compression).await
 }
 
 /// On entering configuration: announce the server brand (so the client's F3
@@ -182,39 +207,45 @@ async fn send_login_finished<W: AsyncWrite + Unpin>(
 /// the core known pack. Registry data follows once the client echoes the known
 /// packs back. Mirrors vanilla's `startConfiguration`, which sends the brand
 /// first.
-async fn begin_configuration<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
-    send_brand(w).await?;
+async fn begin_configuration<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    compression: Option<i32>,
+) -> io::Result<()> {
+    send_brand(w, compression).await?;
 
     let mut feats = PacketWriter::new();
     feats.write_varint(registries::ENABLED_FEATURES.len() as i32);
     for f in registries::ENABLED_FEATURES {
         feats.write_identifier(f);
     }
-    send_packet(w, CB_CFG_UPDATE_FEATURES, &feats.buf).await?;
+    send_packet(w, CB_CFG_UPDATE_FEATURES, &feats.buf, compression).await?;
 
     let mut packs = PacketWriter::new();
     packs.write_varint(1);
     packs.write_utf(registries::KNOWN_PACK_NAMESPACE);
     packs.write_utf(registries::KNOWN_PACK_ID);
     packs.write_utf(registries::KNOWN_PACK_VERSION);
-    send_packet(w, CB_CFG_SELECT_KNOWN_PACKS, &packs.buf).await
+    send_packet(w, CB_CFG_SELECT_KNOWN_PACKS, &packs.buf, compression).await
 }
 
 /// ClientboundCustomPayloadPacket carrying a `BrandPayload` on the
 /// `minecraft:brand` channel. The body is the channel identifier followed by a
 /// single UTF string — the brand the client surfaces on its F3 debug screen.
 /// Vanilla sends "vanilla" here; we send "Vela".
-async fn send_brand<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
+async fn send_brand<W: AsyncWrite + Unpin>(w: &mut W, compression: Option<i32>) -> io::Result<()> {
     let mut p = PacketWriter::new();
     p.write_identifier("minecraft:brand");
     p.write_utf("Vela");
-    send_packet(w, CB_CFG_CUSTOM_PAYLOAD, &p.buf).await
+    send_packet(w, CB_CFG_CUSTOM_PAYLOAD, &p.buf, compression).await
 }
 
 /// One ClientboundRegistryData packet per synced registry. Each entry is its
 /// id with absent NBT (`Optional` = false), so the client fills the definition
 /// from its own copy of the shared core pack.
-async fn send_registry_data<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
+async fn send_registry_data<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    compression: Option<i32>,
+) -> io::Result<()> {
     for (registry_id, entries) in registries::SYNCED {
         let mut p = PacketWriter::new();
         p.write_identifier(registry_id);
@@ -223,26 +254,30 @@ async fn send_registry_data<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> 
             p.write_identifier(entry);
             p.write_bool(false); // data absent
         }
-        send_packet(w, CB_CFG_REGISTRY_DATA, &p.buf).await?;
+        send_packet(w, CB_CFG_REGISTRY_DATA, &p.buf, compression).await?;
     }
     Ok(())
 }
 
-/// ClientboundUpdateTags: a map of registry -> (tag name -> entry ids). We bind
-/// only the tags the client requires, each with an empty id list. Without this
-/// the client aborts configuration with "Unbound tags".
-async fn send_tags<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
+/// ClientboundUpdateTags: a map of registry -> (tag name -> entry ids). Every
+/// tag the client requires must be present or it aborts configuration; the
+/// `minecraft:block` and `minecraft:item` registries carry real member ids
+/// (block / item registry indices), the rest stay empty. See `registry_tags`.
+async fn send_tags<W: AsyncWrite + Unpin>(w: &mut W, compression: Option<i32>) -> io::Result<()> {
     let mut p = PacketWriter::new();
-    p.write_varint(crate::registry_tags::EMPTY_TAGS.len() as i32);
-    for (registry_id, tags) in crate::registry_tags::EMPTY_TAGS {
-        p.write_identifier(registry_id);
-        p.write_varint(tags.len() as i32);
-        for tag in *tags {
-            p.write_identifier(tag);
-            p.write_varint(0); // empty id list
+    p.write_varint(crate::registry_tags::TAGS.len() as i32);
+    for registry in crate::registry_tags::TAGS {
+        p.write_identifier(registry.registry);
+        p.write_varint(registry.tags.len() as i32);
+        for tag in registry.tags {
+            p.write_identifier(tag.name);
+            p.write_varint(tag.ids.len() as i32);
+            for id in tag.ids {
+                p.write_varint(*id);
+            }
         }
     }
-    send_packet(w, CB_CFG_UPDATE_TAGS, &p.buf).await
+    send_packet(w, CB_CFG_UPDATE_TAGS, &p.buf, compression).await
 }
 
 #[derive(Serialize)]

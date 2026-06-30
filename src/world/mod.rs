@@ -25,6 +25,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::protocol::buffer::PacketWriter;
 
+mod block_item;
+pub use block_item::block_state_for_item;
+
 /// World floor. Sections stack upward from here; the overworld is 384 blocks
 /// tall, so 24 sections of 16.
 pub const MIN_Y: i32 = -64;
@@ -38,6 +41,11 @@ const COLUMNS: usize = 16 * 16;
 /// Reference surface height. Terrain is centred on this so a player spawned at
 /// y=64 lands on the ground near the origin.
 pub const SURFACE_Y: i32 = 63;
+
+/// The air block-state id (palette 0) — the "empty" cell and the result of a
+/// break. Public so the simulation can place/clear blocks without reaching into
+/// the private `states` table.
+pub const AIR_STATE: u32 = 0;
 
 /// Global block-state palette ids — the default state of each block, taken from
 /// the server's block registration order in `Blocks.java` (AIR registered first
@@ -146,7 +154,10 @@ fn fbm(x: f64, z: f64) -> f64 {
 /// Deterministic in `(world_x, world_z)`, so adjacent chunks line up exactly.
 /// Result is clamped to `[HEIGHT_MIN, HEIGHT_MAX]`.
 pub fn surface_height(world_x: i32, world_z: i32) -> i32 {
-    let n = fbm(world_x as f64 / TERRAIN_SCALE, world_z as f64 / TERRAIN_SCALE);
+    let n = fbm(
+        world_x as f64 / TERRAIN_SCALE,
+        world_z as f64 / TERRAIN_SCALE,
+    );
     let h = SURFACE_Y as f64 + n * TERRAIN_AMPLITUDE;
     (h.round() as i32).clamp(HEIGHT_MIN, HEIGHT_MAX)
 }
@@ -186,62 +197,150 @@ fn chunk_heights(cx: i32, cz: i32) -> [i32; COLUMNS] {
     heights
 }
 
-/// The generated wire data for one chunk column: the 24-section block blob and
-/// the two client-facing heightmaps. Both derive from the same 256 per-column
-/// heights, so they are produced together (computing the noise field once) and
-/// cached — terrain is static, so a chunk is generated at most once.
+/// Total world height in blocks (`SECTION_COUNT * 16`), and the exclusive top y.
+const WORLD_HEIGHT: i32 = SECTION_COUNT * 16;
+const MAX_Y_EXCL: i32 = MIN_Y + WORLD_HEIGHT;
+
+/// The wire data for one chunk column: the 24-section block blob and the two
+/// client-facing heightmaps. Both derive from the column's 256 surface heights
+/// *plus* any per-cell edits, so they are produced together and cached; the
+/// cache is invalidated whenever the chunk is edited.
 pub struct ChunkColumns {
     pub blob: Vec<u8>,
     pub heightmaps: Vec<(i32, Vec<i64>)>,
 }
 
-/// Generate (uncached) the block blob and heightmaps for chunk `(cx, cz)` from a
-/// single evaluation of the noise heightfield.
-fn generate(cx: i32, cz: i32) -> ChunkColumns {
-    let heights = chunk_heights(cx, cz);
-    ChunkColumns {
-        blob: encode_blob(&heights),
-        heightmaps: compute_heightmaps(&heights),
+/// A chunk's mutable state: its generated baseline heights, a sparse map of
+/// per-cell block-state overrides (edits), and the lazily-built/​cached wire
+/// `ChunkColumns`. The wire cache is `None` until first streamed and is cleared
+/// on every edit so a subsequent `level_chunk` reflects the change.
+struct ChunkData {
+    heights: [i32; COLUMNS],
+    /// `edit_key(lx, y, lz)` → overriding block-state id (AIR included, so a
+    /// broken surface block is represented explicitly).
+    edits: HashMap<u32, u32>,
+    wire: Option<Arc<ChunkColumns>>,
+}
+
+impl ChunkData {
+    fn new(cx: i32, cz: i32) -> Self {
+        Self {
+            heights: chunk_heights(cx, cz),
+            edits: HashMap::new(),
+            wire: None,
+        }
+    }
+
+    /// The block-state at local `(lx, y, lz)` — an edit if one exists, else the
+    /// generated terrain state.
+    fn state(&self, lx: i32, y: i32, lz: i32) -> u32 {
+        if let Some(key) = edit_key(lx, y, lz) {
+            if let Some(&s) = self.edits.get(&key) {
+                return s;
+            }
+        }
+        state_at(y, self.heights[(lz * 16 + lx) as usize])
+    }
+
+    /// Record an edit and invalidate the wire cache, returning the previous state.
+    fn set(&mut self, lx: i32, y: i32, lz: i32, state: u32) -> u32 {
+        let prev = self.state(lx, y, lz);
+        if let Some(key) = edit_key(lx, y, lz) {
+            self.edits.insert(key, state);
+            self.wire = None;
+        }
+        prev
+    }
+
+    /// The cached wire columns, building them from heights + edits on first use.
+    fn columns(&mut self) -> Arc<ChunkColumns> {
+        if self.wire.is_none() {
+            self.wire = Some(Arc::new(ChunkColumns {
+                blob: encode_blob(&self.heights, &self.edits),
+                heightmaps: compute_heightmaps(&self.heights, &self.edits),
+            }));
+        }
+        Arc::clone(self.wire.as_ref().expect("wire just built"))
     }
 }
 
-/// Process-wide cache of generated chunks, keyed by `(cx, cz)`. The world is
-/// static, so an entry is computed once and shared thereafter. Guarded by a
-/// `Mutex` because, while the simulation is single-threaded today, nothing about
-/// the signature promises that; the lock is uncontended in practice.
-type ChunkCache = Mutex<HashMap<(i32, i32), Arc<ChunkColumns>>>;
-
-fn cache() -> &'static ChunkCache {
-    static CACHE: OnceLock<ChunkCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Encode `(lx, y, lz)` into a flat per-column-stack edit key, or `None` if `y`
+/// is outside the buildable world (`MIN_Y..MAX_Y_EXCL`).
+fn edit_key(lx: i32, y: i32, lz: i32) -> Option<u32> {
+    if !(MIN_Y..MAX_Y_EXCL).contains(&y) {
+        return None;
+    }
+    Some(((y - MIN_Y) as u32) * COLUMNS as u32 + (lz as u32) * 16 + lx as u32)
 }
 
-/// The generated columns for chunk `(cx, cz)`, generating and caching on first
-/// request. The returned `Arc` is cheap to clone and share.
+/// Process-wide store of chunks, keyed by `(cx, cz)`. Each chunk caches its wire
+/// data and carries its edits. Guarded by a `Mutex` because, while the
+/// simulation is single-threaded today, nothing about the signatures promises
+/// that; the lock is uncontended in practice.
+type ChunkStore = Mutex<HashMap<(i32, i32), ChunkData>>;
+
+fn store() -> &'static ChunkStore {
+    static STORE: OnceLock<ChunkStore> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Run `f` against chunk `(cx, cz)`'s `ChunkData`, generating it on first touch.
+fn with_chunk<R>(cx: i32, cz: i32, f: impl FnOnce(&mut ChunkData) -> R) -> R {
+    let mut guard = store().lock().expect("chunk store mutex poisoned");
+    let chunk = guard
+        .entry((cx, cz))
+        .or_insert_with(|| ChunkData::new(cx, cz));
+    f(chunk)
+}
+
+/// The wire columns for chunk `(cx, cz)`, generating and caching on first
+/// request and rebuilding after edits. The returned `Arc` is cheap to clone.
 pub fn chunk_columns(cx: i32, cz: i32) -> Arc<ChunkColumns> {
-    Arc::clone(
-        cache()
-            .lock()
-            .expect("chunk cache mutex poisoned")
-            .entry((cx, cz))
-            .or_insert_with(|| Arc::new(generate(cx, cz))),
-    )
+    with_chunk(cx, cz, ChunkData::columns)
 }
 
-/// Encode the 24-section block blob for a chunk from its 256 column heights.
-fn encode_blob(heights: &[i32; COLUMNS]) -> Vec<u8> {
+/// The block-state id at world `(x, y, z)` — an edit if present, else generated
+/// terrain. Out-of-world `y` reads as air.
+pub fn block_state_at(x: i32, y: i32, z: i32) -> u32 {
+    if !(MIN_Y..MAX_Y_EXCL).contains(&y) {
+        return states::AIR;
+    }
+    let (cx, cz) = (x >> 4, z >> 4);
+    let (lx, lz) = (x & 15, z & 15);
+    with_chunk(cx, cz, |c| c.state(lx, y, lz))
+}
+
+/// Set the block-state at world `(x, y, z)`, returning the previous state id.
+/// A no-op (returns air) for out-of-world `y`. Invalidates the chunk's cached
+/// wire blob so a freshly-streamed `level_chunk` reflects the edit.
+pub fn set_block(x: i32, y: i32, z: i32, state: u32) -> u32 {
+    if !(MIN_Y..MAX_Y_EXCL).contains(&y) {
+        return states::AIR;
+    }
+    let (cx, cz) = (x >> 4, z >> 4);
+    let (lx, lz) = (x & 15, z & 15);
+    with_chunk(cx, cz, |c| c.set(lx, y, lz, state))
+}
+
+/// Encode the 24-section block blob for a chunk from its heights and edits.
+fn encode_blob(heights: &[i32; COLUMNS], edits: &HashMap<u32, u32>) -> Vec<u8> {
     let mut out = PacketWriter::new();
     for section in 0..SECTION_COUNT {
         let base_y = MIN_Y + section * 16;
-        encode_section(base_y, heights, &mut out);
+        encode_section(base_y, heights, edits, &mut out);
     }
     out.buf.to_vec()
 }
 
 /// Serialize one section: counts, then the block-state and biome containers.
 /// `heights` are the 256 per-column surface heights for this chunk, indexed
-/// `lz * 16 + lx`.
-fn encode_section(base_y: i32, heights: &[i32; COLUMNS], out: &mut PacketWriter) {
+/// `lz * 16 + lx`; `edits` overrides individual cells.
+fn encode_section(
+    base_y: i32,
+    heights: &[i32; COLUMNS],
+    edits: &HashMap<u32, u32>,
+    out: &mut PacketWriter,
+) {
     // Cell index is vanilla's `(y << 8) | (z << 4) | x`.
     let mut cells = [states::AIR; CELLS];
     let mut non_air: u16 = 0;
@@ -249,8 +348,7 @@ fn encode_section(base_y: i32, heights: &[i32; COLUMNS], out: &mut PacketWriter)
         let world_y = base_y + ly;
         for lz in 0..16i32 {
             for lx in 0..16i32 {
-                let height = heights[(lz * 16 + lx) as usize];
-                let state = state_at(world_y, height);
+                let state = cell_state(heights, edits, lx, world_y, lz);
                 if state != states::AIR {
                     non_air += 1;
                 }
@@ -266,14 +364,33 @@ fn encode_section(base_y: i32, heights: &[i32; COLUMNS], out: &mut PacketWriter)
     write_single_value(PLAINS_BIOME, out); // biome container (single value)
 }
 
+/// The block-state at local `(lx, world_y, lz)`: an edit if present, else the
+/// generated terrain state.
+fn cell_state(
+    heights: &[i32; COLUMNS],
+    edits: &HashMap<u32, u32>,
+    lx: i32,
+    world_y: i32,
+    lz: i32,
+) -> u32 {
+    if let Some(key) = edit_key(lx, world_y, lz) {
+        if let Some(&s) = edits.get(&key) {
+            return s;
+        }
+    }
+    state_at(world_y, heights[(lz * 16 + lx) as usize])
+}
+
 /// Write a block-state `PalettedContainer`. A uniform section collapses to a
 /// single-value palette (0 bits, no data array); otherwise we use a 4-bit
 /// linear palette — vanilla pads palettes of 1–4 bits up to 4 for block states.
 ///
-/// Our terrain uses at most five distinct states per section
-/// (air/grass/dirt/stone/bedrock), well under the 16-entry (4-bit) ceiling, so
-/// the fixed 4-bit width always suffices; a wider section would need a wider
-/// `BITS` and is rejected by the debug assert below.
+/// The width grows with the distinct-state count: 4 bits up to 16 entries, then
+/// the smallest width that fits (5..=8 bits, up to 256 entries). Generated
+/// terrain uses ≤5 states per section, but block placement can introduce more,
+/// so the width is no longer fixed. A section with >256 distinct states (far
+/// beyond any realistic manual edit) would need the direct/global palette, which
+/// we do not emit; the debug assert guards that ceiling.
 fn write_block_palette(cells: &[u32; CELLS], out: &mut PacketWriter) {
     let mut palette: Vec<u32> = Vec::new();
     for &c in cells.iter() {
@@ -287,14 +404,14 @@ fn write_block_palette(cells: &[u32; CELLS], out: &mut PacketWriter) {
         return;
     }
 
-    const BITS: u32 = 4;
-    // 4-bit linear palette caps at 16 entries; extend BITS before exceeding it.
+    // Indirect (linear) palette: 4 bits minimum, widened to fit the entry count.
     debug_assert!(
-        palette.len() <= 16,
-        "section palette {} exceeds 4-bit linear capacity",
+        palette.len() <= 256,
+        "section palette {} exceeds 8-bit linear capacity",
         palette.len()
     );
-    out.write_u8(BITS as u8);
+    let bits = bits_for_palette(palette.len());
+    out.write_u8(bits as u8);
     out.write_varint(palette.len() as i32);
     for &state in &palette {
         out.write_varint(state as i32);
@@ -303,36 +420,76 @@ fn write_block_palette(cells: &[u32; CELLS], out: &mut PacketWriter) {
         .iter()
         .map(|c| palette.iter().position(|p| p == c).unwrap() as u64)
         .collect();
-    for long in pack_bits(&indices, BITS) {
+    for long in pack_bits(&indices, bits) {
         out.write_i64(long as i64);
     }
+}
+
+/// Bits per entry for an indirect block-state palette of `len` entries: vanilla
+/// pads to a 4-bit minimum, then uses the smallest width that indexes `len`.
+fn bits_for_palette(len: usize) -> u32 {
+    let needed = usize::BITS - (len - 1).leading_zeros();
+    needed.max(4)
 }
 
 /// A single-value (0-bit) `PalettedContainer`: just the value, no storage.
 fn write_single_value(value: u32, out: &mut PacketWriter) {
     out.write_u8(0); // bits per entry
     out.write_varint(value as i32); // the sole palette entry
-    // No data array follows a 0-bit storage.
+                                    // No data array follows a 0-bit storage.
 }
 
 /// The two client-facing heightmaps (`WORLD_SURFACE` = id 1, `MOTION_BLOCKING`
 /// = id 4) for a chunk, each a packed `long[]` of 256 column heights. With no
-/// water or non-occluding cover both equal the first free y above the surface,
-/// relative to the world floor (`firstAvailable - minY`).
-fn compute_heightmaps(heights: &[i32; COLUMNS]) -> Vec<(i32, Vec<i64>)> {
+/// water or non-occluding cover both equal the first free y above the highest
+/// non-air block, relative to the world floor (`firstAvailable - minY`).
+///
+/// Edits are folded in by recomputing each column's top non-air block: an
+/// unedited column short-circuits to its generated surface height, while an
+/// edited column is scanned from the top so a placed block raises the map and a
+/// broken surface lowers it.
+fn compute_heightmaps(heights: &[i32; COLUMNS], edits: &HashMap<u32, u32>) -> Vec<(i32, Vec<i64>)> {
     // Bits = ceil(log2(worldHeight + 1)); a 384-tall column -> 9.
-    let bits = ((SECTION_COUNT * 16 + 1) as u32)
+    let bits = ((WORLD_HEIGHT + 1) as u32)
         .next_power_of_two()
         .trailing_zeros();
-    let values: Vec<u64> = heights
-        .iter()
-        .map(|&h| (h + 1 - MIN_Y) as u64) // first empty y above the surface
-        .collect();
+    let mut values = [0u64; COLUMNS];
+    for lz in 0..16i32 {
+        for lx in 0..16i32 {
+            let col = (lz * 16 + lx) as usize;
+            values[col] = (column_first_empty(heights, edits, lx, lz) - MIN_Y) as u64;
+        }
+    }
     let packed: Vec<i64> = pack_bits(&values, bits)
         .into_iter()
         .map(|l| l as i64)
         .collect();
     vec![(1, packed.clone()), (4, packed)]
+}
+
+/// The first empty (air) y above the highest non-air block of column
+/// `(lx, lz)`. Unedited columns return `height + 1` directly; columns with edits
+/// are scanned downward from the world top. A fully-air column returns `MIN_Y`.
+fn column_first_empty(
+    heights: &[i32; COLUMNS],
+    edits: &HashMap<u32, u32>,
+    lx: i32,
+    lz: i32,
+) -> i32 {
+    let height = heights[(lz * 16 + lx) as usize];
+    let column_has_edits = edits.keys().any(|&k| {
+        let rem = k % COLUMNS as u32;
+        rem == (lz as u32) * 16 + lx as u32
+    });
+    if !column_has_edits {
+        return height + 1;
+    }
+    for y in (MIN_Y..MAX_Y_EXCL).rev() {
+        if cell_state(heights, edits, lx, y, lz) != states::AIR {
+            return y + 1;
+        }
+    }
+    MIN_Y
 }
 
 /// Pack `values` into longs at `bits` each, vanilla `SimpleBitStorage` layout:
@@ -353,6 +510,17 @@ fn pack_bits(values: &[u64], bits: u32) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build the wire columns for a chunk from its generated heights with no
+    /// edits — the pre-mutable-world `generate`, kept for the encoding tests.
+    fn generate(cx: i32, cz: i32) -> ChunkColumns {
+        let heights = chunk_heights(cx, cz);
+        let edits = HashMap::new();
+        ChunkColumns {
+            blob: encode_blob(&heights, &edits),
+            heightmaps: compute_heightmaps(&heights, &edits),
+        }
+    }
 
     #[test]
     fn pack_is_non_spanning_and_low_to_high() {
@@ -425,7 +593,7 @@ mod tests {
         assert_eq!(maps.len(), 2);
         assert_eq!(maps[0].0, 1); // WORLD_SURFACE
         assert_eq!(maps[1].0, 4); // MOTION_BLOCKING
-        // 256 columns at 9 bits, 7 per long -> 37 longs.
+                                  // 256 columns at 9 bits, 7 per long -> 37 longs.
         assert_eq!(maps[0].1.len(), 37);
         assert_eq!(maps[1].1.len(), 37);
     }
@@ -481,5 +649,82 @@ mod tests {
             );
         }
     }
-}
 
+    #[test]
+    fn set_block_returns_previous_and_reads_back() {
+        // Use a far-away column so other tests' edits can't interfere.
+        let (x, y, z) = (10_000, 100, 10_000);
+        // Above the surface here is air; place stone, then read it back.
+        assert_eq!(block_state_at(x, y, z), states::AIR);
+        let prev = set_block(x, y, z, states::STONE);
+        assert_eq!(prev, states::AIR);
+        assert_eq!(block_state_at(x, y, z), states::STONE);
+        // Overwrite returns the prior edit; break clears to air.
+        assert_eq!(set_block(x, y, z, states::DIRT), states::STONE);
+        assert_eq!(set_block(x, y, z, states::AIR), states::DIRT);
+        assert_eq!(block_state_at(x, y, z), states::AIR);
+    }
+
+    #[test]
+    fn breaking_surface_block_is_reflected() {
+        // Break the generated surface grass at a column and confirm it reads air.
+        let (wx, wz) = (10_016, 10_048);
+        let h = surface_height(wx, wz);
+        assert_eq!(block_state_at(wx, h, wz), states::GRASS_BLOCK);
+        let prev = set_block(wx, h, wz, states::AIR);
+        assert_eq!(prev, states::GRASS_BLOCK);
+        assert_eq!(block_state_at(wx, h, wz), states::AIR);
+    }
+
+    #[test]
+    fn out_of_world_edits_are_noops() {
+        assert_eq!(set_block(5, MIN_Y - 1, 5, states::STONE), states::AIR);
+        assert_eq!(set_block(5, MAX_Y_EXCL, 5, states::STONE), states::AIR);
+        assert_eq!(block_state_at(5, MIN_Y - 1, 5), states::AIR);
+    }
+
+    #[test]
+    fn edit_invalidates_wire_cache_and_rebuilds() {
+        // First stream caches; an edit must invalidate so the next stream differs.
+        let (cx, cz) = (321, 654);
+        let before = chunk_columns(cx, cz);
+        let a = chunk_columns(cx, cz);
+        assert!(Arc::ptr_eq(&before, &a)); // unedited: same Arc
+                                           // Place a stone pillar block well above the surface in this chunk.
+        set_block(cx * 16 + 1, 200, cz * 16 + 1, states::STONE);
+        let after = chunk_columns(cx, cz);
+        assert!(!Arc::ptr_eq(&before, &after)); // rebuilt after the edit
+        assert_ne!(before.blob, after.blob);
+    }
+
+    #[test]
+    fn placing_above_surface_raises_heightmap() {
+        // A block placed above the terrain surface must lift the WORLD_SURFACE
+        // heightmap for that column.
+        let (cx, cz) = (-321, 222);
+        let (lx, lz) = (2, 3);
+        let (wx, wz) = (cx * 16 + lx, cz * 16 + lz);
+        let surface = surface_height(wx, wz);
+        let place_y = surface + 5; // a floating block, air between
+        set_block(wx, place_y, wz, states::STONE);
+        let cols = chunk_columns(cx, cz);
+        // Unpack the column's WORLD_SURFACE value (9-bit, 7 per long).
+        let bits = 9usize;
+        let per_long = 64 / bits;
+        let col = (lz * 16 + lx) as usize;
+        let longs = &cols.heightmaps[0].1;
+        let raw = longs[col / per_long] as u64;
+        let value = (raw >> ((col % per_long) * bits)) & ((1 << bits) - 1);
+        assert_eq!(value as i32, place_y + 1 - MIN_Y);
+    }
+
+    #[test]
+    fn bits_for_palette_widths() {
+        assert_eq!(bits_for_palette(2), 4); // padded up to the 4-bit minimum
+        assert_eq!(bits_for_palette(16), 4);
+        assert_eq!(bits_for_palette(17), 5);
+        assert_eq!(bits_for_palette(32), 5);
+        assert_eq!(bits_for_palette(33), 6);
+        assert_eq!(bits_for_palette(256), 8);
+    }
+}

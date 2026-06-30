@@ -1,31 +1,30 @@
-//! Text component builders, producing the network-NBT shape the client decodes.
+//! Text-component builders — a thin compatibility shim over the typed model in
+//! [`crate::protocol::text`].
 //!
-//! A 26.2 chat component is an NBT compound: a content field (`text` for a
-//! literal, `translate` (+ optional `with`) for a translatable) plus optional
-//! sibling *style* keys (`color`, `clickEvent`, `hoverEvent`, `insertion`).
-//! These mirror the decompiled `net.minecraft.network.chat` codecs — see
-//! `Component`, `TranslatableContents`, `ClickEvent`, `HoverEvent` — without
-//! copying any of their code.
+//! These functions keep an incremental, `Nbt`-in/`Nbt`-out API (a base component
+//! is built, then style/content keys are appended) that the command and chat
+//! call sites rely on. The wire-shape knowledge — style key names, click/hover
+//! event layout, color serialization — lives in `protocol::text`; this module
+//! delegates to it so the bytes match the decompiled 26.2 `Component`/`Style`
+//! codecs (notably the **snake_case** style keys `click_event` / `hover_event`).
 //!
-//! Translation args (`with`) are written as a homogeneous list of components.
-//! Vanilla also permits raw primitive args (an int renders as its digits), but
-//! a list mixing primitives and components is not a valid (single-type) NBT
-//! list; wrapping every arg as a `{text:"…"}` component keeps the list
-//! homogeneous and renders byte-for-byte identically, since the client
-//! stringifies a numeric arg and a text component the same way.
+//! Translation args (`with`) and siblings are written as a homogeneous list of
+//! component compounds, matching the wire (a primitive arg would be collapsed to
+//! a bare string by vanilla, but a `{text:…}` compound decodes identically).
 
 use crate::protocol::nbt::Nbt;
+use crate::protocol::text::{ClickEvent, Color, TextComponent};
 
 /// A plain literal component: `{text: s}`.
 pub fn text(s: impl Into<String>) -> Nbt {
-    Nbt::Compound(vec![("text".to_string(), Nbt::String(s.into()))])
+    TextComponent::text(s).to_nbt()
 }
 
 /// A translatable component: `{translate: key}` plus `{with: [args]}` when any
-/// args are present. The client formats it through its own language file, so
-/// the rendered text matches vanilla exactly for the same key and args.
+/// args are present. Args arrive already encoded as component compounds, so the
+/// list is homogeneous. Mirrors `Content::Translatable` in `protocol::text`.
 pub fn translatable(key: &str, with: Vec<Nbt>) -> Nbt {
-    let mut fields = vec![("translate".to_string(), Nbt::String(key.to_string()))];
+    let mut fields = vec![("translate".to_string(), Nbt::string(key))];
     if !with.is_empty() {
         fields.push(("with".to_string(), Nbt::List(with)));
     }
@@ -47,37 +46,36 @@ fn with_field(component: Nbt, key: &str, value: Nbt) -> Nbt {
     }
 }
 
-/// Set the component's `color` (a named color like `"green"` or a `#rrggbb`).
+/// Set the component's `color` (a named color like `"green"` or a `#rrggbb`),
+/// serialized through `protocol::text::Color`.
 pub fn colored(component: Nbt, color: &str) -> Nbt {
-    with_field(component, "color", Nbt::String(color.to_string()))
+    with_field(
+        component,
+        "color",
+        Nbt::string(Color::parse(color).serialize()),
+    )
 }
 
-/// Attach a copy-to-clipboard click event, mirroring `ClickEvent.CopyToClipboard`
-/// (`{action: "copy_to_clipboard", value}`).
+/// Attach a copy-to-clipboard click event, delegating to
+/// `ClickEvent::CopyToClipboard` (`{action: "copy_to_clipboard", value}`).
 pub fn copy_to_clipboard(component: Nbt, value: &str) -> Nbt {
-    let event = Nbt::Compound(vec![
-        (
-            "action".to_string(),
-            Nbt::String("copy_to_clipboard".to_string()),
-        ),
-        ("value".to_string(), Nbt::String(value.to_string())),
-    ]);
-    with_field(component, "clickEvent", event)
+    with_field(
+        component,
+        "click_event",
+        ClickEvent::CopyToClipboard(value.to_string()).to_nbt(),
+    )
 }
 
-/// Attach a show-text hover event, mirroring `HoverEvent.ShowText`
-/// (`{action: "show_text", value: <component>}`).
+/// Attach a show-text hover event (`{action: "show_text", value: <component>}`,
+/// mirroring `HoverEvent::ShowText`). `value` is an already-encoded component.
 pub fn hover_text(component: Nbt, value: Nbt) -> Nbt {
-    let event = Nbt::Compound(vec![
-        ("action".to_string(), Nbt::String("show_text".to_string())),
-        ("value".to_string(), value),
-    ]);
-    with_field(component, "hoverEvent", event)
+    let event = Nbt::compound([("action", Nbt::string("show_text")), ("value", value)]);
+    with_field(component, "hover_event", event)
 }
 
 /// Set the shift-click `insertion` text.
 pub fn insertion(component: Nbt, value: &str) -> Nbt {
-    with_field(component, "insertion", Nbt::String(value.to_string()))
+    with_field(component, "insertion", Nbt::string(value))
 }
 
 /// Wrap a component in square brackets, mirroring `ComponentUtils.wrapInSquareBrackets`

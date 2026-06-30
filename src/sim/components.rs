@@ -3,7 +3,7 @@
 //! A connected player is an entity carrying `PlayerId` + `Profile` + `Pos` +
 //! `Conn` + `KeepAlive`. World-wide state lives in resources.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use bevy_ecs::prelude::*;
@@ -77,6 +77,21 @@ pub struct Meta {
     pub sneaking: bool,
     pub sprinting: bool,
     pub flying: bool,
+}
+
+/// The set of chunk columns currently streamed to a player, plus the chunk
+/// center the set was last computed around. Mirrors the per-player slice of
+/// vanilla's `ChunkMap`/`PlayerChunkSender` bookkeeping: the streaming system
+/// only re-diffs when `center` changes, then adds/forgets columns so the loaded
+/// set stays a `(2R+1)²` square around the player.
+///
+/// Seeded at join to exactly the square `send_join_sequence` already streamed,
+/// with `center == (0, 0)`, so the streaming system sends only deltas afterwards
+/// and never re-sends a chunk the join already delivered.
+#[derive(Component)]
+pub struct LoadedChunks {
+    pub center: (i32, i32),
+    pub loaded: HashSet<(i32, i32)>,
 }
 
 /// The egress side of a player's connection — how the sim talks back. Cheap to

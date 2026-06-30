@@ -3,6 +3,7 @@
 pub mod buffer;
 pub mod framing;
 pub mod nbt;
+pub mod text;
 pub mod uuid;
 pub mod varint;
 

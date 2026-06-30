@@ -85,6 +85,58 @@ impl Nbt {
 }
 
 // ---------------------------------------------------------------------------
+// Ergonomic constructors & accessors
+//
+// The binary codec above is complete on its own; these helpers exist so the
+// builders that compose tags (notably the text-component model in
+// `protocol::text`) read naturally and so call sites can introspect a decoded
+// compound without matching the enum by hand.
+// ---------------------------------------------------------------------------
+
+impl Nbt {
+    /// A `TAG_String` from anything string-like.
+    pub fn string(s: impl Into<String>) -> Nbt {
+        Nbt::String(s.into())
+    }
+
+    /// A `TAG_Byte` carrying a boolean (`1`/`0`), the encoding vanilla codecs
+    /// use for `Codec.BOOL` over NBT.
+    pub fn bool(b: bool) -> Nbt {
+        Nbt::Byte(b as i8)
+    }
+
+    /// A `TAG_Compound` from an iterator of `(name, tag)` entries, preserving
+    /// the iteration order.
+    pub fn compound<K: Into<String>, I: IntoIterator<Item = (K, Nbt)>>(entries: I) -> Nbt {
+        Nbt::Compound(entries.into_iter().map(|(k, v)| (k.into(), v)).collect())
+    }
+
+    /// Borrow the entries if this is a `Compound`.
+    pub fn as_compound(&self) -> Option<&[(String, Nbt)]> {
+        match self {
+            Nbt::Compound(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
+    /// Borrow the string payload if this is a `String`.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Nbt::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Look up a child tag by key, if this is a `Compound` containing it.
+    pub fn get(&self, key: &str) -> Option<&Nbt> {
+        self.as_compound()?
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -606,6 +658,25 @@ mod tests {
             }
             other => panic!("expected string, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn constructors_and_accessors() {
+        let c = Nbt::compound([
+            ("text", Nbt::string("hi")),
+            ("bold", Nbt::bool(true)),
+        ]);
+        assert_eq!(c.get("text").and_then(Nbt::as_str), Some("hi"));
+        assert_eq!(c.get("bold"), Some(&Nbt::Byte(1)));
+        assert_eq!(c.get("missing"), None);
+        assert!(c.as_compound().is_some());
+        assert_eq!(Nbt::Int(3).as_compound(), None);
+        assert_eq!(Nbt::Int(3).get("x"), None);
+        // The compound preserves insertion order.
+        assert_eq!(
+            c.as_compound().unwrap()[0].0,
+            "text".to_string()
+        );
     }
 
     #[test]

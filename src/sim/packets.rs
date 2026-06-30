@@ -20,7 +20,14 @@ use crate::protocol::nbt::{write_network, Nbt};
 
 const CB_PLAY_ADD_ENTITY: i32 = 1;
 const CB_PLAY_ANIMATE: i32 = 2;
+// Block-edit feedback packets (clientbound registration order in
+// `GameProtocols.CLIENTBOUND_TEMPLATE`, bundle delimiter = index 0):
+// BLOCK_CHANGED_ACK (line 137 → 4), BLOCK_UPDATE (line 141 → 8),
+// SECTION_BLOCKS_UPDATE (line 217 → 84).
+const CB_PLAY_BLOCK_CHANGED_ACK: i32 = 4;
+const CB_PLAY_BLOCK_UPDATE: i32 = 8;
 const CB_PLAY_ENTITY_POSITION_SYNC: i32 = 35;
+const CB_PLAY_FORGET_LEVEL_CHUNK: i32 = 37;
 const CB_PLAY_GAME_EVENT: i32 = 38;
 const CB_PLAY_KEEP_ALIVE: i32 = 44;
 const CB_PLAY_LEVEL_CHUNK: i32 = 45;
@@ -34,7 +41,9 @@ const CB_PLAY_PLAYER_POSITION: i32 = 72;
 const CB_PLAY_REMOVE_ENTITIES: i32 = 77;
 const CB_PLAY_ROTATE_HEAD: i32 = 83;
 const CB_PLAY_SET_CHUNK_CACHE_CENTER: i32 = 94;
+const CB_PLAY_SECTION_BLOCKS_UPDATE: i32 = 84;
 const CB_PLAY_SET_ENTITY_DATA: i32 = 99;
+const CB_PLAY_SET_TIME: i32 = 113;
 const CB_PLAY_SYSTEM_CHAT: i32 = 121;
 
 /// `minecraft:player` network id — index 156 in the (alphabetical) entity-type
@@ -55,6 +64,41 @@ const GAME_TYPE_SURVIVAL: u8 = 0;
 /// begin waiting for chunks; the "Loading terrain" screen clears once the
 /// chunks around the player arrive.
 pub const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
+
+// Weather `ClientboundGameEventPacket.Type` ids (from `ClientboundGameEventPacket`):
+// START_RAINING=1, STOP_RAINING=2, RAIN_LEVEL_CHANGE=7, THUNDER_LEVEL_CHANGE=8.
+// START/STOP carry a 0.0 param; the LEVEL_CHANGE events carry the new level.
+/// `ClientboundGameEventPacket.START_RAINING` — sky begins to rain (param 0).
+pub const GAME_EVENT_START_RAINING: u8 = 1;
+/// `ClientboundGameEventPacket.STOP_RAINING` — sky clears (param 0).
+pub const GAME_EVENT_STOP_RAINING: u8 = 2;
+/// `ClientboundGameEventPacket.RAIN_LEVEL_CHANGE` — param is the new rain level 0..=1.
+pub const GAME_EVENT_RAIN_LEVEL_CHANGE: u8 = 7;
+/// `ClientboundGameEventPacket.THUNDER_LEVEL_CHANGE` — param is the new thunder level 0..=1.
+pub const GAME_EVENT_THUNDER_LEVEL_CHANGE: u8 = 8;
+
+/// `WORLD_CLOCK` registry id of `minecraft:overworld` — the first entry registered
+/// in `WorldClocks.bootstrap` (overworld=0, the_end=1), so its `holderRegistry`
+/// wire id is 0. Sent as the clock holder key in [`set_time`].
+pub const WORLD_CLOCK_OVERWORLD: i32 = 0;
+
+/// One world-clock update inside a [`set_time`] packet, mirroring vanilla
+/// `ClockNetworkState(totalTicks, partialTick, rate)` keyed by a `Holder<WorldClock>`.
+/// `rate` of 0.0 tells the client the clock is paused (frozen daylight) — in 26.2
+/// the frozen state is signalled by a zero rate, **not** by a negative day time as
+/// in pre-1.21.5 clients.
+#[derive(Clone, Copy)]
+pub struct ClockUpdate {
+    /// `WORLD_CLOCK` registry id (e.g. [`WORLD_CLOCK_OVERWORLD`]).
+    pub clock_id: i32,
+    /// The clock's monotonically-advancing tick counter (the "day time"). The
+    /// client takes `total_ticks % 24000` for the time of day.
+    pub total_ticks: i64,
+    /// Sub-tick fraction accumulated toward the next whole tick.
+    pub partial_tick: f32,
+    /// Ticks advanced per server tick; 0.0 = paused/frozen.
+    pub rate: f32,
+}
 
 /// The join parameters drawn from `server.properties`. The simulation builds one
 /// from the loaded config and hands it to [`play_login`] and the chunk-streaming
@@ -108,6 +152,34 @@ pub fn game_event(event: u8, param: f32) -> Bytes {
     p.write_u8(event);
     p.write_f32(param);
     frame(CB_PLAY_GAME_EVENT, &p.buf)
+}
+
+/// ClientboundSetTimePacket (26.2). The clock model was reworked in this version:
+/// the old `gameTime: long`, `dayTime: long`, `tickDayTime: bool` triple became
+/// `gameTime: long` plus a `Map<Holder<WorldClock>, ClockNetworkState>` of per-clock
+/// updates. Wire layout:
+///   * `gameTime`: i64 (fixed big-endian `LONG`) — the overworld world age.
+///   * `clockUpdates`: a `ByteBufCodecs.map` — VarInt count, then per entry:
+///       - clock holder: VarInt registry id (`holderRegistry`, overworld=0),
+///       - `totalTicks`: VarLong,
+///       - `partialTick`: f32,
+///       - `rate`: f32 (0.0 ⇒ paused / frozen daylight).
+///
+/// Vanilla's periodic 1 s resync (`forceGameTimeSynchronization`) sends an *empty*
+/// map (gameTime only); the clocks are resent in full on join and whenever the
+/// clock changes (rate flip, set-time command). Pass an empty `clocks` slice for
+/// the gameTime-only periodic sync.
+pub fn set_time(game_time: i64, clocks: &[ClockUpdate]) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_i64(game_time); // ByteBufCodecs.LONG
+    p.write_varint(clocks.len() as i32); // map size
+    for c in clocks {
+        p.write_varint(c.clock_id); // Holder<WorldClock>: registry id
+        p.write_varlong(c.total_ticks); // ClockNetworkState.totalTicks (VAR_LONG)
+        p.write_f32(c.partial_tick); // ClockNetworkState.partialTick
+        p.write_f32(c.rate); // ClockNetworkState.rate
+    }
+    frame(CB_PLAY_SET_TIME, &p.buf)
 }
 
 pub fn set_chunk_center(x: i32, z: i32) -> Bytes {
@@ -428,6 +500,63 @@ pub fn level_chunk(cx: i32, cz: i32) -> Bytes {
     frame(CB_PLAY_LEVEL_CHUNK, &p.buf)
 }
 
+/// ClientboundForgetLevelChunkPacket — tell the client to drop a chunk column it
+/// previously received (it left the player's view). The body is a single `long`
+/// `ChunkPos` (`FriendlyByteBuf.writeChunkPos` → `ChunkPos.pack`): the X is the
+/// low 32 bits and the Z the high 32 bits — `x & 0xFFFFFFFF | (z & 0xFFFFFFFF) << 32`.
+pub fn forget_chunk(cx: i32, cz: i32) -> Bytes {
+    let mut p = PacketWriter::new();
+    let packed = (cx as i64 & 0xFFFF_FFFF) | ((cz as i64 & 0xFFFF_FFFF) << 32);
+    p.write_i64(packed);
+    frame(CB_PLAY_FORGET_LEVEL_CHUNK, &p.buf)
+}
+
+/// `ClientboundBlockUpdatePacket` — a single block changed to `state_id`. Layout
+/// (`StreamCodec.composite`): the `BlockPos` (packed long) then the block-state
+/// id as a VarInt (`ByteBufCodecs.idMapper(Block.BLOCK_STATE_REGISTRY)`).
+pub fn block_update(x: i32, y: i32, z: i32, state_id: u32) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_block_pos(x, y, z);
+    p.write_varint(state_id as i32);
+    frame(CB_PLAY_BLOCK_UPDATE, &p.buf)
+}
+
+/// `ClientboundBlockChangedAckPacket` — acknowledge a serverbound block-change
+/// `sequence` so the client retires its predicted change instead of rolling it
+/// back. A single VarInt.
+pub fn block_changed_ack(sequence: i32) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(sequence);
+    frame(CB_PLAY_BLOCK_CHANGED_ACK, &p.buf)
+}
+
+/// Pack a section coordinate into a `SectionPos` long (`SectionPos.asLong`:
+/// 22-bit x at bit 42, 20-bit y at bit 0, 22-bit z at bit 20).
+fn section_pos_as_long(sx: i32, sy: i32, sz: i32) -> i64 {
+    let x = (sx as i64) & 0x3F_FFFF;
+    let y = (sy as i64) & 0xF_FFFF;
+    let z = (sz as i64) & 0x3F_FFFF;
+    (x << 42) | (z << 20) | y
+}
+
+/// `ClientboundSectionBlocksUpdatePacket` — multiple block changes within one
+/// 16³ section. Layout: the `SectionPos` (packed long), a VarInt count, then one
+/// VarLong per change `(stateId << 12) | (localX << 8 | localZ << 4 | localY)`
+/// (`ClientboundSectionBlocksUpdatePacket.write`; the relative packing comes from
+/// `SectionPos.sectionRelativePos`). `changes` are `(localX, localY, localZ,
+/// state_id)` with each local coordinate in `0..16`.
+#[allow(dead_code)] // builder for batched edits; single-block edits use block_update today.
+pub fn section_blocks_update(sx: i32, sy: i32, sz: i32, changes: &[(u8, u8, u8, u32)]) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_i64(section_pos_as_long(sx, sy, sz));
+    p.write_varint(changes.len() as i32);
+    for &(lx, ly, lz, state) in changes {
+        let local = ((lx as i64) << 8) | ((lz as i64) << 4) | (ly as i64);
+        p.write_varlong(((state as i64) << 12) | local);
+    }
+    frame(CB_PLAY_SECTION_BLOCKS_UPDATE, &p.buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +685,96 @@ mod tests {
         assert_eq!(r.read_varint().unwrap(), 20); // serializer POSE
         assert_eq!(r.read_varint().unwrap(), 5); // CROUCHING
         assert_eq!(r.read_u8().unwrap(), 0xFF); // EOF terminator
+    }
+
+    #[test]
+    fn block_update_layout() {
+        let (id, mut r) = unframe(block_update(1, 64, -3, 9));
+        assert_eq!(id, CB_PLAY_BLOCK_UPDATE);
+        assert_eq!(r.read_block_pos().unwrap(), (1, 64, -3));
+        assert_eq!(r.read_varint().unwrap(), 9); // grass_block default state
+    }
+
+    #[test]
+    fn block_changed_ack_layout() {
+        let (id, mut r) = unframe(block_changed_ack(42));
+        assert_eq!(id, CB_PLAY_BLOCK_CHANGED_ACK);
+        assert_eq!(r.read_varint().unwrap(), 42);
+    }
+
+    #[test]
+    fn section_blocks_update_layout() {
+        // Two changes in section (1, 4, -1).
+        let changes = [(2u8, 3u8, 5u8, 1u32), (15u8, 0u8, 0u8, 9u32)];
+        let (id, mut r) = unframe(section_blocks_update(1, 4, -1, &changes));
+        assert_eq!(id, CB_PLAY_SECTION_BLOCKS_UPDATE);
+        assert_eq!(r.read_i64().unwrap(), section_pos_as_long(1, 4, -1));
+        assert_eq!(r.read_varint().unwrap(), 2); // count
+        // entry 0: (1 << 12) | (2<<8 | 5<<4 | 3)
+        let e0 = r.read_varlong().unwrap();
+        assert_eq!(e0 >> 12, 1); // state id
+        assert_eq!(e0 & 0xFFF, (2 << 8) | (5 << 4) | 3); // local x/z/y packing
+        // entry 1: (9 << 12) | (15<<8 | 0<<4 | 0)
+        let e1 = r.read_varlong().unwrap();
+        assert_eq!(e1 >> 12, 9);
+        assert_eq!(e1 & 0xFFF, 15 << 8);
+    }
+
+    #[test]
+    fn forget_chunk_layout() {
+        // Body is a single long ChunkPos: x in the low 32 bits, z in the high.
+        let (id, mut r) = unframe(forget_chunk(3, -2));
+        assert_eq!(id, CB_PLAY_FORGET_LEVEL_CHUNK);
+        let packed = r.read_i64().unwrap();
+        assert_eq!((packed & 0xFFFF_FFFF) as i32, 3); // x
+        assert_eq!((packed >> 32) as i32, -2); // z (sign-extended high half)
+    }
+
+    #[test]
+    fn set_time_layout_with_clock() {
+        // gameTime, then one clock update: overworld id 0, totalTicks (VarLong),
+        // partialTick, rate.
+        let clock = ClockUpdate {
+            clock_id: WORLD_CLOCK_OVERWORLD,
+            total_ticks: 13_000,
+            partial_tick: 0.25,
+            rate: 1.0,
+        };
+        let (id, mut r) = unframe(set_time(123_456, &[clock]));
+        assert_eq!(id, CB_PLAY_SET_TIME);
+        assert_eq!(r.read_i64().unwrap(), 123_456); // gameTime (fixed LONG)
+        assert_eq!(r.read_varint().unwrap(), 1); // map count
+        assert_eq!(r.read_varint().unwrap(), 0); // clock holder id (overworld)
+        assert_eq!(r.read_varlong().unwrap(), 13_000); // totalTicks (VarLong)
+        assert_eq!(r.read_f32().unwrap(), 0.25); // partialTick
+        assert_eq!(r.read_f32().unwrap(), 1.0); // rate
+    }
+
+    #[test]
+    fn set_time_layout_empty_map_is_gametime_only() {
+        // The periodic 1 s resync sends gameTime with a zero-length clock map.
+        let (id, mut r) = unframe(set_time(987_654_321, &[]));
+        assert_eq!(id, CB_PLAY_SET_TIME);
+        assert_eq!(r.read_i64().unwrap(), 987_654_321);
+        assert_eq!(r.read_varint().unwrap(), 0); // empty map
+    }
+
+    #[test]
+    fn set_time_frozen_clock_sends_zero_rate() {
+        // Frozen daylight is signalled by rate == 0.0 (not a negative dayTime).
+        let clock = ClockUpdate {
+            clock_id: WORLD_CLOCK_OVERWORLD,
+            total_ticks: 6_000,
+            partial_tick: 0.0,
+            rate: 0.0,
+        };
+        let (_id, mut r) = unframe(set_time(0, &[clock]));
+        assert_eq!(r.read_i64().unwrap(), 0);
+        assert_eq!(r.read_varint().unwrap(), 1);
+        assert_eq!(r.read_varint().unwrap(), 0);
+        assert_eq!(r.read_varlong().unwrap(), 6_000);
+        assert_eq!(r.read_f32().unwrap(), 0.0);
+        assert_eq!(r.read_f32().unwrap(), 0.0); // rate 0 ⇒ paused
     }
 
     #[test]
