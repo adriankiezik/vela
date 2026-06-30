@@ -282,3 +282,29 @@ Do this in three steps so the dependency lands only after the boundary is proven
 Doing it in this order means `bevy_ecs` lands *after* the architecture is
 validated — so if the dependency turns out not to be worth it, nothing is lost:
 the channel-based boundary is good with or without an ECS behind it.
+
+---
+
+## Implementation status
+
+All three steps are implemented. The shipped code follows this design with a few
+deliberate refinements:
+
+- **`bevy_ecs = "0.18"` with `default-features = false, features = ["std"]`.**
+  The default features drag in `bevy_reflect`/`glam`/`wgpu-types`/`web-sys`,
+  none of which a headless server needs; core ECS pulls only a handful of small
+  `bevy_*` crates. (0.19 was skipped — it requires rustc 1.95.)
+- **Module layout:** the sketch's `resources.rs` + `systems/` directory landed
+  as `sim/components.rs` (components *and* resources) and a single
+  `sim/systems.rs`. Same separation, fewer files at this size.
+- **Ingress lives in a `Mutex<Receiver<ToSim>>` resource.** The tokio receiver
+  is `!Sync`, so the `Mutex` lets it sit in a `Send + Sync` ECS resource; the
+  drain system is exclusive and single-threaded, so the lock never contends.
+- **Shutdown** is signalled by a `Control { stop }` resource set when the
+  ingress channel closes, checked by the run loop after each `schedule.run`.
+- **Systems:** `advance_tick` → `drain_ingress` (exclusive: spawn/despawn +
+  chat fan-out) → `keepalive` (ordinary system: `Query` + `Commands` despawn).
+  Players are entities carrying `PlayerId` + `Profile` + `Pos` + `Conn` +
+  `KeepAlive`; `PlayerIndex` maps `Uuid → Entity`.
+
+`net/` was not touched by the swap, as intended.
