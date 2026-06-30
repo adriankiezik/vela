@@ -6,6 +6,7 @@
 
 # Local AI assistant guidance (not part of the project)
 CLAUDE.md
+.claude/
 
 # Editor / OS cruft
 *.swp

@@ -147,7 +147,7 @@ fn read_payload<B: Buf>(buf: &mut B, id: u8, depth: u32) -> Result<Nbt> {
         TAG_DOUBLE => Nbt::Double(get(buf, 8, Buf::get_f64)?),
         TAG_BYTE_ARRAY => {
             let len = read_array_len(buf)?;
-            let mut v = Vec::with_capacity(len);
+            let mut v = Vec::with_capacity(cap_hint(buf, len, 1));
             for _ in 0..len {
                 v.push(get_i8(buf)?);
             }
@@ -163,7 +163,9 @@ fn read_payload<B: Buf>(buf: &mut B, id: u8, depth: u32) -> Result<Nbt> {
                     "non-empty list of TAG_End",
                 ));
             }
-            let mut v = Vec::with_capacity(len);
+            // Smallest possible element payload is one byte (e.g. a list of
+            // bytes), so bound the hint by the raw remaining byte count.
+            let mut v = Vec::with_capacity(cap_hint(buf, len, 1));
             for _ in 0..len {
                 v.push(read_payload(buf, elem, depth + 1)?);
             }
@@ -184,7 +186,7 @@ fn read_payload<B: Buf>(buf: &mut B, id: u8, depth: u32) -> Result<Nbt> {
         }
         TAG_INT_ARRAY => {
             let len = read_array_len(buf)?;
-            let mut v = Vec::with_capacity(len);
+            let mut v = Vec::with_capacity(cap_hint(buf, len, 4));
             for _ in 0..len {
                 v.push(get(buf, 4, Buf::get_i32)?);
             }
@@ -192,7 +194,7 @@ fn read_payload<B: Buf>(buf: &mut B, id: u8, depth: u32) -> Result<Nbt> {
         }
         TAG_LONG_ARRAY => {
             let len = read_array_len(buf)?;
-            let mut v = Vec::with_capacity(len);
+            let mut v = Vec::with_capacity(cap_hint(buf, len, 8));
             for _ in 0..len {
                 v.push(get(buf, 8, Buf::get_i64)?);
             }
@@ -227,6 +229,14 @@ fn write_payload<B: BufMut>(buf: &mut B, tag: &Nbt) {
             // Element type is the first entry's id (lists are homogeneous);
             // an empty list is framed as TAG_End / length 0, like vanilla.
             let elem = items.first().map(Nbt::id).unwrap_or(TAG_END);
+            // The wire format declares one element type for the whole list, so a
+            // mixed-type `Vec` would serialize to a stream no decoder can read.
+            // `Nbt::List(Vec<Nbt>)` can't enforce this at the type level; catch
+            // the caller bug in dev rather than emit a corrupt list silently.
+            debug_assert!(
+                items.iter().all(|item| item.id() == elem),
+                "heterogeneous NBT list: all elements must share a tag id"
+            );
             buf.put_u8(elem);
             buf.put_i32(items.len() as i32);
             for item in items {
@@ -292,6 +302,16 @@ fn read_array_len<B: Buf>(buf: &mut B) -> Result<usize> {
     Ok(len as usize)
 }
 
+/// A capacity hint for an element vector that never trusts `len` past what the
+/// buffer could possibly hold. Each element occupies at least `elem_size` bytes,
+/// so `remaining / elem_size` is a hard ceiling on the real count — clamping to
+/// it stops a hostile length (up to `i32::MAX`) from reserving gigabytes before
+/// the per-element reads get a chance to fail on truncation. We have no
+/// `NbtAccounter`-style byte quota, so this is the allocation guard.
+fn cap_hint<B: Buf>(buf: &B, len: usize, elem_size: usize) -> usize {
+    len.min(buf.remaining() / elem_size)
+}
+
 // ---------------------------------------------------------------------------
 // Modified UTF-8 (Java `DataInput::readUTF` / `DataOutput::writeUTF`)
 // ---------------------------------------------------------------------------
@@ -299,38 +319,62 @@ fn read_array_len<B: Buf>(buf: &mut B) -> Result<usize> {
 /// Encode `s` as modified UTF-8 into a fresh buffer: `0x0000` and the
 /// `0x0080..=0x07FF` range take two bytes, `0x0800..=0xFFFF` three, and
 /// supplementary code points become a CESU-8 surrogate pair (two 3-byte units).
-fn encode_modified_utf8(s: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    let mut push_unit = |unit: u32| {
-        if (0x0001..=0x007F).contains(&unit) {
-            out.push(unit as u8);
-        } else if unit <= 0x07FF {
-            out.push(0xC0 | (unit >> 6) as u8);
-            out.push(0x80 | (unit & 0x3F) as u8);
+///
+/// Stops before the encoded form would exceed `max_bytes`, always on a whole
+/// `char` boundary so a supplementary code point is never split into a lone
+/// surrogate. Java caps the wire form at 65535 bytes and *throws* past that;
+/// our writers are infallible, so we truncate instead — strictly better than
+/// silently wrapping the `u16` length prefix and desyncing the stream.
+fn encode_modified_utf8(s: &str, max_bytes: usize) -> Vec<u8> {
+    /// Encode one UTF-16 code unit as 1–3 bytes into `unit`, returning the length.
+    fn encode_unit(unit: &mut [u8; 3], code: u32) -> usize {
+        if (0x0001..=0x007F).contains(&code) {
+            unit[0] = code as u8;
+            1
+        } else if code <= 0x07FF {
+            unit[0] = 0xC0 | (code >> 6) as u8;
+            unit[1] = 0x80 | (code & 0x3F) as u8;
+            2
         } else {
-            out.push(0xE0 | (unit >> 12) as u8);
-            out.push(0x80 | ((unit >> 6) & 0x3F) as u8);
-            out.push(0x80 | (unit & 0x3F) as u8);
+            unit[0] = 0xE0 | (code >> 12) as u8;
+            unit[1] = 0x80 | ((code >> 6) & 0x3F) as u8;
+            unit[2] = 0x80 | (code & 0x3F) as u8;
+            3
         }
-    };
+    }
+
+    let mut out = Vec::with_capacity(s.len().min(max_bytes));
+    let mut unit = [0u8; 3];
     for c in s.chars() {
         let code = c as u32;
-        if code <= 0xFFFF {
-            push_unit(code);
+        // Encode this char's unit(s) into a scratch buffer first so we can check
+        // the whole character fits before committing any of its bytes.
+        let mut scratch = [0u8; 6];
+        let n = if code <= 0xFFFF {
+            let len = encode_unit(&mut unit, code);
+            scratch[..len].copy_from_slice(&unit[..len]);
+            len
         } else {
-            // Split into a UTF-16 surrogate pair, then emit each surrogate.
             let v = code - 0x1_0000;
-            push_unit(0xD800 + (v >> 10));
-            push_unit(0xDC00 + (v & 0x3FF));
+            let hi = encode_unit(&mut unit, 0xD800 + (v >> 10));
+            scratch[..hi].copy_from_slice(&unit[..hi]);
+            let lo = encode_unit(&mut unit, 0xDC00 + (v & 0x3FF));
+            scratch[hi..hi + lo].copy_from_slice(&unit[..lo]);
+            hi + lo
+        };
+        if out.len() + n > max_bytes {
+            break;
         }
+        out.extend_from_slice(&scratch[..n]);
     }
     out
 }
 
 fn write_modified_utf8<B: BufMut>(buf: &mut B, s: &str) {
-    let bytes = encode_modified_utf8(s);
-    // Java caps the encoded form at 65535 bytes; mirror that here.
-    debug_assert!(bytes.len() <= u16::MAX as usize, "NBT string too long");
+    // Java caps the encoded form at 65535 bytes. We truncate to that cap (on a
+    // whole-char boundary) rather than let the byte length wrap the u16 prefix
+    // and desync the stream — same behavior in debug and release.
+    let bytes = encode_modified_utf8(s, u16::MAX as usize);
     buf.put_u16(bytes.len() as u16);
     buf.put_slice(&bytes);
 }
@@ -530,6 +574,38 @@ mod tests {
         // Claims an int payload but provides no bytes for it.
         let mut slice = bytes::Bytes::from_static(&[TAG_INT]);
         assert!(read_network(&mut slice).is_err());
+    }
+
+    #[test]
+    fn hostile_length_does_not_overallocate() {
+        // A long-array root claiming i32::MAX elements (~16 GB) but carrying no
+        // payload. The capacity hint must clamp to the empty buffer, so this
+        // errors on the first element read instead of reserving gigabytes.
+        let mut buf = BytesMut::new();
+        buf.put_u8(TAG_LONG_ARRAY);
+        buf.put_i32(i32::MAX);
+        let mut slice = buf.freeze();
+        assert!(read_network(&mut slice).is_err());
+    }
+
+    #[test]
+    fn overlong_string_truncates_on_whole_chars() {
+        // 30k of a 3-byte char = 90k bytes encoded, past the 65535 cap. The
+        // writer must truncate on a char boundary (never a lone surrogate) and
+        // emit a length that fits the u16 prefix, so the result still decodes.
+        let tag = Nbt::String("☃".repeat(30_000));
+        let mut buf = BytesMut::new();
+        write_network(&mut buf, &tag);
+        let mut slice = buf.freeze();
+        let decoded = read_network(&mut slice).expect("decode truncated string");
+        assert!(!slice.has_remaining());
+        match decoded {
+            Nbt::String(s) => {
+                assert!(s.len() <= u16::MAX as usize);
+                assert!(s.chars().all(|c| c == '☃'));
+            }
+            other => panic!("expected string, got {other:?}"),
+        }
     }
 
     #[test]
