@@ -23,6 +23,8 @@ use super::frame::read_frame;
 
 // Serverbound Play packet ids (registration order, decompiled `GameProtocols`).
 const SB_PLAY_ACCEPT_TELEPORTATION: i32 = 0;
+const SB_PLAY_CHAT_COMMAND: i32 = 7;
+const SB_PLAY_CHAT_COMMAND_SIGNED: i32 = 8;
 const SB_PLAY_CHAT: i32 = 9;
 const SB_PLAY_KEEP_ALIVE: i32 = 28;
 const SB_PLAY_MOVE_PLAYER_POS: i32 = 30;
@@ -135,6 +137,14 @@ fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbound> {
         // ServerboundChatPacket: the message leads, then timestamp/salt/
         // signature/last-seen fields we ignore.
         SB_PLAY_CHAT => Some(Serverbound::Chat(reader.read_utf(256).ok()?)),
+        // ServerboundChatCommand{,Signed}: the command string (no leading `/`)
+        // leads both. The signed variant trails timestamp/salt/argument
+        // signatures/last-seen, which we ignore — each frame is its own buffer,
+        // so the unread tail can't desync the stream. The client sends the
+        // unsigned form for commands without signable arguments (all of ours).
+        SB_PLAY_CHAT_COMMAND | SB_PLAY_CHAT_COMMAND_SIGNED => {
+            Some(Serverbound::ChatCommand(reader.read_utf(256).ok()?))
+        }
         _ => None,
     }
 }

@@ -138,7 +138,7 @@ marked accordingly.
 
 ## Chat / commands / UI
 
-- `L` — **Command system** (`commands/` — Brigadier-style tree, `arguments/`, `Commands` packet sync, `ChatCommand`/`SignedChatCommand`, suggestions)
+- `L` — `[partial]` **Command system** (`commands/` — Brigadier-style tree, `arguments/`, `Commands` packet sync, `ChatCommand`/`SignedChatCommand`, suggestions): the full vanilla dedicated-server command surface (93 roots + 5 aliases) is scaffolded in one declarative table in `sim/commands.rs`, each with its permission level and a `Ready`/`Pending` status; the table drives both the advertised graph and dispatch. The literal-only graph is serialized into the join sequence (`ClientboundCommandsPacket`), `ChatCommand`/`ChatCommandSigned` are decoded (signing fields ignored), `/seed` + `/list` (+ `list uuids`) run with faithful translatable replies via `SystemChat`, and every other command replies with a "not yet implemented (needs …)" notice naming its blocking subsystem. Argument-node serialization (the `ArgumentTypeInfos` registry + parser properties), suggestions, signed-message args, redirect/alias nodes, and op/permission enforcement still pending
 - `M` — **Chat** (`PlayerChat`, `SystemChat`, `DisguisedChat`, `chat` types, message signing/`ChatSession`)
 - `M` — **Scoreboard / teams** (`world/scores`, `SetObjective`/`SetScore`/`SetPlayerTeam`)
 - `M` — **Boss bars** (`server/bossevents`, `BossEvent`)

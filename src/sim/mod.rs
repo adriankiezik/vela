@@ -7,9 +7,11 @@
 //! `systems`. See `docs/ARCHITECTURE.md`.
 
 pub mod bridge;
+mod commands;
 mod components;
 mod packets;
 mod systems;
+mod text;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::bridge::{Outbound, OutboxTx, Serverbound, ToSim};
+use super::commands;
 use super::components::*;
 use super::packets;
 
@@ -111,6 +112,9 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
 /// the teleport settles the player. Returns `false` if any send fails.
 fn send_join_sequence(outbox: &OutboxTx, entity_id: i32, sx: f64, sy: f64, sz: f64) -> bool {
     let mut ok = send(outbox, packets::play_login(entity_id));
+    // Advertise the command tree right after login so the client highlights and
+    // tab-completes our commands as it would against a vanilla server.
+    ok &= send(outbox, commands::commands_packet());
     ok &= send(
         outbox,
         packets::game_event(packets::GAME_EVENT_LEVEL_CHUNKS_LOAD_START, 0.0),
@@ -184,6 +188,7 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
                 let _ = conn.outbox.try_send(Outbound::Packet(bytes.clone()));
             }
         }
+        Serverbound::ChatCommand(line) => on_command(world, entity, &line),
         Serverbound::KeepAlive(echo) => {
             if let Some(mut ka) = world.get_mut::<KeepAlive>(entity) {
                 if echo == ka.id {
@@ -194,6 +199,22 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         Serverbound::AcceptTeleport(tp) => {
             debug!(teleport_id = tp, "teleport confirmed");
         }
+    }
+}
+
+/// Run a `/command` for `sender`. Like vanilla's `sendSuccess(..., false)`, the
+/// reply goes only to the player who issued it; dispatch and the per-command
+/// handlers live in `commands`.
+fn on_command(world: &mut World, sender: Entity, line: &str) {
+    let Some(name) = world.get::<Profile>(sender).map(|p| p.name.clone()) else {
+        return;
+    };
+    info!(%name, command = %line, "command");
+
+    let reply = commands::run(world, sender, line);
+    let bytes = packets::system_chat_component(&reply);
+    if let Some(conn) = world.get::<Conn>(sender) {
+        let _ = conn.outbox.try_send(Outbound::Packet(bytes));
     }
 }
 

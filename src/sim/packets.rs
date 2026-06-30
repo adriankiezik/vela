@@ -14,6 +14,9 @@ use crate::protocol::framing::frame;
 use crate::protocol::nbt::{write_network, Nbt};
 
 const CB_PLAY_GAME_EVENT: i32 = 38;
+/// Max players we advertise in the join packet and report from `/list`. One
+/// source of truth so the two never disagree.
+pub const MAX_PLAYERS: i32 = 42;
 const CB_PLAY_KEEP_ALIVE: i32 = 44;
 const CB_PLAY_LEVEL_CHUNK: i32 = 45;
 const CB_PLAY_LOGIN: i32 = 49;
@@ -42,7 +45,7 @@ pub fn play_login(entity_id: i32) -> Bytes {
     p.write_bool(false); // hardcore
     p.write_varint(1); // levels: 1 dimension
     p.write_identifier("minecraft:overworld");
-    p.write_varint(42); // max players
+    p.write_varint(MAX_PLAYERS); // max players
     p.write_varint(VIEW_RADIUS); // view distance
     p.write_varint(VIEW_RADIUS); // simulation distance
     p.write_bool(false); // reduced debug info
@@ -101,15 +104,20 @@ pub fn keep_alive(id: i64) -> Bytes {
 }
 
 /// ClientboundSystemChatPacket: a text component (nameless network NBT) plus an
-/// overlay flag. We render lines as a plain `{text:"…"}` compound and clear the
-/// overlay so they land in the chat box rather than the action bar. System chat
-/// is unsigned ("trusted"), so it sidesteps the whole secure-chat apparatus.
-pub fn system_chat(text: &str) -> Bytes {
-    let component = Nbt::Compound(vec![("text".to_string(), Nbt::String(text.to_string()))]);
+/// overlay flag. The overlay is cleared so lines land in the chat box rather
+/// than the action bar. System chat is unsigned ("trusted"), so it sidesteps
+/// the whole secure-chat apparatus. Command replies and broadcasts both flow
+/// through here, differing only in the component they carry.
+pub fn system_chat_component(component: &Nbt) -> Bytes {
     let mut p = PacketWriter::new();
-    write_network(&mut p.buf, &component);
+    write_network(&mut p.buf, component);
     p.write_bool(false); // overlay: false -> chat box (true would be the action bar)
     frame(CB_PLAY_SYSTEM_CHAT, &p.buf)
+}
+
+/// Convenience for a plain-text system message: `{text:"…"}`.
+pub fn system_chat(text: &str) -> Bytes {
+    system_chat_component(&super::text::text(text))
 }
 
 /// A flat chunk column: bedrock floor, dirt fill, grass surface at y=63, air

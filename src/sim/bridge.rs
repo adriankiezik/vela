@@ -53,6 +53,10 @@ pub enum Serverbound {
         on_ground: bool,
     },
     Chat(String),
+    /// A `/command` line (the client strips the leading `/`). Both the unsigned
+    /// and signed serverbound variants collapse here — we run the same handlers
+    /// and ignore signatures.
+    ChatCommand(String),
     KeepAlive(i64),
     AcceptTeleport(i32),
 }

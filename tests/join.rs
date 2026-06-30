@@ -330,4 +330,30 @@ fn login_through_configuration_into_play() {
         0,
         "overlay flag is false (renders in the chat box)"
     );
+
+    // Run a command. ServerboundChatCommand (id 7): just the command string with
+    // no leading slash. `/list` replies to the issuer with a SystemChat (121)
+    // carrying the translatable `commands.list.players` component.
+    let mut list_cmd = Vec::new();
+    write_utf(&mut list_cmd, "list");
+    send(&mut s, 7, &list_cmd);
+
+    let mut cmd_reply = None;
+    for _ in 0..400 {
+        let (id, body) = recv(&mut s);
+        if id == 121 {
+            cmd_reply = Some(body);
+            break;
+        }
+    }
+    let cmd_reply = cmd_reply.expect("received a SystemChat reply to /list");
+    // The reply is a translatable component; its key appears verbatim in the
+    // network-NBT bytes, as does the only online player's name in the `with` arg.
+    for needle in [b"commands.list.players".as_slice(), b"TestPlayer".as_slice()] {
+        assert!(
+            cmd_reply.windows(needle.len()).any(|w| w == needle),
+            "command reply carries {}",
+            String::from_utf8_lossy(needle)
+        );
+    }
 }
