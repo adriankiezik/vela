@@ -368,6 +368,18 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
             }
             debug!(flying, "player abilities");
         }
+        Serverbound::PlayerInput { sneaking } => {
+            // The SHIFT bit drives crouch in 26.2: toggle the sneaking flag and,
+            // on a change, push the shared-flags/pose metadata to viewers (the
+            // `set_entity_data` builder maps `sneaking` to the 0x02 flag bit and
+            // the CROUCHING pose).
+            let changed = world
+                .get_mut::<Meta>(entity)
+                .is_some_and(|mut m| std::mem::replace(&mut m.sneaking, sneaking) != sneaking);
+            if changed {
+                broadcast_meta(world, entity);
+            }
+        }
         // Update the player's selected hotbar slot. The `Inventory` component is
         // attached lazily on the first inventory packet so the join path stays
         // untouched.

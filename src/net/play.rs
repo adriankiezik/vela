@@ -36,6 +36,9 @@ const SB_PLAY_MOVE_PLAYER_STATUS_ONLY: i32 = 33;
 // (line 103 → 42), Swing (line 124 → 63).
 const SB_PLAY_PLAYER_ABILITIES: i32 = 40;
 const SB_PLAY_PLAYER_COMMAND: i32 = 42;
+// PlayerInput follows PlayerCommand in SERVERBOUND_TEMPLATE (line 104 → 43); it
+// carries the `Input` flags byte that reports crouch in 26.2.
+const SB_PLAY_PLAYER_INPUT: i32 = 43;
 const SB_PLAY_SWING: i32 = 63;
 // Inventory ids: SetCarriedItem (53), SetCreativeModeSlot (56).
 const SB_PLAY_SET_CARRIED_ITEM: i32 = 53;
@@ -44,6 +47,11 @@ const SB_PLAY_SET_CREATIVE_MODE_SLOT: i32 = 56;
 /// `ServerboundMovePlayerPacket.FLAG_ON_GROUND` — bit 0 of the trailing flags
 /// byte the movement packets carry (bit 1 is horizontal collision, ignored).
 const MOVE_FLAG_ON_GROUND: u8 = 1;
+
+/// `Input.FLAG_SHIFT` — the crouch bit of the `ServerboundPlayerInputPacket`
+/// flags byte (forward 1, backward 2, left 4, right 8, jump 16, shift 32,
+/// sprint 64).
+const INPUT_FLAG_SHIFT: u8 = 32;
 
 /// Per-connection outbox depth. Sized to absorb the join sequence, which bursts
 /// ~127 small packets (login + a `(2R+1)²` chunk square + teleport) in a single
@@ -170,6 +178,11 @@ fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbound> {
         // ServerboundPlayerAbilitiesPacket: a single flags byte (bit 0x02 = flying).
         SB_PLAY_PLAYER_ABILITIES => Some(Serverbound::PlayerAbilities {
             flags: reader.read_u8().ok()?,
+        }),
+        // ServerboundPlayerInputPacket: an `Input` flags byte; bit 0x20 = SHIFT
+        // (crouch). We only surface the sneak state.
+        SB_PLAY_PLAYER_INPUT => Some(Serverbound::PlayerInput {
+            sneaking: reader.read_u8().ok()? & INPUT_FLAG_SHIFT != 0,
         }),
         // ServerboundSetCarriedItemPacket: a single signed short hotbar slot.
         SB_PLAY_SET_CARRIED_ITEM => Some(Serverbound::SetCarriedItem {

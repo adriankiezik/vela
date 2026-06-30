@@ -72,6 +72,10 @@ pub enum Serverbound {
     /// `ServerboundPlayerAbilitiesPacket` — the client's abilities bitset. Only
     /// the flying bit (0x02) is meaningful serverbound.
     PlayerAbilities { flags: u8 },
+    /// `ServerboundPlayerInputPacket` — the player's movement-key state as a
+    /// single `Input` flags byte. In 26.2 this is how the client reports crouch
+    /// (the SHIFT bit); we extract only `shift` (sneaking) and ignore the rest.
+    PlayerInput { sneaking: bool },
     /// `ServerboundSetCarriedItemPacket` — the selected hotbar slot (0..8). The
     /// wire field is a signed short; the sim validates the range.
     SetCarriedItem { slot: i16 },
