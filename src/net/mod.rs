@@ -5,8 +5,10 @@
 //! the `sim::bridge` channels. See `docs/ARCHITECTURE.md`.
 
 pub mod connection;
+mod crypto;
 mod frame;
 mod play_decode;
 mod play_io;
+mod stream;
 
 pub use connection::handle;

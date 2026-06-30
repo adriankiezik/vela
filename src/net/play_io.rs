@@ -11,16 +11,16 @@
 //!   the other down and emits a single `Left`.
 
 use tokio::io::{self, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::protocol::framing::compress;
+use crate::protocol::framing::Compressor;
 use crate::sim::bridge::{Outbound, ToSim};
 
 use super::frame::read_frame;
 use super::play_decode::decode_play;
+use super::stream::{NetReadHalf, NetWriteHalf};
 
 /// Per-connection outbox depth. Sized to absorb the join sequence, which bursts
 /// ~127 small packets (login + a `(2R+1)²` chunk square + teleport) in a single
@@ -37,8 +37,8 @@ const OUTBOX_CAP: usize = 1024;
 /// inbound frames via `read_frame`. This keeps the compression transform wholly
 /// inside `net`.
 pub async fn play(
-    rd: OwnedReadHalf,
-    wr: OwnedWriteHalf,
+    rd: NetReadHalf,
+    wr: NetWriteHalf,
     peer: std::net::SocketAddr,
     uuid: Uuid,
     name: String,
@@ -80,7 +80,7 @@ pub async fn play(
 
 /// Decode frames and forward them to the sim until EOF or a decode error.
 async fn read_loop(
-    rd: OwnedReadHalf,
+    rd: NetReadHalf,
     uuid: Uuid,
     to_sim: mpsc::Sender<ToSim>,
     compression: Option<i32>,
@@ -100,13 +100,16 @@ async fn read_loop(
 /// emits plain `frame()` bytes; once compression is active we re-wrap each frame
 /// through `framing::compress` here, so the sim never deals with compression.
 async fn write_loop(
-    mut wr: OwnedWriteHalf,
+    mut wr: NetWriteHalf,
     mut rx: mpsc::Receiver<Outbound>,
     compression: Option<i32>,
 ) -> io::Result<()> {
-    // Apply the compressed framing to a sim-built frame iff a threshold is set.
-    let wrap = |b: bytes::Bytes| match compression {
-        Some(threshold) => compress(&b, threshold),
+    // Apply the compressed framing to a sim-built frame iff a threshold is set,
+    // reusing one `Deflater`/scratch buffer for the whole connection rather than
+    // allocating per packet (review follow-up F2).
+    let mut compressor = Compressor::new();
+    let mut wrap = |b: bytes::Bytes| match compression {
+        Some(threshold) => compressor.compress_frame(&b, threshold),
         None => b,
     };
     while let Some(first) = rx.recv().await {

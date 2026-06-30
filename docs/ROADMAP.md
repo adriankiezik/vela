@@ -28,8 +28,8 @@ marked accordingly.
 
 - `S` — `[done]` **VarLong codec** (`src/protocol/varint.rs`, with tests)
 - `S` — `[done]` **Packet framing polish**: length-prefix done; max-size guard (`MAX_FRAME_LEN`, 2 MiB) and read-side buffering (`BufReader` feeding the play loop) added
-- `M` — `[done]` **Compression** (`SetCompression` / zlib): threshold negotiation (`src/net/connection.rs`), compress/decompress framing (`src/protocol/framing.rs`, used in `src/net/frame.rs`)
-- `L` — **Encryption** (online mode): RSA keypair, `Hello`→`Key` exchange, AES-CFB8 stream cipher, Mojang session-server `hasJoined` auth, encrypted profile
+- `M` — `[done]` **Compression** (`SetCompression` / zlib): threshold negotiation from `network-compression-threshold`, compressed packet layout in both directions once bodies exceed the threshold, with a per-connection reused `Deflater`/scratch buffer on the Play write path (review F2)
+- `L` — `[done]` **Encryption** (online mode): RSA-1024 keypair (lazily generated), `ClientboundHello`→`ServerboundKey` exchange, AES-CFB8 stream cipher wrapping the socket in both directions, Mojang session-server `hasJoined` auth (signed-hex server-id hash) yielding the real `GameProfile` with signed skin properties forwarded in `LoginFinished`. Gated on `online-mode` (default true); offline path unchanged
 - `M` — **Cookie store** (`cookie/` — 6 packets): request/response/store for transfers
 - `M` — **Transfer / cross-server** support (`Intent::Transfer` path, `ClientboundTransfer`)
 - `S` — **Plugin/custom-query channels** (login `CustomQuery`/`CustomQueryAnswer`, play `CustomPayload`)
@@ -172,7 +172,7 @@ marked accordingly.
 - `M` — **Registry framework** (`core/Registry`, `Holder`, `ResourceKey`, tags) — underpins almost everything
 - `M` — **DataComponent framework** (`core/component`) — the 26.x replacement for item NBT
 - `S` — **Damage sources** (`world/damagesource`)
-- `S` — `[partial]` **UUID / GameProfile utilities**: offline UUID done (MD5 `OfflinePlayer:<name>`, tested); property/signature handling still to add
+- `S` — `[partial]` **UUID / GameProfile utilities**: offline UUID done (MD5 `OfflinePlayer:<name>`, tested); online-mode profiles resolved via `hasJoined` carry their UUID and signed skin/cape properties (forwarded in `LoginFinished`). Threading those properties through to the in-game player list / entity skin still to add
 - `M` — **Region/chunk coordinate + seed-based RNG utilities** (`util/random`, `valueproviders`)
 - `XL` — **Data generation pipeline**: extract blocks/items/registries from the reference data so content isn't hand-written (clean-room: derive from observable IDs, not copied code)
 
@@ -190,12 +190,13 @@ fix and were intentionally deferred (nothing silently dropped):
   registries' member ids. Populate them (same generator approach as block/item)
   once each registry's registration order is enumerated. The block/item tags now
   carry real ids.
-- `M` — **Compression encode path efficiency** (review **F2**): reduce the ~3
-  allocations per outbound packet (frame → strip → re-encode → copy) and, the
-  bigger win, give each connection a reused `Deflater`/scratch buffer as vanilla
-  `CompressionEncoder` does. Deferred to avoid destabilizing the hot path in this
-  pass; the outbound 8 MiB guard (F1) and the malformed-frame `expect` (F4) are
-  done.
+- `[done]` **Compression encode path efficiency** (review **F2**): the hot Play
+  write path now uses a per-connection `Compressor` (`protocol::framing`) that
+  reuses one `Deflater` (`reset` between packets) and a scratch output buffer, as
+  vanilla `CompressionEncoder` does. The low-volume pre-Play handshake keeps the
+  simpler stateless `compress` free function. The frame→strip→re-encode→copy
+  flow (and the broader "sim emits framed bytes, net re-parses" design) remains —
+  see the F3/F5 unification follow-up below.
 - `M` — **Framer/Codec unification** (review **F3/F5**): collapse the `Option<i32>`
   threshold threading through ~10 signatures and the "sim emits framed bytes, net
   re-parses" design into a small `Framer`/`Codec` type so the sim emits `id+body`

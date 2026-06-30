@@ -30,10 +30,13 @@ fn start_server(addr: &str) -> Server {
     // This byte-level fake client speaks only the plain `VarInt(len)|id|body`
     // framing, so disable the mid-Login compression negotiation (default 256) for
     // it: `-1` is vanilla's "compression off". The compressed framing itself is
-    // covered by the round-trip unit tests in `protocol::framing`.
+    // covered by the round-trip unit tests in `protocol::framing`. It also cannot
+    // perform the online-mode RSA/AES key exchange or Mojang `hasJoined` auth, so
+    // run in offline mode (`online-mode=false`); the secure-transport math is
+    // covered by the unit tests in `net::crypto`.
     std::fs::write(
         workdir.join("server.properties"),
-        "network-compression-threshold=-1\n",
+        "network-compression-threshold=-1\nonline-mode=false\n",
     )
     .expect("write server.properties");
     let child = Command::new(env!("CARGO_BIN_EXE_vela"))
