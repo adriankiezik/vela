@@ -90,7 +90,7 @@ pub fn play_login(entity_id: i32, p_in: &JoinParams) -> Bytes {
     p.write_u8(p_in.game_type); // game type
     p.write_u8(0xFF); // previous game type = -1 (none)
     p.write_bool(false); // is debug
-    p.write_bool(true); // is flat (renders a flat horizon/fog)
+    p.write_bool(false); // is flat: false now that terrain is noise-generated (normal horizon/fog)
     p.write_bool(false); // last death location: absent
     p.write_varint(0); // portal cooldown
     p.write_varint(63); // sea level
