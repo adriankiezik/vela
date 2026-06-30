@@ -186,7 +186,9 @@ pub fn write_network<B: BufMut>(buf: &mut B, tag: &Nbt) {
 // ---------------------------------------------------------------------------
 
 fn read_payload<B: Buf>(buf: &mut B, id: u8, depth: u32) -> Result<Nbt> {
-    if depth > MAX_DEPTH {
+    // Vanilla `NbtAccounter.pushDepth` throws at `depth >= maxDepth` (512), so the
+    // 512nd level of nesting is rejected — use `>=`, not `>`, to match.
+    if depth >= MAX_DEPTH {
         return Err(Error::new(ErrorKind::InvalidData, "NBT nested too deeply"));
     }
     Ok(match id {

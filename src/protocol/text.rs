@@ -26,8 +26,13 @@
 //! `with` and `extra` are homogeneous NBT lists of component compounds, matching
 //! the wire (a translation arg that is a plain literal would be collapsed to a
 //! bare string by vanilla, but a `{text:…}` compound decodes identically).
+//!
+//! Dead-code note: this typed model is broader than the handful of builders the
+//! `sim` shim currently drives, so unused-but-intentional API surface carries a
+//! targeted `#[allow(dead_code)]` rather than a module-wide blanket — that way a
+//! genuinely orphaned item still surfaces as a warning as the model grows.
 
-#![allow(dead_code)]
+use std::num::NonZeroU32;
 
 use crate::protocol::nbt::Nbt;
 
@@ -35,46 +40,118 @@ use crate::protocol::nbt::Nbt;
 // Color
 // ---------------------------------------------------------------------------
 
-/// A text color — a named vanilla color or an arbitrary 24-bit RGB value.
-/// Mirrors `net.minecraft.network.chat.TextColor`, which serializes as the
-/// color name when it has one and `#rrggbb` otherwise.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One of the 16 vanilla named colors (`ChatFormatting`'s color entries, in
+/// ordinal order). These are the only names `TextColor.parseColor` accepts as a
+/// name — any other string the client rejects, so the type system enforces it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NamedColor {
+    Black,
+    DarkBlue,
+    DarkGreen,
+    DarkAqua,
+    DarkRed,
+    DarkPurple,
+    Gold,
+    Gray,
+    DarkGray,
+    Blue,
+    Green,
+    Aqua,
+    Red,
+    LightPurple,
+    Yellow,
+    White,
+}
+
+impl NamedColor {
+    /// The lowercase wire name (e.g. `dark_blue`), as `ChatFormatting.getName`.
+    pub fn name(self) -> &'static str {
+        match self {
+            NamedColor::Black => "black",
+            NamedColor::DarkBlue => "dark_blue",
+            NamedColor::DarkGreen => "dark_green",
+            NamedColor::DarkAqua => "dark_aqua",
+            NamedColor::DarkRed => "dark_red",
+            NamedColor::DarkPurple => "dark_purple",
+            NamedColor::Gold => "gold",
+            NamedColor::Gray => "gray",
+            NamedColor::DarkGray => "dark_gray",
+            NamedColor::Blue => "blue",
+            NamedColor::Green => "green",
+            NamedColor::Aqua => "aqua",
+            NamedColor::Red => "red",
+            NamedColor::LightPurple => "light_purple",
+            NamedColor::Yellow => "yellow",
+            NamedColor::White => "white",
+        }
+    }
+
+    /// Resolve a wire name to a named color, or `None` if it isn't one of the 16.
+    pub fn from_name(name: &str) -> Option<NamedColor> {
+        Some(match name {
+            "black" => NamedColor::Black,
+            "dark_blue" => NamedColor::DarkBlue,
+            "dark_green" => NamedColor::DarkGreen,
+            "dark_aqua" => NamedColor::DarkAqua,
+            "dark_red" => NamedColor::DarkRed,
+            "dark_purple" => NamedColor::DarkPurple,
+            "gold" => NamedColor::Gold,
+            "gray" => NamedColor::Gray,
+            "dark_gray" => NamedColor::DarkGray,
+            "blue" => NamedColor::Blue,
+            "green" => NamedColor::Green,
+            "aqua" => NamedColor::Aqua,
+            "red" => NamedColor::Red,
+            "light_purple" => NamedColor::LightPurple,
+            "yellow" => NamedColor::Yellow,
+            "white" => NamedColor::White,
+            _ => return None,
+        })
+    }
+}
+
+/// A text color — one of the 16 named vanilla colors or an arbitrary 24-bit RGB
+/// value. Mirrors `net.minecraft.network.chat.TextColor`, which serializes as
+/// the color name when it has one and `#rrggbb` otherwise. Using [`NamedColor`]
+/// (rather than a free string) means an invalid name can't reach the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
-    /// One of the 16 named colors (e.g. `"green"`), or any string the caller
-    /// trusts the client to resolve.
-    Named(String),
+    /// One of the 16 named colors.
+    Named(NamedColor),
     /// A 24-bit RGB value, rendered as `#rrggbb`.
     Rgb(u32),
 }
 
 impl Color {
-    /// A named color such as `Color::named("green")`.
-    pub fn named(name: impl Into<String>) -> Color {
-        Color::Named(name.into())
+    /// A named color, e.g. `Color::named(NamedColor::Green)`.
+    #[allow(dead_code)] // typed-model convenience; sim shim builds colors via `parse`
+    pub fn named(color: NamedColor) -> Color {
+        Color::Named(color)
     }
 
     /// An arbitrary RGB color (low 24 bits used).
+    #[allow(dead_code)] // typed-model convenience; not yet driven by a call site
     pub fn rgb(value: u32) -> Color {
         Color::Rgb(value & 0xFF_FFFF)
     }
 
-    /// Parse a color the way `TextColor.parseColor` does: `#rrggbb` hex, else a
-    /// named color. An unparseable `#` value or unknown name is kept verbatim as
-    /// a `Named` (the builder layer trusts its callers; the client validates).
-    pub fn parse(s: &str) -> Color {
+    /// Parse a color the way `TextColor.parseColor` does: `#rrggbb` hex, else one
+    /// of the 16 named colors. `None` for an unparseable `#` value or unknown
+    /// name (the client would reject either).
+    pub fn parse(s: &str) -> Option<Color> {
         if let Some(hex) = s.strip_prefix('#') {
-            if let Ok(v) = u32::from_str_radix(hex, 16) {
-                return Color::Rgb(v & 0xFF_FFFF);
-            }
+            return u32::from_str_radix(hex, 16)
+                .ok()
+                .map(|v| Color::Rgb(v & 0xFF_FFFF));
         }
-        Color::Named(s.to_string())
+        NamedColor::from_name(s).map(Color::Named)
     }
 
     /// The wire string: the name, or `#rrggbb` (uppercase hex, as `String.format`
     /// `"#%06X"` produces in `TextColor.formatValue`).
     pub fn serialize(&self) -> String {
         match self {
-            Color::Named(name) => name.clone(),
+            Color::Named(name) => name.name().to_string(),
             Color::Rgb(value) => format!("#{:06X}", value & 0xFF_FFFF),
         }
     }
@@ -86,13 +163,18 @@ impl Color {
 
 /// A click event (`net.minecraft.network.chat.ClickEvent`). Only the actions a
 /// server is allowed to send and that need no extra registries are modelled.
+// Several variants aren't wired to a call site yet; the sim shim only builds
+// `CopyToClipboard`. Kept as intentional API surface.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClickEvent {
     OpenUrl(String),
     RunCommand(String),
     SuggestCommand(String),
     CopyToClipboard(String),
-    ChangePage(u32),
+    /// `change_page` — vanilla `ChangePage.CODEC` uses `ExtraCodecs.POSITIVE_INT`
+    /// (≥1) and the client rejects page 0, so the page is a [`NonZeroU32`].
+    ChangePage(NonZeroU32),
 }
 
 impl ClickEvent {
@@ -103,7 +185,7 @@ impl ClickEvent {
             ClickEvent::RunCommand(cmd) => ("run_command", "command", Nbt::string(cmd)),
             ClickEvent::SuggestCommand(cmd) => ("suggest_command", "command", Nbt::string(cmd)),
             ClickEvent::CopyToClipboard(v) => ("copy_to_clipboard", "value", Nbt::string(v)),
-            ClickEvent::ChangePage(p) => ("change_page", "page", Nbt::Int(*p as i32)),
+            ClickEvent::ChangePage(p) => ("change_page", "page", Nbt::Int(p.get() as i32)),
         };
         Nbt::compound([("action", Nbt::string(action)), (field, value)])
     }
@@ -111,6 +193,7 @@ impl ClickEvent {
 
 /// A hover event (`net.minecraft.network.chat.HoverEvent`). `show_item` /
 /// `show_entity` are omitted — they need the item-stack / entity codecs.
+#[allow(dead_code)] // the sim shim builds show_text as raw Nbt; typed form unused yet
 #[derive(Clone, Debug, PartialEq)]
 pub enum HoverEvent {
     ShowText(Box<TextComponent>),
@@ -197,6 +280,8 @@ impl Style {
 
 /// The content of a component — one of the `ComponentContents` variants whose
 /// map fields are inlined into the component compound.
+// Only `Text`/`Translatable` are driven so far; the rest are modelled for parity.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Content {
     /// `PlainTextContents` → `{text}`.
@@ -284,6 +369,7 @@ impl TextComponent {
     }
 
     /// A translatable component with the given key and (component) args.
+    #[allow(dead_code)]
     pub fn translatable(key: impl Into<String>, with: Vec<TextComponent>) -> TextComponent {
         TextComponent::new(Content::Translatable {
             key: key.into(),
@@ -293,11 +379,13 @@ impl TextComponent {
     }
 
     /// A keybind component, `{keybind: id}`.
+    #[allow(dead_code)]
     pub fn keybind(id: impl Into<String>) -> TextComponent {
         TextComponent::new(Content::Keybind(id.into()))
     }
 
     /// A scoreboard-value component, `{score: {name, objective}}`.
+    #[allow(dead_code)]
     pub fn score(name: impl Into<String>, objective: impl Into<String>) -> TextComponent {
         TextComponent::new(Content::Score {
             name: name.into(),
@@ -306,6 +394,7 @@ impl TextComponent {
     }
 
     /// An entity-selector component, `{selector: pattern}`.
+    #[allow(dead_code)]
     pub fn selector(pattern: impl Into<String>) -> TextComponent {
         TextComponent::new(Content::Selector {
             selector: pattern.into(),
@@ -315,57 +404,68 @@ impl TextComponent {
 
     // -- chainable style/sibling setters ------------------------------------
 
+    #[allow(dead_code)]
     pub fn with_color(mut self, color: Color) -> Self {
         self.style.color = Some(color);
         self
     }
 
-    pub fn bold(mut self, value: bool) -> Self {
+    #[allow(dead_code)]
+    pub fn with_bold(mut self, value: bool) -> Self {
         self.style.bold = Some(value);
         self
     }
 
-    pub fn italic(mut self, value: bool) -> Self {
+    #[allow(dead_code)]
+    pub fn with_italic(mut self, value: bool) -> Self {
         self.style.italic = Some(value);
         self
     }
 
-    pub fn underlined(mut self, value: bool) -> Self {
+    #[allow(dead_code)]
+    pub fn with_underlined(mut self, value: bool) -> Self {
         self.style.underlined = Some(value);
         self
     }
 
-    pub fn strikethrough(mut self, value: bool) -> Self {
+    #[allow(dead_code)]
+    pub fn with_strikethrough(mut self, value: bool) -> Self {
         self.style.strikethrough = Some(value);
         self
     }
 
-    pub fn obfuscated(mut self, value: bool) -> Self {
+    #[allow(dead_code)]
+    pub fn with_obfuscated(mut self, value: bool) -> Self {
         self.style.obfuscated = Some(value);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_click_event(mut self, event: ClickEvent) -> Self {
         self.style.click_event = Some(event);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_hover_event(mut self, event: HoverEvent) -> Self {
         self.style.hover_event = Some(event);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_insertion(mut self, value: impl Into<String>) -> Self {
         self.style.insertion = Some(value.into());
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_font(mut self, value: impl Into<String>) -> Self {
         self.style.font = Some(value.into());
         self
     }
 
     /// Append a sibling component to `extra`.
+    #[allow(dead_code)]
     pub fn append(mut self, sibling: TextComponent) -> Self {
         self.extra.push(sibling);
         self
@@ -409,25 +509,39 @@ mod tests {
 
     #[test]
     fn color_named_and_rgb() {
-        assert_eq!(Color::named("green").serialize(), "green");
+        assert_eq!(Color::named(NamedColor::Green).serialize(), "green");
+        assert_eq!(Color::named(NamedColor::DarkBlue).serialize(), "dark_blue");
         assert_eq!(Color::rgb(0x55_FF55).serialize(), "#55FF55");
-        assert_eq!(Color::parse("#0a0B0c"), Color::Rgb(0x0A_0B0C));
-        assert_eq!(Color::parse("red"), Color::Named("red".into()));
+        assert_eq!(Color::parse("#0a0B0c"), Some(Color::Rgb(0x0A_0B0C)));
+        assert_eq!(Color::parse("red"), Some(Color::Named(NamedColor::Red)));
+        assert_eq!(Color::parse("not_a_color"), None); // unknown name rejected
 
-        let nbt = TextComponent::text("x").with_color(Color::named("green")).to_nbt();
+        let nbt = TextComponent::text("x")
+            .with_color(Color::named(NamedColor::Green))
+            .to_nbt();
         assert_eq!(field(&nbt, "color").as_str(), Some("green"));
     }
 
     #[test]
     fn style_flags_are_bytes_with_snake_case_keys() {
         let nbt = TextComponent::text("x")
-            .bold(true)
-            .italic(false)
+            .with_bold(true)
+            .with_italic(false)
             .with_insertion("ins")
             .to_nbt();
         assert_eq!(field(&nbt, "bold"), &Nbt::Byte(1));
         assert_eq!(field(&nbt, "italic"), &Nbt::Byte(0));
         assert_eq!(field(&nbt, "insertion").as_str(), Some("ins"));
+    }
+
+    #[test]
+    fn change_page_is_positive_and_uses_page_field() {
+        let nbt = TextComponent::text("x")
+            .with_click_event(ClickEvent::ChangePage(NonZeroU32::new(3).unwrap()))
+            .to_nbt();
+        let click = field(&nbt, "click_event");
+        assert_eq!(field(click, "action").as_str(), Some("change_page"));
+        assert_eq!(field(click, "page"), &Nbt::Int(3));
     }
 
     #[test]

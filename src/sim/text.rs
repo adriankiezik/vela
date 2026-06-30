@@ -24,7 +24,20 @@ pub fn text(s: impl Into<String>) -> Nbt {
 /// args are present. Args arrive already encoded as component compounds, so the
 /// list is homogeneous. Mirrors `Content::Translatable` in `protocol::text`.
 pub fn translatable(key: &str, with: Vec<Nbt>) -> Nbt {
+    translatable_with_fallback(key, None, with)
+}
+
+/// Like [`translatable`] but with an optional `fallback` (rendered when the
+/// client lacks the translation key). This keeps the same field order as
+/// `protocol::text::Content::Translatable` — `translate`, then `fallback`, then
+/// `with` — so the bytes match the codec. (The args are already-encoded `Nbt`,
+/// so this can't take the typed `TextComponent` path directly; the field layout
+/// is the single source of truth shared by both.)
+pub fn translatable_with_fallback(key: &str, fallback: Option<&str>, with: Vec<Nbt>) -> Nbt {
     let mut fields = vec![("translate".to_string(), Nbt::string(key))];
+    if let Some(fallback) = fallback {
+        fields.push(("fallback".to_string(), Nbt::string(fallback)));
+    }
     if !with.is_empty() {
         fields.push(("with".to_string(), Nbt::List(with)));
     }
@@ -46,14 +59,18 @@ fn with_field(component: Nbt, key: &str, value: Nbt) -> Nbt {
     }
 }
 
-/// Set the component's `color` (a named color like `"green"` or a `#rrggbb`),
-/// serialized through `protocol::text::Color`.
+/// Set the component's `color` (one of the 16 named colors like `"green"`, or a
+/// `#rrggbb` value), serialized through `protocol::text::Color`. An unrecognized
+/// color is rejected (debug-asserted) and leaves the component unchanged rather
+/// than emitting a name the client would refuse.
 pub fn colored(component: Nbt, color: &str) -> Nbt {
-    with_field(
-        component,
-        "color",
-        Nbt::string(Color::parse(color).serialize()),
-    )
+    match Color::parse(color) {
+        Some(c) => with_field(component, "color", Nbt::string(c.serialize())),
+        None => {
+            debug_assert!(false, "invalid text color: {color}");
+            component
+        }
+    }
 }
 
 /// Attach a copy-to-clipboard click event, delegating to

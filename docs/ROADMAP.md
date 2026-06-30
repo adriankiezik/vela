@@ -178,6 +178,51 @@ marked accordingly.
 
 ---
 
+## Deferred code-review follow-ups
+
+Items raised in review that are larger features/refactors than the surrounding
+fix and were intentionally deferred (nothing silently dropped):
+
+- `S` — **Real tag ids for non-block/item registries** (review **M4**): the
+  `entity_type`, `damage_type`, `enchantment`, `game_event`, `fluid`,
+  `point_of_interest_type`, … tags in `registry_tags.rs` are bound with the right
+  *names* but **empty** id lists, because Vela does not yet enumerate those
+  registries' member ids. Populate them (same generator approach as block/item)
+  once each registry's registration order is enumerated. The block/item tags now
+  carry real ids.
+- `M` — **Compression encode path efficiency** (review **F2**): reduce the ~3
+  allocations per outbound packet (frame → strip → re-encode → copy) and, the
+  bigger win, give each connection a reused `Deflater`/scratch buffer as vanilla
+  `CompressionEncoder` does. Deferred to avoid destabilizing the hot path in this
+  pass; the outbound 8 MiB guard (F1) and the malformed-frame `expect` (F4) are
+  done.
+- `M` — **Framer/Codec unification** (review **F3/F5**): collapse the `Option<i32>`
+  threshold threading through ~10 signatures and the "sim emits framed bytes, net
+  re-parses" design into a small `Framer`/`Codec` type so the sim emits `id+body`
+  and net owns all framing. Broader refactor; deferred to keep this pass green.
+- `M` — **Chunk batch flow control** (review): `ChunkBatchStart` /
+  `ChunkBatchFinished` framing + `ServerboundChunkBatchReceived` so the client
+  paces chunk delivery, around both the join stream and `stream_chunks`. New
+  sub-feature, not a bug.
+- `S` — **Full clock resync maps all clocks**: `world_tick`'s full sync sends only
+  the overworld clock; vanilla `createFullSyncPacket` maps every dimension's clock
+  (overworld + the_end). Fine for a single-dimension server; revisit when the End
+  is added.
+- `M` — **World store as an ECS `Resource`**: `world::store()` is a process-global
+  `OnceLock<Mutex<HashMap>>` rather than a sim-`World`-owned `Resource`. Moving it
+  behind a `Resource` would improve test isolation (note the far-apart test
+  coords) and enable reset/unload, but cleanly threading it through the
+  `chunk_columns(cx,cz)` / `level_chunk(cx,cz)` free-function API the streaming
+  feature depends on (including call sites with no `World` access, e.g.
+  `send_join_sequence`) is invasive. Deferred rather than risk regressing the
+  streaming path.
+- `S` — **Palette encode micro-optimization**: `write_block_palette` still does a
+  linear `Vec::contains` / `position` per cell. A `HashMap<state,index>` was tried
+  but the per-section map allocation + hashing measurably *regressed* the hot
+  encode path (sections are overwhelmingly uniform/tiny-paletted), so it was
+  reverted. Revisit with a reusable/scratch structure that doesn't allocate per
+  section if this ever shows up in a profile.
+
 ## Suggested near-term path (matches existing M2–M5)
 
 1. NBT codec + text components + identifiers (foundational)
