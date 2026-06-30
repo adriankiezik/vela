@@ -404,8 +404,8 @@ mod tests {
             let base_y = MIN_Y + section * 16;
             let mut distinct: Vec<u32> = Vec::new();
             for ly in 0..16i32 {
-                for col in 0..COLUMNS {
-                    let s = state_at(base_y + ly, heights[col]);
+                for &h in heights.iter() {
+                    let s = state_at(base_y + ly, h);
                     if !distinct.contains(&s) {
                         distinct.push(s);
                     }
