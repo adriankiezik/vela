@@ -141,7 +141,6 @@ impl PacketWriter {
         self.buf.put_u8(v);
     }
 
-    #[allow(dead_code)]
     pub fn write_i16(&mut self, v: i16) {
         self.buf.put_i16(v);
     }

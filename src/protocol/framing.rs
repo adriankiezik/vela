@@ -69,7 +69,8 @@ pub fn frame(id: i32, body: &[u8]) -> Bytes {
 pub fn compress(uncompressed_frame: &[u8], threshold: i32) -> Bytes {
     let mut cursor: &[u8] = uncompressed_frame;
     // Discard the uncompressed length prefix; the remainder is exactly `data`.
-    let _ = get_varint(&mut cursor);
+    // `frame` always writes a valid leading VarInt, so this never fails.
+    get_varint(&mut cursor).expect("frame() always prefixes a valid VarInt length");
     encode_compressed(cursor, threshold)
 }
 
@@ -78,6 +79,15 @@ pub fn compress(uncompressed_frame: &[u8], threshold: i32) -> Bytes {
 /// behind a `dataLength` of 0; at or above it the data is zlib-deflated and the
 /// real uncompressed length is written.
 pub fn encode_compressed(data: &[u8], threshold: i32) -> Bytes {
+    // Vanilla `CompressionEncoder.encode` throws "Packet too big" when the
+    // uncompressed data exceeds 8 MiB. We are the producer of these bytes, so a
+    // debug assert documents and guards the invariant without burdening the
+    // release path with a fallible return on every outbound packet.
+    debug_assert!(
+        data.len() <= MAX_UNCOMPRESSED_LEN as usize,
+        "Packet too big (is {}, should be less than {MAX_UNCOMPRESSED_LEN})",
+        data.len()
+    );
     let mut payload = BytesMut::new();
     if (data.len() as i32) < threshold {
         put_varint(&mut payload, 0);
