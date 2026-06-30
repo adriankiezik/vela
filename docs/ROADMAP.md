@@ -11,8 +11,8 @@ registries, ~30 inventory menus.
 **Size key:** `S` ≈ hours · `M` ≈ a day or two · `L` ≈ several days · `XL` ≈ a
 week+ / ongoing. Unordered — pick by dependency, not list order.
 
-**Status key:** ✅ done · 🟡 partial (reached far enough to function; noted what
-remains). Unmarked items are not started.
+**Status key:** `[done]` · `[partial]` (reached far enough to function; noted
+what remains). Unmarked items are not started.
 
 ### Milestone 1 — achieved (a client reaches Play and stands in a void world)
 
@@ -27,7 +27,7 @@ marked accordingly.
 ## Network / transport layer
 
 - `S` — **VarLong codec** (have VarInt; VarLong still needed for some fields)
-- `S` — ✅ **Packet framing polish**: length-prefix done; max-size guard (`MAX_FRAME_LEN`, 2 MiB) and read-side buffering (`BufReader` feeding the play loop) added
+- `S` — `[done]` **Packet framing polish**: length-prefix done; max-size guard (`MAX_FRAME_LEN`, 2 MiB) and read-side buffering (`BufReader` feeding the play loop) added
 - `M` — **Compression** (`SetCompression` / zlib): threshold negotiation, compress/decompress framing once bodies grow
 - `L` — **Encryption** (online mode): RSA keypair, `Hello`→`Key` exchange, AES-CFB8 stream cipher, Mojang session-server `hasJoined` auth, encrypted profile
 - `M` — **Cookie store** (`cookie/` — 6 packets): request/response/store for transfers
@@ -45,39 +45,39 @@ marked accordingly.
 
 ## Login → Configuration → Play handshake
 
-- `S` — ✅ **`LoginFinished`** packet — real login completion (offline GameProfile, no signed properties)
-- `S` — ✅ **`LoginAcknowledged`** transition into configuration state
-- `S` — ✅ **State enum + listener split**: `Handshake/Status/Login/Configuration/Play` (play owns the split stream)
-- `L` — 🟡 **Registry data sync** (`ClientboundRegistryDataPacket`): reaches Play via **known-packs passthrough** — entry IDs sent with data absent, client fills definitions from its core pack. Full network-NBT serialization of the ~60 registries still pending (needs the NBT codec)
-- `S` — ✅ **`UpdateEnabledFeatures`** + **feature flags** (`minecraft:vanilla`)
-- `S` — 🟡 **Tags sync** (`UpdateTags`): packet implemented; all required tags bound **empty** to satisfy the client's presence check. Real tag contents pending
-- `S` — ✅ **Known packs negotiation** (`SelectKnownPacks`, vanilla `minecraft:core/26.2`)
+- `S` — `[done]` **`LoginFinished`** packet — real login completion (offline GameProfile, no signed properties)
+- `S` — `[done]` **`LoginAcknowledged`** transition into configuration state
+- `S` — `[done]` **State enum + listener split**: `Handshake/Status/Login/Configuration/Play` (play owns the split stream)
+- `L` — `[partial]` **Registry data sync** (`ClientboundRegistryDataPacket`): reaches Play via **known-packs passthrough** — entry IDs sent with data absent, client fills definitions from its core pack. Full network-NBT serialization of the ~60 registries still pending (needs the NBT codec)
+- `S` — `[done]` **`UpdateEnabledFeatures`** + **feature flags** (`minecraft:vanilla`)
+- `S` — `[partial]` **Tags sync** (`UpdateTags`): packet implemented; all required tags bound **empty** to satisfy the client's presence check. Real tag contents pending
+- `S` — `[done]` **Known packs negotiation** (`SelectKnownPacks`, vanilla `minecraft:core/26.2`)
 - `S` — **Code-of-conduct** packets (new in 26.x: `CodeOfConduct` / `AcceptCodeOfConduct`)
-- `S` — ✅ **`FinishConfiguration`** ↔ `ServerboundFinishConfiguration` handoff to Play
-- `S` — 🟡 **Client information / brand** (`ClientInformation`, `CustomPayload` brand): received and tolerated (logged, not yet acted upon)
+- `S` — `[done]` **`FinishConfiguration`** ↔ `ServerboundFinishConfiguration` handoff to Play
+- `S` — `[partial]` **Client information / brand** (`ClientInformation`, `CustomPayload` brand): received and tolerated (logged, not yet acted upon)
 - `S` — **Resource-pack push/pop** packets (common)
 
 ## Play: join & keep-alive
 
-- `M` — ✅ **`Login` (play) packet**: single overworld dimension, spectator game mode, view/sim distance, spawn info — the big "join game" packet
-- `S` — ✅ **Keep-alive loop** (clientbound ping + serverbound echo, with timeout disconnect on a missed response)
+- `M` — `[done]` **`Login` (play) packet**: single overworld dimension, spectator game mode, view/sim distance, spawn info — the big "join game" packet
+- `S` — `[done]` **Keep-alive loop** (clientbound ping + serverbound echo, with timeout disconnect on a missed response)
 - `S` — **`Disconnect`** (play) + **`Ping`/`Pong`** (common)
-- `S` — ✅ **Set default spawn / `PlayerPosition`** (initial teleport id 1 + `AcceptTeleportation` confirm)
-- `S` — ✅ **Game-event packet** (`ClientboundGameEvent`: `LEVEL_CHUNKS_LOAD_START`)
+- `S` — `[done]` **Set default spawn / `PlayerPosition`** (initial teleport id 1 + `AcceptTeleportation` confirm)
+- `S` — `[done]` **Game-event packet** (`ClientboundGameEvent`: `LEVEL_CHUNKS_LOAD_START`)
 - `S` — **Server links / `ServerData`** (MOTD/icon in-game)
 
 ## World representation & chunks
 
 - `L` — **Block-state model**: `Block` registry, `BlockState` with properties, global palette IDs
 - `L` — **Chunk data structures**: `LevelChunk`, 16×16×16 sections, heightmaps, biome storage
-- `XL` — 🟡 **Chunk serialization** (`ClientboundLevelChunkWithLight`): packet wire format implemented for **all-air void columns** (single-valued block/biome palettes, empty heightmaps, empty light). Real paletted block/biome data and block entities pending
-- `M` — 🟡 **Light engine**: empty-light payload sent (four empty BitSets + two empty arrays); no real sky/block light propagation yet
-- `M` — 🟡 **Chunk streaming**: `SetChunkCacheCenter` + a fixed view-radius batch of chunks sent on join. Dynamic load/unload by movement and `ForgetLevelChunk` pending
+- `XL` — `[partial]` **Chunk serialization** (`ClientboundLevelChunkWithLight`): packet wire format implemented for **all-air void columns** (single-valued block/biome palettes, empty heightmaps, empty light). Real paletted block/biome data and block entities pending
+- `M` — `[partial]` **Light engine**: empty-light payload sent (four empty BitSets + two empty arrays); no real sky/block light propagation yet
+- `M` — `[partial]` **Chunk streaming**: `SetChunkCacheCenter` + a fixed view-radius batch of chunks sent on join. Dynamic load/unload by movement and `ForgetLevelChunk` pending
 - `M` — **Heightmaps** computation & maintenance
 - `S` — **Block-change packets**: `BlockUpdate`, `SectionBlocksUpdate`
 - `M` — **Block entities** (`BlockEntityData`, chests/signs/etc. NBT) — model + per-type data
 - `M` — **Region / `.mca` persistence** (Anvil format) — or start with in-memory only and defer
-- `L` — 🟡 **World generation**: the **void generator** (`S`) is effectively in place (server streams all-air columns). Real `levelgen` (noise, biomes, carvers, features, structures) is `XL` and still out of early scope
+- `L` — `[partial]` **World generation**: the **void generator** (`S`) is effectively in place (server streams all-air columns). Real `levelgen` (noise, biomes, carvers, features, structures) is `XL` and still out of early scope
 - `S` — **World border** (`world/level/border`, `SetBorder*` packets)
 
 ## Blocks, items, registries (content)
@@ -152,7 +152,7 @@ marked accordingly.
 
 ## Server infrastructure
 
-- `M` — 🟡 **Player connection manager**: accept loop + per-connection async task + (in play) a buffered reader task feeding the select loop over a channel. Per-player session state, dispatch queues, and graceful disconnect still to add
+- `M` — `[partial]` **Player connection manager**: accept loop + per-connection async task + (in play) a buffered reader task feeding the select loop over a channel. Per-player session state, dispatch queues, and graceful disconnect still to add
 - `M` — **`server.properties` / config loading** (`server/dedicated`)
 - `M` — **Server status with player sample, favicon, secure-chat enforcement**
 - `S` — **Ban/whitelist/op lists** (`server/players`, JSON files)
@@ -161,7 +161,7 @@ marked accordingly.
 - `S` — **Query protocol** (legacy UDP server query) — optional
 - `M` — **JSON-RPC management API** (`server/jsonrpc`) — new 26.x, optional
 - `L` — **World save/load** (`world/level/storage` — `level.dat`, player data, region files)
-- `S` — 🟡 **Console / log handling, command-line args, ticking watchdog**: `tracing` logging (`RUST_LOG`) and a bind-address CLI arg in place; ticking watchdog pending
+- `S` — `[partial]` **Console / log handling, command-line args, ticking watchdog**: `tracing` logging (`RUST_LOG`) and a bind-address CLI arg in place; ticking watchdog pending
 - `M` — **Datapack / tag loading** (`server/packs`, `tags`) — feed registry & tag sync
 - `S` — **Brand & version reporting, ping debug charts** (`util/debugchart`)
 
@@ -172,7 +172,7 @@ marked accordingly.
 - `M` — **Registry framework** (`core/Registry`, `Holder`, `ResourceKey`, tags) — underpins almost everything
 - `M` — **DataComponent framework** (`core/component`) — the 26.x replacement for item NBT
 - `S` — **Damage sources** (`world/damagesource`)
-- `S` — 🟡 **UUID / GameProfile utilities**: offline UUID done (MD5 `OfflinePlayer:<name>`, tested); property/signature handling still to add
+- `S` — `[partial]` **UUID / GameProfile utilities**: offline UUID done (MD5 `OfflinePlayer:<name>`, tested); property/signature handling still to add
 - `M` — **Region/chunk coordinate + seed-based RNG utilities** (`util/random`, `valueproviders`)
 - `XL` — **Data generation pipeline**: extract blocks/items/registries from the reference data so content isn't hand-written (clean-room: derive from observable IDs, not copied code)
 
