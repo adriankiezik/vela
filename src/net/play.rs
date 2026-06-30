@@ -31,6 +31,12 @@ const SB_PLAY_MOVE_PLAYER_POS: i32 = 30;
 const SB_PLAY_MOVE_PLAYER_POS_ROT: i32 = 31;
 const SB_PLAY_MOVE_PLAYER_ROT: i32 = 32;
 const SB_PLAY_MOVE_PLAYER_STATUS_ONLY: i32 = 33;
+// Player-action ids, same registration-order source. `GameProtocols`
+// SERVERBOUND_TEMPLATE: PlayerAbilities (line 101 → 40), PlayerCommand
+// (line 103 → 42), Swing (line 124 → 63).
+const SB_PLAY_PLAYER_ABILITIES: i32 = 40;
+const SB_PLAY_PLAYER_COMMAND: i32 = 42;
+const SB_PLAY_SWING: i32 = 63;
 
 /// `ServerboundMovePlayerPacket.FLAG_ON_GROUND` — bit 0 of the trailing flags
 /// byte the movement packets carry (bit 1 is horizontal collision, ignored).
@@ -145,6 +151,23 @@ fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbound> {
         SB_PLAY_CHAT_COMMAND | SB_PLAY_CHAT_COMMAND_SIGNED => {
             Some(Serverbound::ChatCommand(reader.read_utf(256).ok()?))
         }
+        // ServerboundSwingPacket: a single `InteractionHand` written as its enum
+        // ordinal via a VarInt (0 = main hand, 1 = off hand).
+        SB_PLAY_SWING => Some(Serverbound::Swing {
+            hand: reader.read_varint().ok()?,
+        }),
+        // ServerboundPlayerCommandPacket: entity id (the sender's own, dropped),
+        // then the `Action` ordinal, then a VarInt data argument.
+        SB_PLAY_PLAYER_COMMAND => {
+            let _entity_id = reader.read_varint().ok()?;
+            let action = reader.read_varint().ok()?;
+            let _data = reader.read_varint().ok()?;
+            Some(Serverbound::PlayerCommand { action })
+        }
+        // ServerboundPlayerAbilitiesPacket: a single flags byte (bit 0x02 = flying).
+        SB_PLAY_PLAYER_ABILITIES => Some(Serverbound::PlayerAbilities {
+            flags: reader.read_u8().ok()?,
+        }),
         _ => None,
     }
 }

@@ -42,6 +42,8 @@ struct Existing {
     yaw: i8,
     pitch: i8,
     head: i8,
+    sneaking: bool,
+    sprinting: bool,
     outbox: OutboxTx,
 }
 
@@ -110,9 +112,9 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
     // last value broadcast), so the newcomer joins the shared delta stream in
     // sync — exactly what vanilla's entity tracker sends a new viewer.
     let existing: Vec<Existing> = {
-        let mut q = world.query::<(&PlayerId, &Profile, &Tracking, &Conn)>();
+        let mut q = world.query::<(&PlayerId, &Profile, &Tracking, &Meta, &Conn)>();
         q.iter(world)
-            .map(|(pid, profile, t, conn)| Existing {
+            .map(|(pid, profile, t, meta, conn)| Existing {
                 uuid: pid.0,
                 name: profile.name.clone(),
                 entity_id: profile.entity_id,
@@ -122,6 +124,8 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
                 yaw: t.yaw,
                 pitch: t.pitch,
                 head: t.head,
+                sneaking: meta.sneaking,
+                sprinting: meta.sprinting,
                 outbox: conn.outbox.clone(),
             })
             .collect()
@@ -154,6 +158,12 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
                 e.head,
             ),
         );
+        // AddEntity carries no metadata, so follow it with the current pose/flags
+        // — otherwise an already-sneaking player would render standing.
+        send(
+            &outbox,
+            packets::set_entity_data(e.entity_id, e.sneaking, e.sprinting),
+        );
     }
 
     // Announce the newcomer to everyone already here: tab entry, then spawn.
@@ -166,9 +176,13 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
         name: name.clone(),
     }]);
     let newcomer_spawn = packets::add_entity(entity_id, id, (sx, sy, sz), 0, 0, 0);
+    // A fresh join is neither sneaking nor sprinting, but send the metadata for
+    // parity with the existing-player path (and so the pose is explicitly reset).
+    let newcomer_meta = packets::set_entity_data(entity_id, false, false);
     for e in &existing {
         let _ = e.outbox.try_send(Outbound::Packet(newcomer_info.clone()));
         let _ = e.outbox.try_send(Outbound::Packet(newcomer_spawn.clone()));
+        let _ = e.outbox.try_send(Outbound::Packet(newcomer_meta.clone()));
     }
 
     let entity = world
@@ -194,6 +208,7 @@ fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
                 teleport_delay: 0,
                 tick_count: 0,
             },
+            Meta::default(),
             Conn { outbox },
             KeepAlive {
                 id: 0,
@@ -315,7 +330,70 @@ fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         Serverbound::AcceptTeleport(tp) => {
             debug!(teleport_id = tp, "teleport confirmed");
         }
+        Serverbound::Swing { hand } => {
+            let Some(eid) = world.get::<Profile>(entity).map(|p| p.entity_id) else {
+                return;
+            };
+            // InteractionHand: 0 = main hand, 1 = off hand. Anything else maps to
+            // the main-arm swing (vanilla only ever sends the two).
+            let action = if hand == 1 {
+                packets::ANIMATE_SWING_OFF_HAND
+            } else {
+                packets::ANIMATE_SWING_MAIN_HAND
+            };
+            broadcast_to_others(world, entity, packets::animate(eid, action));
+        }
+        Serverbound::PlayerCommand { action } => {
+            // 26.2 `Action` ordinals: 1 = START_SPRINTING, 2 = STOP_SPRINTING.
+            // The others (sleeping, riding jump, open inventory, fall flying) have
+            // no metadata effect here yet. Crouch is no longer reported via this
+            // packet (see `Meta`), so only sprint toggles entity metadata.
+            let sprinting = match action {
+                1 => true,
+                2 => false,
+                _ => return,
+            };
+            let changed = world
+                .get_mut::<Meta>(entity)
+                .is_some_and(|mut m| std::mem::replace(&mut m.sprinting, sprinting) != sprinting);
+            if changed {
+                broadcast_meta(world, entity);
+            }
+        }
+        Serverbound::PlayerAbilities { flags } => {
+            // Only the flying bit (0x02) is meaningful serverbound; record it.
+            let flying = flags & 0x02 != 0;
+            if let Some(mut meta) = world.get_mut::<Meta>(entity) {
+                meta.flying = flying;
+            }
+            debug!(flying, "player abilities");
+        }
     }
+}
+
+/// Fan a single framed packet out to every connection except `sender` — the
+/// model `broadcast_movement` uses, lifted out for the one-shot action packets.
+fn broadcast_to_others(world: &mut World, sender: Entity, bytes: bytes::Bytes) {
+    let mut q = world.query::<(Entity, &Conn)>();
+    for (e, conn) in q.iter(world) {
+        if e == sender {
+            continue;
+        }
+        let _ = conn.outbox.try_send(Outbound::Packet(bytes.clone()));
+    }
+}
+
+/// Rebuild a player's entity-metadata packet from its current `Meta` and send it
+/// to every other tracking connection.
+fn broadcast_meta(world: &mut World, entity: Entity) {
+    let Some(eid) = world.get::<Profile>(entity).map(|p| p.entity_id) else {
+        return;
+    };
+    let Some((sneaking, sprinting)) = world.get::<Meta>(entity).map(|m| (m.sneaking, m.sprinting))
+    else {
+        return;
+    };
+    broadcast_to_others(world, entity, packets::set_entity_data(eid, sneaking, sprinting));
 }
 
 /// Run a `/command` for `sender`. Like vanilla's `sendSuccess(..., false)`, the
