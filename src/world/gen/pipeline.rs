@@ -1,0 +1,757 @@
+//! P6 — the staged chunk-generation pipeline: vanilla's chunk statuses, the
+//! dependency pyramid, proto-chunks, a `WorldGenRegion` view, and a scheduler
+//! that generates a chunk's dependencies before advancing it.
+//!
+//! Reference: `world/level/chunk/status/` (`ChunkStatus`, `ChunkDependencies`,
+//! `ChunkStep`, `ChunkPyramid`, `ChunkStatusTasks`) and
+//! `server/level/WorldGenRegion`. Vanilla generates through 12 statuses
+//! (empty → … → full); each status's step declares per-radius requirements on
+//! neighbor chunks (`addRequirement`) and a block-state write radius. The
+//! pyramid's *accumulated* dependencies answer "how far out, and at what
+//! status, must neighbors exist for this chunk to reach status S" — e.g. FULL
+//! accumulates `[SPAWN, INITIALIZE_LIGHT, CARVERS, BIOMES, STRUCTURE_STARTS×8]`.
+//!
+//! The stage tasks route to the P2–P5 engines: BIOMES fills the per-section
+//! quart biomes (`fillBiomesFromNoise`), NOISE runs `doFill`
+//! (aquifers/ore veins included), SURFACE applies the surface rules over the
+//! biomes *stored* in the 3×3 neighborhood (exactly vanilla, which reads
+//! neighbor chunks at ≥ BIOMES through the region rather than resampling).
+//! STRUCTURE_STARTS / STRUCTURE_REFERENCES (P9), CARVERS (P7) and FEATURES
+//! (P8) are vanilla-shaped no-ops for now — for terrain output that is *exact*
+//! wherever no structure/carver/feature would touch, and the pipeline is the
+//! architecture those layers plug into. Light/spawn statuses are also no-ops:
+//! Vela computes light at encode time and spawns mobs in the sim.
+//!
+//! Vanilla's LOADING_PYRAMID (chunks read from disk re-run only light tasks)
+//! collapses here to: only `minecraft:full` chunks are loaded from disk;
+//! anything less regenerates — output-identical while generation stays
+//! deterministic and cross-chunk writes don't exist (they arrive with P8,
+//! which is when intermediate-status persistence starts to matter).
+
+// The pipeline is the P6 architecture layer: its consumers are the golden
+// tests today and the carver/feature/structure stages (P7–P9) plus the live
+// chunk path next. Until those land, most of the API has no non-test caller.
+// Drop this once the live generator drives the pipeline.
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use tracing::warn;
+
+use super::density::{FilledChunk, NoiseChunk, ParityBlock};
+use super::surface_rules::{BakedBiomes, SurfacedGenerator};
+
+// ---------------------------------------------------------------------------
+// ChunkStatus
+// ---------------------------------------------------------------------------
+
+/// `ChunkStatus` — the 12 generation statuses, in pyramid order. The
+/// discriminant is vanilla's `getIndex()`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[repr(u8)]
+pub enum ChunkStatus {
+    Empty = 0,
+    StructureStarts = 1,
+    StructureReferences = 2,
+    Biomes = 3,
+    Noise = 4,
+    Surface = 5,
+    Carvers = 6,
+    Features = 7,
+    InitializeLight = 8,
+    Light = 9,
+    Spawn = 10,
+    Full = 11,
+}
+
+impl ChunkStatus {
+    pub const ALL: [ChunkStatus; 12] = [
+        ChunkStatus::Empty,
+        ChunkStatus::StructureStarts,
+        ChunkStatus::StructureReferences,
+        ChunkStatus::Biomes,
+        ChunkStatus::Noise,
+        ChunkStatus::Surface,
+        ChunkStatus::Carvers,
+        ChunkStatus::Features,
+        ChunkStatus::InitializeLight,
+        ChunkStatus::Light,
+        ChunkStatus::Spawn,
+        ChunkStatus::Full,
+    ];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The registry id persisted in chunk NBT (`Status`).
+    pub fn name(self) -> &'static str {
+        match self {
+            ChunkStatus::Empty => "minecraft:empty",
+            ChunkStatus::StructureStarts => "minecraft:structure_starts",
+            ChunkStatus::StructureReferences => "minecraft:structure_references",
+            ChunkStatus::Biomes => "minecraft:biomes",
+            ChunkStatus::Noise => "minecraft:noise",
+            ChunkStatus::Surface => "minecraft:surface",
+            ChunkStatus::Carvers => "minecraft:carvers",
+            ChunkStatus::Features => "minecraft:features",
+            ChunkStatus::InitializeLight => "minecraft:initialize_light",
+            ChunkStatus::Light => "minecraft:light",
+            ChunkStatus::Spawn => "minecraft:spawn",
+            ChunkStatus::Full => "minecraft:full",
+        }
+    }
+
+    /// Parse a persisted `Status` string (with or without the `minecraft:`
+    /// namespace), mirroring `ChunkStatus.byName`.
+    pub fn from_name(name: &str) -> Option<ChunkStatus> {
+        let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+        Self::ALL
+            .into_iter()
+            .find(|s| s.name().strip_prefix("minecraft:") == Some(bare))
+    }
+
+    pub fn is_or_after(self, other: ChunkStatus) -> bool {
+        self >= other
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChunkDependencies / ChunkStep / ChunkPyramid
+// ---------------------------------------------------------------------------
+
+/// `ChunkDependencies` — for a generating step, the status required of a
+/// neighbor chunk at each chessboard distance (`dependency_by_radius[d]`),
+/// plus the inverse lookup "out to what radius is status S required".
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChunkDependencies {
+    dependency_by_radius: Vec<ChunkStatus>,
+    radius_by_dependency: Vec<i32>,
+}
+
+impl ChunkDependencies {
+    fn new(dependency_by_radius: Vec<ChunkStatus>) -> Self {
+        let size = dependency_by_radius.first().map_or(0, |s| s.index() + 1);
+        let mut radius_by_dependency = vec![0i32; size];
+        for (radius, dependency) in dependency_by_radius.iter().enumerate() {
+            for entry in radius_by_dependency.iter_mut().take(dependency.index() + 1) {
+                *entry = radius as i32;
+            }
+        }
+        Self { dependency_by_radius, radius_by_dependency }
+    }
+
+    pub fn size(&self) -> i32 {
+        self.dependency_by_radius.len() as i32
+    }
+
+    /// The furthest chessboard distance at which `status` is required.
+    /// Panics (like vanilla) when `status` is outside the dependency range.
+    pub fn radius_of(&self, status: ChunkStatus) -> i32 {
+        self.radius_by_dependency
+            .get(status.index())
+            .copied()
+            .unwrap_or_else(|| {
+                panic!("requesting a ChunkStatus({status:?}) outside of dependency range")
+            })
+    }
+
+    pub fn radius(&self) -> i32 {
+        (self.dependency_by_radius.len() as i32 - 1).max(0)
+    }
+
+    pub fn get(&self, distance: i32) -> ChunkStatus {
+        self.dependency_by_radius[distance as usize]
+    }
+
+    #[cfg(test)]
+    fn as_slice(&self) -> &[ChunkStatus] {
+        &self.dependency_by_radius
+    }
+}
+
+/// `ChunkStep` — one pyramid step: the status it produces, its direct and
+/// accumulated neighbor requirements, and how far block writes may reach.
+pub struct ChunkStep {
+    pub target_status: ChunkStatus,
+    pub direct_dependencies: ChunkDependencies,
+    pub accumulated_dependencies: ChunkDependencies,
+    /// `blockStateWriteRadius` — `-1` for steps that place no blocks.
+    pub block_state_write_radius: i32,
+}
+
+impl ChunkStep {
+    /// `getAccumulatedRadiusOf` — 0 for the step's own status.
+    pub fn accumulated_radius_of(&self, status: ChunkStatus) -> i32 {
+        if status == self.target_status {
+            0
+        } else {
+            self.accumulated_dependencies.radius_of(status)
+        }
+    }
+}
+
+/// `ChunkStep.Builder`, ported exactly: `add_requirement` widens the
+/// per-radius array keeping the max status at each distance, and the
+/// accumulated dependencies merge the parent step's accumulation shifted out
+/// by the parent's own radius in this step.
+struct StepBuilder {
+    status: ChunkStatus,
+    parent: Option<usize>,
+    direct_by_radius: Vec<ChunkStatus>,
+    write_radius: i32,
+}
+
+impl StepBuilder {
+    fn new(status: ChunkStatus, parent: Option<&ChunkStep>) -> Self {
+        let direct_by_radius = match parent {
+            None => Vec::new(),
+            Some(p) => vec![p.target_status],
+        };
+        Self {
+            status,
+            parent: parent.map(|p| p.target_status.index()),
+            direct_by_radius,
+            write_radius: -1,
+        }
+    }
+
+    fn add_requirement(mut self, status: ChunkStatus, radius: i32) -> Self {
+        assert!(
+            status < self.status,
+            "status {status:?} can not be required by {:?}",
+            self.status
+        );
+        let previous = std::mem::take(&mut self.direct_by_radius);
+        let new_length = (radius + 1) as usize;
+        if new_length > previous.len() {
+            self.direct_by_radius = vec![status; new_length];
+        } else {
+            self.direct_by_radius = vec![status; previous.len()];
+        }
+        for i in 0..new_length.min(previous.len()) {
+            self.direct_by_radius[i] = previous[i].max(status);
+        }
+        // Beyond the overlap, entries keep the widened fill (`status`) when we
+        // grew, or the previous values when we didn't.
+        if new_length <= previous.len() {
+            self.direct_by_radius[new_length..].copy_from_slice(&previous[new_length..]);
+        }
+        self
+    }
+
+    fn write_radius(mut self, radius: i32) -> Self {
+        self.write_radius = radius;
+        self
+    }
+
+    fn build(self, steps: &[ChunkStep]) -> ChunkStep {
+        let accumulated = self.build_accumulated(steps);
+        ChunkStep {
+            target_status: self.status,
+            direct_dependencies: ChunkDependencies::new(self.direct_by_radius),
+            accumulated_dependencies: ChunkDependencies::new(accumulated),
+            block_state_write_radius: self.write_radius,
+        }
+    }
+
+    fn build_accumulated(&self, steps: &[ChunkStep]) -> Vec<ChunkStatus> {
+        let Some(parent_index) = self.parent else {
+            return self.direct_by_radius.clone();
+        };
+        let parent = &steps[parent_index];
+        let radius_of_parent = self.radius_of_parent(parent.target_status);
+        let parent_deps = &parent.accumulated_dependencies.dependency_by_radius;
+        let len = (radius_of_parent + parent_deps.len()).max(self.direct_by_radius.len());
+        let mut accumulated = Vec::with_capacity(len);
+        for distance in 0..len {
+            let in_parent = distance.checked_sub(radius_of_parent).filter(|d| *d < parent_deps.len());
+            let value = match (in_parent, self.direct_by_radius.get(distance)) {
+                (None, Some(&direct)) => direct,
+                (Some(p), None) => parent_deps[p],
+                (Some(p), Some(&direct)) => direct.max(parent_deps[p]),
+                (None, None) => unreachable!("accumulated length covers one of the two"),
+            };
+            accumulated.push(value);
+        }
+        accumulated
+    }
+
+    fn radius_of_parent(&self, status: ChunkStatus) -> usize {
+        for i in (0..self.direct_by_radius.len()).rev() {
+            if self.direct_by_radius[i].is_or_after(status) {
+                return i;
+            }
+        }
+        0
+    }
+}
+
+/// `ChunkPyramid` — the ordered steps, one per status.
+pub struct ChunkPyramid {
+    steps: Vec<ChunkStep>,
+}
+
+impl ChunkPyramid {
+    pub fn step_to(&self, status: ChunkStatus) -> &ChunkStep {
+        &self.steps[status.index()]
+    }
+
+    /// `ChunkPyramid.GENERATION_PYRAMID` — the vanilla requirement table.
+    pub fn generation() -> &'static ChunkPyramid {
+        static PYRAMID: OnceLock<ChunkPyramid> = OnceLock::new();
+        PYRAMID.get_or_init(|| {
+            use ChunkStatus::*;
+            let mut steps: Vec<ChunkStep> = Vec::with_capacity(ChunkStatus::ALL.len());
+            let step = |steps: &mut Vec<ChunkStep>, status: ChunkStatus, f: fn(StepBuilder) -> StepBuilder| {
+                let builder = StepBuilder::new(status, steps.last());
+                let built = f(builder).build(steps);
+                steps.push(built);
+            };
+            step(&mut steps, Empty, |s| s);
+            step(&mut steps, StructureStarts, |s| s);
+            step(&mut steps, StructureReferences, |s| s.add_requirement(StructureStarts, 8));
+            step(&mut steps, Biomes, |s| s.add_requirement(StructureStarts, 8));
+            step(&mut steps, Noise, |s| {
+                s.add_requirement(StructureStarts, 8)
+                    .add_requirement(Biomes, 1)
+                    .write_radius(0)
+            });
+            step(&mut steps, Surface, |s| {
+                s.add_requirement(StructureStarts, 8)
+                    .add_requirement(Biomes, 1)
+                    .write_radius(0)
+            });
+            step(&mut steps, Carvers, |s| s.add_requirement(StructureStarts, 8).write_radius(0));
+            step(&mut steps, Features, |s| {
+                s.add_requirement(StructureStarts, 8)
+                    .add_requirement(Carvers, 1)
+                    .write_radius(1)
+            });
+            step(&mut steps, InitializeLight, |s| s);
+            step(&mut steps, Light, |s| s.add_requirement(InitializeLight, 1));
+            step(&mut steps, Spawn, |s| s.add_requirement(Biomes, 1));
+            step(&mut steps, Full, |s| s);
+            ChunkPyramid { steps }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProtoChunk
+// ---------------------------------------------------------------------------
+
+/// A chunk at an intermediate generation status (`ProtoChunk`): the pieces
+/// filled in so far. `biome_sections` appears at BIOMES (per 16-block section
+/// bottom-up, 4×4×4 quart biomes at container index `(y·4 + z)·4 + x`);
+/// `blocks` appears at NOISE and is mutated in place by SURFACE (and, later,
+/// CARVERS/FEATURES).
+pub struct ProtoChunk {
+    pub pos: (i32, i32),
+    pub status: ChunkStatus,
+    pub biome_sections: Option<Vec<[u16; 64]>>,
+    pub blocks: Option<FilledChunk>,
+}
+
+impl ProtoChunk {
+    fn new(pos: (i32, i32)) -> Self {
+        Self { pos, status: ChunkStatus::Empty, biome_sections: None, blocks: None }
+    }
+}
+
+/// Chessboard (Chebyshev) distance between two chunk positions
+/// (`ChunkPos.getChessboardDistance`).
+pub fn chessboard_distance(a: (i32, i32), b: (i32, i32)) -> i32 {
+    (a.0 - b.0).abs().max((a.1 - b.1).abs())
+}
+
+// ---------------------------------------------------------------------------
+// WorldGenRegion
+// ---------------------------------------------------------------------------
+
+/// `WorldGenRegion` — the view a generating step works through: reads reach
+/// any chunk within the step's direct-dependency radius, block writes only
+/// chunks within the step's `blockStateWriteRadius`. Carvers (P7) and
+/// features (P8) receive one of these.
+pub struct WorldGenRegion<'a> {
+    chunks: &'a mut HashMap<(i32, i32), ProtoChunk>,
+    center: (i32, i32),
+    step: &'a ChunkStep,
+    /// `NoiseSettings.minY` / `height`, for biome-section indexing.
+    min_y: i32,
+    height: i32,
+}
+
+impl WorldGenRegion<'_> {
+    /// `hasChunk` — availability is a pure function of the generating step's
+    /// dependency radius, not of what happens to be resident.
+    pub fn has_chunk(&self, cx: i32, cz: i32) -> bool {
+        chessboard_distance(self.center, (cx, cz)) < self.step.direct_dependencies.size()
+    }
+
+    fn chunk(&self, cx: i32, cz: i32) -> &ProtoChunk {
+        self.expect_available(cx, cz);
+        self.chunks.get(&(cx, cz)).expect("dependency chunk generated before this step")
+    }
+
+    fn expect_available(&self, cx: i32, cz: i32) {
+        assert!(
+            self.has_chunk(cx, cz),
+            "requested chunk ({cx}, {cz}) unavailable while generating {:?} at {:?} \
+             (dependency radius {})",
+            self.step.target_status,
+            self.center,
+            self.step.direct_dependencies.radius(),
+        );
+    }
+
+    /// The block at world `(x, y, z)`. Outside the generated y-range (or in a
+    /// chunk that has not reached NOISE) everything reads as air, matching a
+    /// `ProtoChunk` whose sections are still empty.
+    pub fn get_block(&self, x: i32, y: i32, z: i32) -> ParityBlock {
+        match &self.chunk(x >> 4, z >> 4).blocks {
+            Some(blocks) if (blocks.min_y..blocks.min_y + blocks.height).contains(&y) => {
+                blocks.block(x & 15, y, z & 15)
+            }
+            _ => ParityBlock::Air,
+        }
+    }
+
+    /// Set the block at world `(x, y, z)`, enforcing the generating step's
+    /// write radius: outside it the write is dropped with a warning, exactly
+    /// vanilla's `ensureCanWrite` behavior. Returns whether the write landed.
+    pub fn set_block(&mut self, x: i32, y: i32, z: i32, state: ParityBlock) -> bool {
+        let pos = (x >> 4, z >> 4);
+        let dx = (self.center.0 - pos.0).abs();
+        let dz = (self.center.1 - pos.1).abs();
+        if dx > self.step.block_state_write_radius || dz > self.step.block_state_write_radius {
+            warn!(
+                x, y, z,
+                center = ?self.center,
+                status = ?self.step.target_status,
+                "detected setBlock in a far chunk during worldgen; dropping the write"
+            );
+            return false;
+        }
+        let chunk = self.chunks.get_mut(&pos).expect("writable chunk resident");
+        let blocks = chunk.blocks.as_mut().expect("writable chunk past NOISE");
+        if !(blocks.min_y..blocks.min_y + blocks.height).contains(&y) {
+            return false;
+        }
+        blocks.set_block(x & 15, y, z & 15, state);
+        true
+    }
+
+    /// `getNoiseBiome` at quart coordinates — read from the owning chunk's
+    /// *stored* biome sections (the chunk is ≥ BIOMES by the pyramid).
+    pub fn get_noise_biome(&self, quart_x: i32, quart_y: i32, quart_z: i32) -> u16 {
+        let chunk = self.chunk(quart_x >> 2, quart_z >> 2);
+        let sections = chunk.biome_sections.as_ref().expect("biome-dependency chunk ≥ BIOMES");
+        let min_section_y = self.min_y >> 4;
+        let qy = quart_y.clamp(self.min_y >> 2, (self.min_y + self.height - 1) >> 2);
+        let section = &sections[((qy >> 2) - min_section_y) as usize];
+        section[((((qy & 3) * 4) + (quart_z & 3)) * 4 + (quart_x & 3)) as usize]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pipeline scheduler
+// ---------------------------------------------------------------------------
+
+/// The staged generator: proto-chunks by position plus the seeded P2–P5
+/// engines. `advance` brings a chunk to a target status, generating every
+/// dependency (recursively, depth-first) first — the vanilla "pyramid".
+///
+/// Single-threaded by design: parity output must not depend on scheduling, so
+/// a deterministic depth-first order is the simplest correct scheduler. (The
+/// only order-visible state is the RTree's last-result tie-breaking seed,
+/// which vanilla itself leaves thread-dependent.)
+pub struct ChunkPipeline {
+    pub generator: SurfacedGenerator,
+    chunks: HashMap<(i32, i32), ProtoChunk>,
+}
+
+impl ChunkPipeline {
+    pub fn new_overworld(seed: i64) -> Self {
+        Self { generator: SurfacedGenerator::new_overworld(seed), chunks: HashMap::new() }
+    }
+
+    /// The proto-chunk at `pos`, if it has been touched.
+    pub fn chunk(&self, cx: i32, cz: i32) -> Option<&ProtoChunk> {
+        self.chunks.get(&(cx, cz))
+    }
+
+    fn status(&mut self, pos: (i32, i32)) -> ChunkStatus {
+        self.chunks.entry(pos).or_insert_with(|| ProtoChunk::new(pos)).status
+    }
+
+    /// Advance chunk `(cx, cz)` to `target`, generating dependencies first.
+    /// Idempotent: a chunk already at or past `target` is untouched.
+    pub fn advance(&mut self, cx: i32, cz: i32, target: ChunkStatus) -> &ProtoChunk {
+        let pos = (cx, cz);
+        let mut current = self.status(pos);
+        while current < target {
+            let next = ChunkStatus::ALL[current.index() + 1];
+            let step = ChunkPyramid::generation().step_to(next);
+            // Neighbors first: at each chessboard distance the step's direct
+            // dependencies name the status that ring must have reached.
+            // (Distance 0 is `pos` itself at the parent status — the previous
+            // loop iteration.)
+            for distance in 1..step.direct_dependencies.size() {
+                let required = step.direct_dependencies.get(distance);
+                for dz in -distance..=distance {
+                    for dx in -distance..=distance {
+                        if dx.abs().max(dz.abs()) == distance {
+                            self.advance(cx + dx, cz + dz, required);
+                        }
+                    }
+                }
+            }
+            self.run_step(pos, step);
+            let chunk = self.chunks.get_mut(&pos).expect("proto chunk resident");
+            chunk.status = next;
+            current = next;
+        }
+        self.chunks.get(&pos).expect("proto chunk resident")
+    }
+
+    /// One `ChunkStatusTasks` stage. Statuses without a P-layer yet are
+    /// vanilla-shaped no-ops (see the module docs).
+    fn run_step(&mut self, pos: (i32, i32), step: &ChunkStep) {
+        let noise = self.generator.inner.random_state.settings.noise;
+        match step.target_status {
+            // `generateBiomes` → `fillBiomesFromNoise`.
+            ChunkStatus::Biomes => {
+                let sections = self.generator.source.fill_chunk_biomes(
+                    &self.generator.sampler,
+                    pos.0,
+                    pos.1,
+                    noise.min_y,
+                    noise.height,
+                );
+                self.chunks.get_mut(&pos).expect("proto chunk resident").biome_sections =
+                    Some(sections);
+            }
+            // `generateNoise` → `doFill` (aquifers + ore veins included).
+            ChunkStatus::Noise => {
+                let filled = self.generator.inner.fill_chunk(pos.0, pos.1);
+                self.chunks.get_mut(&pos).expect("proto chunk resident").blocks = Some(filled);
+            }
+            // `generateSurface` → `buildSurface` over the biomes *stored* in
+            // the 3×3 neighborhood (guaranteed ≥ BIOMES by this step's
+            // dependencies), the staged equivalent of vanilla's BiomeManager
+            // reading neighbor chunks through the region.
+            ChunkStatus::Surface => {
+                let baked = {
+                    let sections = |dx: i32, dz: i32| {
+                        let chunk = &self.chunks[&(pos.0 + dx, pos.1 + dz)];
+                        ((pos.0 + dx, pos.1 + dz), chunk.biome_sections.as_deref().expect("neighbors ≥ BIOMES"))
+                    };
+                    let mut all = Vec::with_capacity(9);
+                    for dz in -1..=1 {
+                        for dx in -1..=1 {
+                            all.push(sections(dx, dz));
+                        }
+                    }
+                    BakedBiomes::from_sections(all, noise.min_y, noise.height)
+                };
+                let mut noise_chunk = NoiseChunk::for_chunk(
+                    &self.generator.inner.random_state,
+                    pos.0 * 16,
+                    pos.1 * 16,
+                );
+                let chunk = self.chunks.get_mut(&pos).expect("proto chunk resident");
+                let blocks = chunk.blocks.as_mut().expect("SURFACE runs after NOISE");
+                self.generator.surface.build_surface(blocks, &mut noise_chunk, &baked, pos.0, pos.1);
+            }
+            // P9 (structure starts/references), P7 (carvers), P8 (features):
+            // no-op contributions are exactly vanilla wherever those systems
+            // would not have touched the chunk. Light and spawn live outside
+            // the worldgen parity layer (encode-time light, sim spawning).
+            _ => {}
+        }
+    }
+
+    /// The generating region for a step at `pos` — what a carver/feature
+    /// implementation receives. Exposed for the P7/P8 layers and tests.
+    pub fn region_for<'a>(&'a mut self, pos: (i32, i32), step: &'a ChunkStep) -> WorldGenRegion<'a> {
+        let noise = self.generator.inner.random_state.settings.noise;
+        WorldGenRegion {
+            chunks: &mut self.chunks,
+            center: pos,
+            step,
+            min_y: noise.min_y,
+            height: noise.height,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ChunkStatus::*;
+
+    /// The vanilla GENERATION_PYRAMID dependency tables, derived by hand from
+    /// `ChunkStep.Builder` (`addRequirement` + `buildAccumulatedDependencies`)
+    /// applied to the `ChunkPyramid.GENERATION_PYRAMID` builder calls.
+    #[test]
+    fn generation_pyramid_matches_vanilla() {
+        let p = ChunkPyramid::generation();
+        let ss8 = |head: &[ChunkStatus]| {
+            let mut v = head.to_vec();
+            v.extend(std::iter::repeat(StructureStarts).take(9 - head.len().min(9)));
+            v
+        };
+
+        // Direct dependencies.
+        assert_eq!(p.step_to(Empty).direct_dependencies.as_slice(), &[] as &[ChunkStatus]);
+        assert_eq!(p.step_to(StructureStarts).direct_dependencies.as_slice(), &[Empty]);
+        assert_eq!(p.step_to(StructureReferences).direct_dependencies.as_slice(), vec![StructureStarts; 9]);
+        assert_eq!(p.step_to(Biomes).direct_dependencies.as_slice(), ss8(&[StructureReferences]));
+        assert_eq!(p.step_to(Noise).direct_dependencies.as_slice(), ss8(&[Biomes, Biomes]));
+        assert_eq!(p.step_to(Surface).direct_dependencies.as_slice(), ss8(&[Noise, Biomes]));
+        assert_eq!(p.step_to(Carvers).direct_dependencies.as_slice(), ss8(&[Surface]));
+        assert_eq!(p.step_to(Features).direct_dependencies.as_slice(), ss8(&[Carvers, Carvers]));
+        assert_eq!(p.step_to(InitializeLight).direct_dependencies.as_slice(), &[Features]);
+        assert_eq!(p.step_to(Light).direct_dependencies.as_slice(), &[InitializeLight, InitializeLight]);
+        assert_eq!(p.step_to(Spawn).direct_dependencies.as_slice(), &[Light, Biomes]);
+        assert_eq!(p.step_to(Full).direct_dependencies.as_slice(), &[Spawn]);
+
+        // Accumulated dependencies (the "pyramid").
+        let tail_ss = |head: &[ChunkStatus], len: usize| {
+            let mut v = head.to_vec();
+            v.extend(std::iter::repeat(StructureStarts).take(len - head.len()));
+            v
+        };
+        assert_eq!(p.step_to(StructureStarts).accumulated_dependencies.as_slice(), &[Empty]);
+        assert_eq!(
+            p.step_to(Noise).accumulated_dependencies.as_slice(),
+            tail_ss(&[Biomes, Biomes], 10)
+        );
+        assert_eq!(
+            p.step_to(Surface).accumulated_dependencies.as_slice(),
+            tail_ss(&[Noise, Biomes], 10)
+        );
+        assert_eq!(
+            p.step_to(Carvers).accumulated_dependencies.as_slice(),
+            tail_ss(&[Surface, Biomes], 10)
+        );
+        assert_eq!(
+            p.step_to(Features).accumulated_dependencies.as_slice(),
+            tail_ss(&[Carvers, Carvers, Biomes], 11)
+        );
+        assert_eq!(
+            p.step_to(Light).accumulated_dependencies.as_slice(),
+            tail_ss(&[InitializeLight, InitializeLight, Carvers, Biomes], 12)
+        );
+        assert_eq!(
+            p.step_to(Full).accumulated_dependencies.as_slice(),
+            tail_ss(&[Spawn, InitializeLight, Carvers, Biomes], 12)
+        );
+
+        // Write radii.
+        for (status, radius) in [
+            (Empty, -1), (StructureStarts, -1), (StructureReferences, -1), (Biomes, -1),
+            (Noise, 0), (Surface, 0), (Carvers, 0), (Features, 1),
+            (InitializeLight, -1), (Light, -1), (Spawn, -1), (Full, -1),
+        ] {
+            assert_eq!(p.step_to(status).block_state_write_radius, radius, "{status:?}");
+        }
+
+        // Inverse lookups.
+        assert_eq!(p.step_to(Full).accumulated_radius_of(StructureStarts), 11);
+        assert_eq!(p.step_to(Full).accumulated_radius_of(Biomes), 3);
+        assert_eq!(p.step_to(Full).accumulated_radius_of(Carvers), 2);
+        assert_eq!(p.step_to(Full).accumulated_radius_of(Full), 0);
+        assert_eq!(p.step_to(Features).direct_dependencies.radius_of(Carvers), 1);
+        assert_eq!(p.step_to(Features).direct_dependencies.radius_of(StructureStarts), 8);
+    }
+
+    #[test]
+    fn status_names_round_trip() {
+        for status in ChunkStatus::ALL {
+            assert_eq!(ChunkStatus::from_name(status.name()), Some(status));
+        }
+        assert_eq!(ChunkStatus::from_name("full"), Some(Full));
+        assert_eq!(ChunkStatus::from_name("minecraft:nonsense"), None);
+        assert!(Full.is_or_after(Surface));
+        assert!(!Biomes.is_or_after(Noise));
+    }
+
+    /// The staged pipeline produces the same terrain as the single-shot P5
+    /// facade: same blocks and WG heightmaps after SURFACE.
+    #[test]
+    fn staged_pipeline_matches_single_shot() {
+        let seed = 8000;
+        let single = SurfacedGenerator::new_overworld(seed);
+        let mut pipeline = ChunkPipeline::new_overworld(seed);
+        for (cx, cz) in [(0, 0), (-3, 7)] {
+            let expected = single.generate_chunk(cx, cz);
+            let staged = pipeline.advance(cx, cz, Surface);
+            let blocks = staged.blocks.as_ref().expect("surface chunk has blocks");
+            assert_eq!(blocks.blocks, expected.blocks, "blocks differ at ({cx},{cz})");
+            assert_eq!(blocks.ocean_floor_wg, expected.ocean_floor_wg);
+            assert_eq!(blocks.world_surface_wg, expected.world_surface_wg);
+        }
+    }
+
+    /// Advancing to FULL walks the pyramid: the center reaches FULL and every
+    /// neighbor ring reaches at least its accumulated requirement.
+    #[test]
+    fn full_advance_generates_the_dependency_pyramid() {
+        let mut pipeline = ChunkPipeline::new_overworld(0);
+        pipeline.advance(0, 0, Full);
+        assert_eq!(pipeline.chunk(0, 0).unwrap().status, Full);
+        let full = ChunkPyramid::generation().step_to(Full);
+        for distance in 1..=full.accumulated_dependencies.radius() {
+            let required = full.accumulated_dependencies.get(distance);
+            for (cx, cz) in [(distance, 0), (0, -distance), (-distance, distance)] {
+                let status = pipeline.chunk(cx, cz).expect("dependency generated").status;
+                assert!(
+                    status.is_or_after(required),
+                    "chunk ({cx},{cz}) at distance {distance} is {status:?}, needs {required:?}"
+                );
+            }
+        }
+        // Advancing again is a no-op (idempotent).
+        pipeline.advance(0, 0, Full);
+        assert_eq!(pipeline.chunk(0, 0).unwrap().status, Full);
+    }
+
+    /// The region enforces vanilla read/write bounds: reads reach the
+    /// dependency radius, writes only the step's write radius.
+    #[test]
+    fn region_enforces_read_and_write_bounds() {
+        let mut pipeline = ChunkPipeline::new_overworld(0);
+        // Surface both the center and a neighbor so both hold blocks.
+        pipeline.advance(0, 0, Surface);
+        pipeline.advance(1, 0, Surface);
+
+        let pyramid = ChunkPyramid::generation();
+        // FEATURES: write radius 1 — the neighbor write lands.
+        let mut region = pipeline.region_for((0, 0), pyramid.step_to(Features));
+        assert!(region.has_chunk(1, 0));
+        assert!(!region.has_chunk(9, 0), "reads stop at the dependency radius (8)");
+        assert!(region.set_block(20, 100, 4, ParityBlock::Stone));
+        assert_eq!(region.get_block(20, 100, 4), ParityBlock::Stone);
+        // Out-of-range y is dropped, not panicked.
+        assert!(!region.set_block(20, -1000, 4, ParityBlock::Stone));
+
+        // NOISE: write radius 0 — a cross-chunk write is dropped.
+        let mut region = pipeline.region_for((0, 0), pyramid.step_to(Noise));
+        assert!(!region.set_block(20, 100, 4, ParityBlock::Air));
+        assert!(region.set_block(4, 100, 4, ParityBlock::Stone));
+        assert_eq!(region.get_block(4, 100, 4), ParityBlock::Stone);
+
+        // Biome reads route to the owning chunk's stored sections and match
+        // the biome source directly.
+        let region = pipeline.region_for((0, 0), pyramid.step_to(Features));
+        let via_region = region.get_noise_biome(1, 10, 2);
+        drop(region);
+        let sections = pipeline.chunk(0, 0).unwrap().biome_sections.as_ref().unwrap();
+        let min_section_y = pipeline.generator.inner.random_state.settings.noise.min_y >> 4;
+        let section = &sections[((10 >> 2) - min_section_y) as usize];
+        assert_eq!(via_region, section[(((10 & 3) * 4 + 2) * 4 + 1) as usize]);
+    }
+}

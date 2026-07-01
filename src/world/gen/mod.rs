@@ -18,6 +18,7 @@ pub mod climate;
 pub mod density;
 mod feature;
 mod noise;
+pub mod pipeline;
 pub mod random;
 mod rng;
 pub mod synth;

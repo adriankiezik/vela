@@ -2521,6 +2521,14 @@ impl FilledChunk {
     pub fn block(&self, x: i32, y: i32, z: i32) -> ParityBlock {
         self.blocks[(((y - self.min_y) * 16 + z) * 16 + x) as usize]
     }
+
+    /// Overwrite the block at chunk-local `(x, z)`, world `y`. Raw storage
+    /// write — heightmap maintenance is the calling stage's concern (the
+    /// surface stage updates the WG heightmaps itself; carvers/features track
+    /// the post-carver heightmap kinds).
+    pub fn set_block(&mut self, x: i32, y: i32, z: i32, state: ParityBlock) {
+        self.blocks[(((y - self.min_y) * 16 + z) * 16 + x) as usize] = state;
+    }
 }
 
 /// The P2 generator facade: a seeded overworld `RandomState` plus

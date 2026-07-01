@@ -238,6 +238,37 @@ impl BakedBiomes {
         Self { map, quart_min_y: min_y >> 2, quart_max_y: (min_y + height - 1) >> 2 }
     }
 
+    /// Assemble the baked view from *stored* per-section quart biomes (the
+    /// layout `MultiNoiseBiomeSource::fill_chunk_biomes` produces) — the
+    /// staged pipeline's path, where the SURFACE stage reads the biomes its
+    /// dependency chunks computed at BIOMES rather than resampling.
+    pub fn from_sections<'a>(
+        chunks: impl IntoIterator<Item = ((i32, i32), &'a [[u16; 64]])>,
+        min_y: i32,
+        height: i32,
+    ) -> Self {
+        let mut map = HashMap::new();
+        for ((cx, cz), sections) in chunks {
+            let quart_min_x = (cx * 16) >> 2;
+            let quart_min_z = (cz * 16) >> 2;
+            let min_section_y = min_y >> 4;
+            for (section_index, section) in sections.iter().enumerate() {
+                let quart_min_y = (min_section_y + section_index as i32) << 2;
+                for y in 0..4 {
+                    for z in 0..4 {
+                        for x in 0..4 {
+                            map.insert(
+                                (quart_min_x + x, quart_min_y + y, quart_min_z + z),
+                                section[((y * 4 + z) * 4 + x) as usize],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Self { map, quart_min_y: min_y >> 2, quart_max_y: (min_y + height - 1) >> 2 }
+    }
+
     /// `ChunkAccess.getNoiseBiome` — quart y clamped to the world range.
     fn get_noise_biome(&self, quart_x: i32, quart_y: i32, quart_z: i32) -> u16 {
         let qy = quart_y.clamp(self.quart_min_y, self.quart_max_y);

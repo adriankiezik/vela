@@ -70,7 +70,7 @@ pub fn to_nbt(
         ("zPos", Nbt::Int(cz)),
         ("LastUpdate", Nbt::Long(game_time)),
         ("InhabitedTime", Nbt::Long(0)),
-        ("Status", Nbt::string("minecraft:full")),
+        ("Status", Nbt::string(crate::world::gen::pipeline::ChunkStatus::Full.name())),
         ("sections", Nbt::List(sections)),
         ("Heightmaps", heightmaps),
         ("block_entities", Nbt::List(vec![])),
@@ -93,8 +93,15 @@ pub fn to_nbt(
 /// each section's `block_states` `{palette, data}` is decoded independently of
 /// the width vanilla chose.
 pub fn from_nbt(nbt: &Nbt) -> Option<Vec<BlockState>> {
-    // A chunk with no status was never generated; reject it like vanilla `parse`.
-    if nbt.get("Status").and_then(Nbt::as_str)?.is_empty() {
+    // Only a fully generated chunk carries a complete block grid we can diff
+    // against the baseline; anything at an intermediate status (or with no
+    // status at all) regenerates instead — the staged pipeline's statuses are
+    // deterministic with no cross-chunk writes yet (through P6), so
+    // regeneration is output-identical to resuming. Vanilla instead resumes
+    // via its LOADING_PYRAMID; revisit when features (P8) land.
+    use crate::world::gen::pipeline::ChunkStatus;
+    let status = ChunkStatus::from_name(nbt.get("Status").and_then(Nbt::as_str)?)?;
+    if status != ChunkStatus::Full {
         return None;
     }
     let mut grid = vec![states::AIR; (SECTION_COUNT as usize) * CELLS];
