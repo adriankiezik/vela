@@ -23,6 +23,8 @@ md-5 = "0.10"
 rsa = "0.9"
 aes = "0.8"
 sha1 = "0.10"
+# SHA-256 for the worldgen biome-zoom seed (`BiomeManager.obfuscateSeed`).
+sha2 = "0.10"
 rand = "0.8"
 # Lightweight blocking HTTP client for the Mojang `hasJoined` session call.
 ureq = "2"

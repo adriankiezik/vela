@@ -472,6 +472,129 @@ impl BlendedNoise {
     }
 }
 
+/// 2D simplex noise (`SimplexNoise`) — used only by the biome temperature
+/// fields (`Biome.TEMPERATURE_NOISE` and friends), all seeded on the legacy
+/// LCG. Shares [`GRADIENT`] with the Perlin implementation but hashes with a
+/// `% 12` (not `& 15`), so the 4 padding rows are unreachable here.
+pub struct SimplexNoise {
+    p: [u8; 256],
+    pub xo: f64,
+    pub yo: f64,
+    pub zo: f64,
+}
+
+const SIMPLEX_F2: f64 = 0.3660254037844386; // 0.5 * (sqrt(3) - 1)
+const SIMPLEX_G2: f64 = 0.21132486540518713; // (3 - sqrt(3)) / 6
+
+impl SimplexNoise {
+    pub fn new(random: &mut RandomSource) -> Self {
+        let xo = random.next_double() * 256.0;
+        let yo = random.next_double() * 256.0;
+        let zo = random.next_double() * 256.0;
+        let mut p = [0u8; 256];
+        for (i, v) in p.iter_mut().enumerate() {
+            *v = i as u8;
+        }
+        for i in 0..256 {
+            let offset = random.next_int_bounded(256 - i as i32) as usize;
+            p.swap(i, i + offset);
+        }
+        Self { p, xo, yo, zo }
+    }
+
+    fn p(&self, x: i32) -> i32 {
+        self.p[(x & 0xFF) as usize] as i32
+    }
+
+    fn corner_noise(index: i32, x: f64, y: f64, z: f64, base: f64) -> f64 {
+        let t = base - x * x - y * y - z * z;
+        if t < 0.0 {
+            0.0
+        } else {
+            let t = t * t;
+            t * t * dot(&GRADIENT[index as usize], x, y, z)
+        }
+    }
+
+    /// The 2D `getValue(x, y)`.
+    pub fn get_value_2d(&self, xin: f64, yin: f64) -> f64 {
+        let s = (xin + yin) * SIMPLEX_F2;
+        let i = (xin + s).floor() as i32;
+        let j = (yin + s).floor() as i32;
+        let t = (i + j) as f64 * SIMPLEX_G2;
+        let x0 = xin - (i as f64 - t);
+        let y0 = yin - (j as f64 - t);
+        let (i1, j1) = if x0 > y0 { (1, 0) } else { (0, 1) };
+        let x1 = x0 - i1 as f64 + SIMPLEX_G2;
+        let y1 = y0 - j1 as f64 + SIMPLEX_G2;
+        let x2 = x0 - 1.0 + 2.0 * SIMPLEX_G2;
+        let y2 = y0 - 1.0 + 2.0 * SIMPLEX_G2;
+        let ii = i & 0xFF;
+        let jj = j & 0xFF;
+        let gi0 = self.p(ii + self.p(jj)) % 12;
+        let gi1 = self.p(ii + i1 + self.p(jj + j1)) % 12;
+        let gi2 = self.p(ii + 1 + self.p(jj + 1)) % 12;
+        let n0 = Self::corner_noise(gi0, x0, y0, 0.0, 0.5);
+        let n1 = Self::corner_noise(gi1, x1, y1, 0.0, 0.5);
+        let n2 = Self::corner_noise(gi2, x2, y2, 0.0, 0.5);
+        70.0 * (n0 + n1 + n2)
+    }
+}
+
+/// Octave stack over [`SimplexNoise`] (`PerlinSimplexNoise`). Only the
+/// non-positive-octave sets the biome temperature fields use are supported —
+/// the positive-octave reseed path (`positiveOctaveSeed`) never runs for them.
+pub struct PerlinSimplexNoise {
+    levels: Vec<Option<SimplexNoise>>,
+    highest_freq_value_factor: f64,
+    highest_freq_input_factor: f64,
+}
+
+impl PerlinSimplexNoise {
+    /// `octaves` is the sorted distinct octave set (e.g. `[-2, -1, 0]`), which
+    /// must end at 0 (no positive octaves).
+    pub fn new(random: &mut RandomSource, octaves: &[i32]) -> Self {
+        let first = octaves[0];
+        let last = *octaves.last().unwrap();
+        assert!(last == 0, "positive-octave PerlinSimplexNoise is unsupported");
+        let low_freq_octaves = -first;
+        let count = (low_freq_octaves + last + 1) as usize;
+        let zero_octave = SimplexNoise::new(random);
+        let zero_index = last as usize;
+        let mut levels: Vec<Option<SimplexNoise>> = (0..count).map(|_| None).collect();
+        if octaves.contains(&0) {
+            levels[zero_index] = Some(zero_octave);
+        }
+        for i in zero_index + 1..count {
+            if octaves.contains(&(zero_index as i32 - i as i32)) {
+                levels[i] = Some(SimplexNoise::new(random));
+            } else {
+                random.consume_count(262);
+            }
+        }
+        Self {
+            levels,
+            highest_freq_input_factor: 2.0f64.powi(last),
+            highest_freq_value_factor: 1.0 / (2.0f64.powi(count as i32) - 1.0),
+        }
+    }
+
+    pub fn get_value_2d(&self, x: f64, y: f64, use_noise_start: bool) -> f64 {
+        let mut value = 0.0;
+        let mut factor = self.highest_freq_input_factor;
+        let mut value_factor = self.highest_freq_value_factor;
+        for level in &self.levels {
+            if let Some(noise) = level {
+                let (ox, oy) = if use_noise_start { (noise.xo, noise.yo) } else { (0.0, 0.0) };
+                value += noise.get_value_2d(x * factor + ox, y * factor + oy) * value_factor;
+            }
+            factor /= 2.0;
+            value_factor *= 2.0;
+        }
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

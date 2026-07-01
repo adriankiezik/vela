@@ -513,6 +513,17 @@ impl MultiNoiseBiomeSource {
     pub fn biome_name(&self, id: u16) -> &str {
         &self.biomes[id as usize]
     }
+
+    /// The fill value for a biome registry id (`minecraft:`-prefixed), if the
+    /// biome appears in the parameter list.
+    pub fn biome_index(&self, name: &str) -> Option<u16> {
+        self.biomes.iter().position(|b| b == name).map(|i| i as u16)
+    }
+
+    /// The number of distinct biomes in the parameter list.
+    pub fn biome_count(&self) -> usize {
+        self.biomes.len()
+    }
 }
 
 #[cfg(test)]

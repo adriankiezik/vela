@@ -119,6 +119,8 @@ pub struct NoiseGeneratorSettings {
     pub ore_veins_enabled: bool,
     /// The 15 raw router graphs, keyed by their JSON field name.
     noise_router: Value,
+    /// The raw `surface_rule` tree (parsed by the P5 surface-rules engine).
+    pub surface_rule: Value,
 }
 
 /// `NoiseSettings` (overworld: −64, 384, 1, 2 → 4×8 cells).
@@ -176,8 +178,18 @@ impl VanillaWorldgenData {
             aquifers_enabled: s["aquifers_enabled"].as_bool().unwrap(),
             ore_veins_enabled: s["ore_veins_enabled"].as_bool().unwrap(),
             noise_router: s["noise_router"].clone(),
+            surface_rule: s["surface_rule"].clone(),
         };
         Self { noise_params, density_fns, settings }
+    }
+
+    /// The `worldgen/noise` parameters for a (possibly `minecraft:`-prefixed)
+    /// noise id.
+    pub fn noise_parameters(&self, id: &str) -> &NoiseParameters {
+        let short = id.strip_prefix("minecraft:").unwrap_or(id);
+        self.noise_params
+            .get(short)
+            .unwrap_or_else(|| panic!("unknown noise parameters {id}"))
     }
 }
 
@@ -778,6 +790,9 @@ pub struct NoiseRouter {
 /// positional factories downstream layers fork from.
 pub struct RandomState {
     pub router: NoiseRouter,
+    /// The base positional factory (`RandomState.random`) — named noises and
+    /// `getOrCreateRandomFactory` fork from it.
+    pub random: PositionalRandomFactory,
     pub aquifer_random: PositionalRandomFactory,
     pub ore_random: PositionalRandomFactory,
     pub settings: NoiseGeneratorSettingsPublic,
@@ -832,6 +847,7 @@ impl RandomState {
         };
         Self {
             router,
+            random,
             aquifer_random,
             ore_random,
             settings: NoiseGeneratorSettingsPublic {
@@ -1480,8 +1496,10 @@ pub fn compute_at(f: &Dfn, x: i32, y: i32, z: i32) -> f64 {
 // NoiseChunk — the per-chunk cell interpolator + fill driver
 // ---------------------------------------------------------------------------
 
-/// What `doFill` writes: air, the default block (stone), a fluid, or one of
-/// the `OreVeinifier.VeinType` blocks.
+/// What `doFill` writes — air, the default block (stone), a fluid, or one of
+/// the `OreVeinifier.VeinType` blocks — plus (since P5) every block the
+/// overworld surface-rule tree can place. Discriminants are the fixture
+/// digest alphabet shared with the JVM harnesses, so they must never change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum ParityBlock {
@@ -1495,6 +1513,85 @@ pub enum ParityBlock {
     Tuff = 7,
     DeepslateIronOre = 8,
     RawIronBlock = 9,
+    // P5 surface-rule blocks.
+    Bedrock = 10,
+    Deepslate = 11,
+    GrassBlock = 12,
+    Dirt = 13,
+    CoarseDirt = 14,
+    Podzol = 15,
+    Mycelium = 16,
+    Mud = 17,
+    Sand = 18,
+    Sandstone = 19,
+    RedSand = 20,
+    RedSandstone = 21,
+    Gravel = 22,
+    Calcite = 23,
+    Cinnabar = 24,
+    Sulfur = 25,
+    SnowBlock = 26,
+    PowderSnow = 27,
+    Ice = 28,
+    PackedIce = 29,
+    Terracotta = 30,
+    WhiteTerracotta = 31,
+    OrangeTerracotta = 32,
+    YellowTerracotta = 33,
+    BrownTerracotta = 34,
+    RedTerracotta = 35,
+    LightGrayTerracotta = 36,
+}
+
+impl ParityBlock {
+    /// The `minecraft:` block id → parity block, for the surface-rule JSON's
+    /// `result_state` entries.
+    pub fn from_name(name: &str) -> Option<ParityBlock> {
+        Some(match name.strip_prefix("minecraft:").unwrap_or(name) {
+            "air" => ParityBlock::Air,
+            "stone" => ParityBlock::Stone,
+            "water" => ParityBlock::Water,
+            "lava" => ParityBlock::Lava,
+            "bedrock" => ParityBlock::Bedrock,
+            "deepslate" => ParityBlock::Deepslate,
+            "grass_block" => ParityBlock::GrassBlock,
+            "dirt" => ParityBlock::Dirt,
+            "coarse_dirt" => ParityBlock::CoarseDirt,
+            "podzol" => ParityBlock::Podzol,
+            "mycelium" => ParityBlock::Mycelium,
+            "mud" => ParityBlock::Mud,
+            "sand" => ParityBlock::Sand,
+            "sandstone" => ParityBlock::Sandstone,
+            "red_sand" => ParityBlock::RedSand,
+            "red_sandstone" => ParityBlock::RedSandstone,
+            "gravel" => ParityBlock::Gravel,
+            "calcite" => ParityBlock::Calcite,
+            "cinnabar" => ParityBlock::Cinnabar,
+            "sulfur" => ParityBlock::Sulfur,
+            "snow_block" => ParityBlock::SnowBlock,
+            "powder_snow" => ParityBlock::PowderSnow,
+            "ice" => ParityBlock::Ice,
+            "packed_ice" => ParityBlock::PackedIce,
+            "terracotta" => ParityBlock::Terracotta,
+            "white_terracotta" => ParityBlock::WhiteTerracotta,
+            "orange_terracotta" => ParityBlock::OrangeTerracotta,
+            "yellow_terracotta" => ParityBlock::YellowTerracotta,
+            "brown_terracotta" => ParityBlock::BrownTerracotta,
+            "red_terracotta" => ParityBlock::RedTerracotta,
+            "light_gray_terracotta" => ParityBlock::LightGrayTerracotta,
+            _ => return None,
+        })
+    }
+
+    /// Vanilla `BlockBehaviour.isAir` over the parity alphabet.
+    pub fn is_air(self) -> bool {
+        self == ParityBlock::Air
+    }
+
+    /// Non-empty `getFluidState` over the parity alphabet.
+    pub fn is_fluid(self) -> bool {
+        self == ParityBlock::Water || self == ParityBlock::Lava
+    }
 }
 
 /// `Aquifer.FluidStatus`.
@@ -2576,19 +2673,12 @@ mod tests {
         run_golden_fixture(include_str!("testdata/p3_golden.txt"), false, 390);
     }
 
+    /// The fixture column alphabet, indexed by `ParityBlock` discriminant —
+    /// shared verbatim with the JVM harnesses.
+    const BLOCK_ALPHABET: &str = "._~LgcCtiIBDGdepmusSrRvanfwWxXTkoybql";
+
     fn block_char(b: ParityBlock) -> char {
-        match b {
-            ParityBlock::Air => '.',
-            ParityBlock::Stone => '_',
-            ParityBlock::Water => '~',
-            ParityBlock::Lava => 'L',
-            ParityBlock::Granite => 'g',
-            ParityBlock::CopperOre => 'c',
-            ParityBlock::RawCopperBlock => 'C',
-            ParityBlock::Tuff => 't',
-            ParityBlock::DeepslateIronOre => 'i',
-            ParityBlock::RawIronBlock => 'I',
-        }
+        BLOCK_ALPHABET.as_bytes()[b as usize] as char
     }
 
     fn run_golden_fixture(fixture: &str, shape_only: bool, expected_lines: usize) {
