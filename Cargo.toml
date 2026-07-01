@@ -28,6 +28,9 @@ rand = "0.8"
 ureq = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Derive `Display`/`Error` for typed error enums (e.g. `net::crypto::AuthError`)
+# so they satisfy `std::error::Error` without hand-rolled boilerplate.
+thiserror = "2"
 
 [profile.release]
 opt-level = 3

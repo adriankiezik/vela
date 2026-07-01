@@ -200,15 +200,22 @@ pub struct ProfileProperty {
     pub signature: Option<String>,
 }
 
-#[derive(Debug)]
+/// A login-time authentication failure. Callers (`connection.rs`) branch on the
+/// variant to pick a client disconnect key; the `thiserror`-derived `Display` /
+/// `Error` impls let it also be logged via `{}` or boxed.
+#[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     /// RSA/AES failure (bad ciphertext, wrong key) — a protocol error.
+    #[error("crypto failure")]
     Crypt,
     /// The verify token the client returned did not match the one we issued.
+    #[error("verify token mismatch")]
     BadVerifyToken,
     /// The session server returned no matching profile (invalid session).
+    #[error("session unverified")]
     Unverified,
     /// The session server could not be reached.
+    #[error("auth server unavailable")]
     Unavailable,
 }
 
