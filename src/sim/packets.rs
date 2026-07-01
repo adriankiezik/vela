@@ -36,6 +36,7 @@ const CB_PLAY_LOGIN: i32 = 49;
 const CB_PLAY_MOVE_ENTITY_POS: i32 = 53;
 const CB_PLAY_MOVE_ENTITY_POS_ROT: i32 = 54;
 const CB_PLAY_MOVE_ENTITY_ROT: i32 = 56;
+const CB_PLAY_PLAYER_ABILITIES: i32 = 64;
 const CB_PLAY_PLAYER_INFO_REMOVE: i32 = 69;
 const CB_PLAY_PLAYER_INFO_UPDATE: i32 = 70;
 const CB_PLAY_PLAYER_POSITION: i32 = 72;
@@ -313,6 +314,31 @@ pub fn add_entity(
     p.write_u8(head as u8); // yHeadRot
     p.write_varint(0); // data
     frame(CB_PLAY_ADD_ENTITY, &p.buf)
+}
+
+// `ClientboundPlayerAbilitiesPacket` flag bits (`FLAG_INVULNERABLE=1`,
+// `FLAG_FLYING=2`, `FLAG_CAN_FLY=4`, `FLAG_INSTABUILD=8`).
+/// The player is currently flying.
+pub const ABILITY_FLYING: u8 = 0x02;
+/// The player is allowed to fly (double-tap jump to toggle).
+pub const ABILITY_MAY_FLY: u8 = 0x04;
+
+/// The vanilla `Abilities` base speeds (`Abilities.DEFAULT_FLYING_SPEED` /
+/// `DEFAULT_WALKING_SPEED`), which the client scales by these ability values.
+pub const BASE_FLYING_SPEED: f32 = 0.05;
+pub const BASE_WALKING_SPEED: f32 = 0.1;
+
+/// ClientboundPlayerAbilitiesPacket — the client's movement abilities. Layout
+/// (`ClientboundPlayerAbilitiesPacket.write`): a `flags` byte (bits invulnerable
+/// `0x1`, flying `0x2`, may-fly `0x4`, instabuild `0x8`), the `flyingSpeed`
+/// float, and the `walkingSpeed` (FOV/move) float. Raising the two speeds above
+/// their `0.05`/`0.1` defaults makes the player move faster.
+pub fn player_abilities(flags: u8, flying_speed: f32, walking_speed: f32) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_u8(flags);
+    p.write_f32(flying_speed);
+    p.write_f32(walking_speed);
+    frame(CB_PLAY_PLAYER_ABILITIES, &p.buf)
 }
 
 /// ClientboundRemoveEntitiesPacket — despawn entities by id.
@@ -688,6 +714,16 @@ mod tests {
         assert_eq!(r.read_varint().unwrap(), 0); // game mode = survival
         assert!(r.read_bool().unwrap()); // listed
         assert_eq!(r.read_varint().unwrap(), 0); // latency
+    }
+
+    #[test]
+    fn player_abilities_layout() {
+        let flags = ABILITY_MAY_FLY | ABILITY_FLYING;
+        let (id, mut r) = unframe(player_abilities(flags, 0.25, 0.5));
+        assert_eq!(id, CB_PLAY_PLAYER_ABILITIES);
+        assert_eq!(r.read_u8().unwrap(), 0x06); // may-fly | flying
+        assert_eq!(r.read_f32().unwrap(), 0.25); // flying speed
+        assert_eq!(r.read_f32().unwrap(), 0.5); // walking speed
     }
 
     #[test]

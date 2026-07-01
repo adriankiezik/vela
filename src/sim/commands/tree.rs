@@ -37,12 +37,17 @@ pub(super) enum Parser {
     Entity { single: bool, players_only: bool },
     /// `minecraft:gamemode` (id 42) — a game-mode keyword. Singleton: no properties.
     GameMode,
+    /// `brigadier:float` (id 1) — a float with optional min/max bounds
+    /// (`FloatArgumentInfo`): a flags byte (`0x1` has-min, `0x2` has-max) then
+    /// each present bound as a float.
+    Float { min: Option<f32>, max: Option<f32> },
 }
 
 impl Parser {
     /// Registry id from `ArgumentTypeInfos.bootstrap` registration order.
     fn id(self) -> i32 {
         match self {
+            Parser::Float { .. } => 1,
             Parser::Entity { .. } => 6,
             Parser::GameMode => 42,
             Parser::Message => 20,
@@ -61,6 +66,22 @@ impl Parser {
                     flags |= 0x2;
                 }
                 p.write_u8(flags);
+            }
+            Parser::Float { min, max } => {
+                let mut flags = 0u8;
+                if min.is_some() {
+                    flags |= 0x1;
+                }
+                if max.is_some() {
+                    flags |= 0x2;
+                }
+                p.write_u8(flags);
+                if let Some(min) = min {
+                    p.write_f32(min);
+                }
+                if let Some(max) = max {
+                    p.write_f32(max);
+                }
             }
             Parser::Message | Parser::GameMode => {} // singletons: no properties
         }
@@ -172,6 +193,22 @@ impl Tree {
         self.add_child(lit, gamemode);
         lit
     }
+
+    /// `/speed [<multiplier>]` — a bare-executable literal (resets to a default
+    /// boost) with an optional float `multiplier` child (0..=10), both executable.
+    fn speed_command(&mut self) -> usize {
+        let lit = self.push(NodeKind::Literal("speed"), true);
+        let multiplier = self.push(
+            NodeKind::Argument {
+                name: "multiplier",
+                parser: Parser::Float { min: Some(0.0), max: Some(10.0) },
+                ask_server: false,
+            },
+            true,
+        );
+        self.add_child(lit, multiplier);
+        lit
+    }
 }
 
 /// Build the full command graph: node 0 is the root, whose children are one
@@ -203,6 +240,7 @@ fn build_tree() -> Tree {
                 n
             }
             "gamemode" => t.gamemode_command(),
+            "speed" => t.speed_command(),
             _ => t.push(NodeKind::Literal(spec.name), true),
         };
         t.add_child(0, node);
@@ -314,6 +352,16 @@ mod tests {
                     let id = r.read_varint().unwrap();
                     parser_id = Some(id);
                     match id {
+                        // brigadier:float — flags byte then present min/max floats.
+                        1 => {
+                            let fl = r.read_u8().unwrap();
+                            if fl & 0x1 != 0 {
+                                r.read_f32().unwrap();
+                            }
+                            if fl & 0x2 != 0 {
+                                r.read_f32().unwrap();
+                            }
+                        }
                         6 => entity_flags = Some(r.read_u8().unwrap()),
                         20 | 42 => {}
                         other => panic!("unexpected parser id {other} in test"),
@@ -392,6 +440,21 @@ mod tests {
             assert_eq!(node.redirect, Some(msg_idx), "/{alias} -> /msg");
             assert!(node.children.is_empty());
         }
+    }
+
+    #[test]
+    fn speed_has_an_optional_float_multiplier() {
+        let nodes = decode_nodes(commands_packet());
+        let (_, speed) = find_literal(&nodes, "speed");
+        // The literal itself is executable (bare `/speed` resets the boost)...
+        assert!(speed.flags & FLAG_EXECUTABLE != 0);
+        assert_eq!(speed.children.len(), 1);
+        // ...and it has one executable float-argument child.
+        let arg = &nodes[speed.children[0]];
+        assert_eq!(arg.flags & 3, TYPE_ARGUMENT);
+        assert!(arg.flags & FLAG_EXECUTABLE != 0);
+        assert_eq!(arg.name.as_deref(), Some("multiplier"));
+        assert_eq!(arg.parser_id, Some(1)); // brigadier:float
     }
 
     #[test]

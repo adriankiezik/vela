@@ -156,6 +156,9 @@ static COMMANDS: &[Spec] = &[
 
     // --- Players -------------------------------------------------------------
     Spec::ready("gamemode", 2, handlers::cmd_gamemode), // set a player's game mode
+    // Not a vanilla command — a Vela-only debug aid, mainly for stress-testing
+    // world-generation speed (fly fast to force rapid chunk gen/streaming).
+    Spec::ready("speed", 2, handlers::cmd_speed),       // (Vela debug) boost movement speed
     Spec::pending("defaultgamemode", 2, NEEDS_PLAYERS), // set default game mode
     Spec::pending("spectate", 2, NEEDS_PLAYERS),        // spectate an entity
     Spec::pending("spawnpoint", 2, "a player spawn point"),    // set spawn point

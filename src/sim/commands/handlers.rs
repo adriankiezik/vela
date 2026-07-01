@@ -8,7 +8,7 @@ use crate::protocol::nbt::Nbt;
 
 use crate::sim::bridge::Outbound;
 use crate::sim::chat;
-use crate::sim::components::{Config, Conn, Control, PlayerId, Profile};
+use crate::sim::components::{Config, Conn, Control, Meta, PlayerId, Profile};
 use crate::sim::packets;
 use crate::sim::text;
 
@@ -241,6 +241,40 @@ pub(super) fn cmd_gamemode(world: &mut World, sender: Entity, args: &str) -> Opt
         }
     }
     None
+}
+
+/// `/speed [<multiplier>]` — **not a vanilla command.** A Vela-only debug aid
+/// whose main purpose is to stress-test world-generation speed: cranking flying
+/// speed lets a player race across the world so chunks are generated and streamed
+/// as fast as possible, surfacing terrain-gen throughput and chunk-loading
+/// bottlenecks. It scales the sender's movement speed by sending a
+/// `ClientboundPlayerAbilitiesPacket` with boosted flying + walking speeds, and
+/// grants the may-fly ability so the boosted flying speed is usable (double-tap
+/// jump to fly). `multiplier` defaults to 5 and is clamped to `0..=10`; the base
+/// speeds are the vanilla `Abilities` defaults (flying 0.05, walking 0.1).
+pub(super) fn cmd_speed(world: &mut World, sender: Entity, args: &str) -> Option<Nbt> {
+    let multiplier = args
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(5.0)
+        .clamp(0.0, 10.0);
+
+    let flying_speed = packets::BASE_FLYING_SPEED * multiplier;
+    let walking_speed = packets::BASE_WALKING_SPEED * multiplier;
+
+    // Preserve the current flying state; always grant may-fly so the boosted
+    // flight speed can be tried out even in survival.
+    let flying = world.get::<Meta>(sender).is_some_and(|m| m.flying);
+    let mut flags = packets::ABILITY_MAY_FLY;
+    if flying {
+        flags |= packets::ABILITY_FLYING;
+    }
+
+    send_to(world, sender, packets::player_abilities(flags, flying_speed, walking_speed));
+    Some(text::text(format!(
+        "Speed set to {multiplier}× (double-tap jump to fly)."
+    )))
 }
 
 /// The `GameType.getName` string for a wire id, used to build the
