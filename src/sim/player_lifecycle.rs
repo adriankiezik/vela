@@ -12,10 +12,6 @@ use super::commands;
 use super::components::*;
 use super::packets;
 
-/// Spawn column (X/Z). The Y is derived per-join from the generated surface
-/// height (see [`on_joined`]) so the player lands on top of the terrain rather
-/// than inside it.
-const SPAWN_XZ: (f64, f64) = (0.0, 0.0);
 /// Teleport id for the initial spawn synchronization; the client echoes it back
 /// via `AcceptTeleportation`.
 const SPAWN_TELEPORT_ID: i32 = 1;
@@ -44,9 +40,12 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
         next.0 += 1;
         v
     };
-    let (mut sx, mut sz) = SPAWN_XZ;
-    // The column places grass at `surface_height` with air above, so stand the
-    // player one block higher (their feet rest on top of the grass block).
+    // Choose a solid, dry spawn column from the generator rather than the fixed
+    // origin (which may be ocean under the biome/height field).
+    let spawn = crate::world::spawn_column();
+    let (mut sx, mut sz) = (spawn.0 as f64, spawn.1 as f64);
+    // The column's surface block sits at `surface_height` with air above, so stand
+    // the player one block higher (their feet rest on top of the surface block).
     let mut sy = (crate::world::surface_height(sx as i32, sz as i32) + 1) as f64;
     let mut syaw = 0.0f32;
     let mut spitch = 0.0f32;
@@ -112,7 +111,7 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
     send_world_state(world, &outbox);
 
     // Seed the loaded-chunk set to exactly the rounded view region the join just
-    // streamed, centered on the spawn chunk (derived from `SPAWN_XZ`). Using the
+    // streamed, centered on the spawn chunk (derived from the spawn column). Using the
     // same `in_view` predicate the streaming diff uses means the seeded set equals
     // what `send_join_sequence` streamed — no double-send, no gap — and the
     // streaming system (`stream_chunks`) sends only deltas as the player moves.

@@ -15,9 +15,10 @@
 //!     from the palette size (`Strategy.getConfigurationForPaletteSize`); and
 //!   * a single-entry palette omits the `data` array entirely.
 //!
-//! Vela stores block state only. Biomes are written as the single overworld
-//! biome we generate and ignored on read (the chunk store re-derives biomes),
-//! and lighting, block entities, ticks, and structures are written empty.
+//! Vela stores block state only. Biomes are written as a single representative
+//! (chunk-centre) biome per section and ignored on read — the chunk store
+//! re-derives per-column biomes deterministically from the generator — and
+//! lighting, block entities, ticks, and structures are written empty.
 
 use std::collections::HashMap;
 
@@ -27,16 +28,13 @@ use crate::registry::block_state::{describe_state, with_properties};
 
 use super::super::bitpack::{pack_bits, unpack_bits};
 use super::super::chunk_data::cell_state;
+use super::super::gen::GenChunk;
 use super::super::heightmap::compute_heightmaps;
-use super::super::{states, CELLS, COLUMNS, MIN_Y, SECTION_COUNT};
+use super::super::{states, CELLS, MIN_Y, SECTION_COUNT};
 
 /// Current world data version (`SharedConstants.WORLD_VERSION`, MC 26.2). Written
 /// as `DataVersion` so a vanilla client/server recognises the save format.
 const DATA_VERSION: i32 = 4903;
-
-/// The single biome id every generated section reports (see `super::PLAINS_BIOME`
-/// for the network index; the disk palette stores the name).
-const BIOME_NAME: &str = "minecraft:plains";
 
 /// The lowest section's Y coordinate (`minSectionY = MIN_Y / 16`), written as
 /// `yPos` and used to offset each section's `Y` byte.
@@ -48,7 +46,7 @@ const MIN_SECTION_Y: i32 = MIN_Y / 16;
 pub fn to_nbt(
     cx: i32,
     cz: i32,
-    heights: &[i32; COLUMNS],
+    gen: &GenChunk,
     edits: &HashMap<u32, BlockState>,
     game_time: i64,
 ) -> Nbt {
@@ -56,10 +54,10 @@ pub fn to_nbt(
     for section in 0..SECTION_COUNT {
         let base_y = MIN_Y + section * 16;
         let y_byte = (MIN_SECTION_Y + section) as i8;
-        sections.push(section_nbt(y_byte, base_y, heights, edits));
+        sections.push(section_nbt(y_byte, base_y, gen, edits));
     }
 
-    let maps = compute_heightmaps(heights, edits);
+    let maps = compute_heightmaps(gen, edits);
     let heightmaps = Nbt::compound(
         maps.into_iter()
             .map(|(id, longs)| (heightmap_key(id).to_string(), Nbt::LongArray(longs))),
@@ -129,7 +127,7 @@ pub fn from_nbt(nbt: &Nbt) -> Option<Vec<BlockState>> {
 fn section_nbt(
     y_byte: i8,
     base_y: i32,
-    heights: &[i32; COLUMNS],
+    gen: &GenChunk,
     edits: &HashMap<u32, BlockState>,
 ) -> Nbt {
     let mut cells = [states::AIR; CELLS];
@@ -138,7 +136,7 @@ fn section_nbt(
         for lz in 0..16i32 {
             for lx in 0..16i32 {
                 let idx = ((ly << 8) | (lz << 4) | lx) as usize;
-                cells[idx] = cell_state(heights, edits, lx, world_y, lz);
+                cells[idx] = cell_state(gen, edits, lx, world_y, lz);
             }
         }
     }
@@ -146,7 +144,7 @@ fn section_nbt(
     Nbt::compound([
         ("Y", Nbt::Byte(y_byte)),
         ("block_states", encode_block_states(&cells)),
-        ("biomes", single_value_biomes()),
+        ("biomes", single_value_biomes(gen)),
     ])
 }
 
@@ -217,10 +215,15 @@ fn decode_block_states(container: &Nbt) -> Option<[BlockState; CELLS]> {
     Some(cells)
 }
 
-/// The single-value biome container: a one-entry `palette` of the overworld
-/// biome id, no `data`.
-fn single_value_biomes() -> Nbt {
-    Nbt::compound([("palette", Nbt::List(vec![Nbt::string(BIOME_NAME)]))])
+/// A single-value biome container carrying the chunk-centre biome name. Vela
+/// re-derives per-column biomes from the generator on load (`from_nbt` ignores
+/// the stored biomes), so storing one representative biome per section is
+/// lossless for our pipeline while staying valid, readable NBT.
+fn single_value_biomes(gen: &GenChunk) -> Nbt {
+    Nbt::compound([(
+        "palette",
+        Nbt::List(vec![Nbt::string(gen.biome_name(8, 8))]),
+    )])
 }
 
 /// One block-state palette entry: `{Name}` for a propertyless block, or
@@ -279,10 +282,11 @@ fn heightmap_key(id: i32) -> &'static str {
 mod tests {
     use super::*;
     use crate::world::storage::chunk_nbt;
+    use crate::world::COLUMNS;
 
-    /// Rebuild the dense grid straight from heights+edits, in the same section /
-    /// cell order [`from_nbt`] returns — the expected value for a round-trip.
-    fn expected_grid(heights: &[i32; COLUMNS], edits: &HashMap<u32, BlockState>) -> Vec<BlockState> {
+    /// Rebuild the dense grid straight from the baseline + edits, in the same
+    /// section/cell order [`from_nbt`] returns — the expected round-trip value.
+    fn expected_grid(gen: &GenChunk, edits: &HashMap<u32, BlockState>) -> Vec<BlockState> {
         let mut grid = vec![states::AIR; (SECTION_COUNT as usize) * CELLS];
         for section in 0..SECTION_COUNT {
             let base_y = MIN_Y + section * 16;
@@ -292,7 +296,7 @@ mod tests {
                     for lx in 0..16i32 {
                         let idx = (section as usize) * CELLS
                             + ((ly << 8) | (lz << 4) | lx) as usize;
-                        grid[idx] = cell_state(heights, edits, lx, world_y, lz);
+                        grid[idx] = cell_state(gen, edits, lx, world_y, lz);
                     }
                 }
             }
@@ -313,18 +317,18 @@ mod tests {
     #[test]
     fn empty_chunk_round_trips() {
         // No edits: pure generated terrain must survive a to_nbt/from_nbt cycle.
-        let heights = super::super::super::chunk_data::chunk_heights(3, -5);
+        let gen = GenChunk::generate(3, -5);
         let edits = HashMap::new();
-        let tag = chunk_nbt::to_nbt(3, -5, &heights, &edits, 42);
+        let tag = chunk_nbt::to_nbt(3, -5, &gen, &edits, 42);
         let grid = chunk_nbt::from_nbt(&tag).expect("decode");
-        assert_eq!(grid, expected_grid(&heights, &edits));
+        assert_eq!(grid, expected_grid(&gen, &edits));
     }
 
     #[test]
     fn edited_chunk_round_trips_multi_state_sections() {
         // Place a handful of distinct blocks to force a multi-entry palette (and
         // thus a packed `data` array), then confirm the decode reproduces them.
-        let heights = super::super::super::chunk_data::chunk_heights(0, 0);
+        let gen = GenChunk::generate(0, 0);
         let mut edits = HashMap::new();
         // edit_key mirror: ((y-MIN_Y) * COLUMNS + lz*16 + lx).
         let key = |lx: i32, y: i32, lz: i32| {
@@ -335,9 +339,9 @@ mod tests {
         edits.insert(key(3, 100, 1), BlockState(85)); // bedrock
         edits.insert(key(1, 101, 1), BlockState(14)); // cobblestone
 
-        let tag = chunk_nbt::to_nbt(0, 0, &heights, &edits, 0);
+        let tag = chunk_nbt::to_nbt(0, 0, &gen, &edits, 0);
         let grid = chunk_nbt::from_nbt(&tag).expect("decode");
-        assert_eq!(grid, expected_grid(&heights, &edits));
+        assert_eq!(grid, expected_grid(&gen, &edits));
 
         // Spot-check one placed block sits where we put it.
         let section = ((100 - MIN_Y) / 16) as usize;

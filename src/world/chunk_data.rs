@@ -10,12 +10,15 @@ use tracing::warn;
 use crate::ids::BlockState;
 
 use super::encoding::encode_blob;
+use super::gen::{edit_key, surface_height, GenChunk};
 use super::heightmap::compute_heightmaps;
-use super::terrain::{state_at, surface_height};
 use super::{states, CELLS, COLUMNS, MAX_Y_EXCL, MIN_Y, SECTION_COUNT};
 
 /// Compute the 256 column surface heights for chunk `(cx, cz)`, indexed
-/// `lz * 16 + lx` to mirror the `(z << 4) | x` part of the cell index.
+/// `lz * 16 + lx` to mirror the `(z << 4) | x` part of the cell index. A
+/// convenience over [`GenChunk`] for tests and the disk round-trip that only
+/// need the height field.
+#[allow(dead_code)] // exercised by the chunk-store tests.
 pub(super) fn chunk_heights(cx: i32, cz: i32) -> [i32; COLUMNS] {
     let mut heights = [0i32; COLUMNS];
     for lz in 0..16i32 {
@@ -44,7 +47,9 @@ pub struct ChunkColumns {
 /// `ChunkColumns`. The wire cache is `None` until first streamed and is cleared
 /// on every edit so a subsequent `level_chunk` reflects the change.
 struct ChunkData {
-    heights: [i32; COLUMNS],
+    /// The deterministic generated baseline (heights, biomes, surface rule, and
+    /// generated features) this chunk is built on. Player edits override it.
+    gen: GenChunk,
     /// `edit_key(lx, y, lz)` → overriding block-state id (AIR included, so a
     /// broken surface block is represented explicitly). The key is a packed cell
     /// position (a bit-index, not a state); the value is the confusable id.
@@ -62,12 +67,12 @@ impl ChunkData {
     /// against freshly generated terrain), otherwise the chunk is pure generated
     /// terrain with no edits. Either way the chunk starts clean.
     fn new(cx: i32, cz: i32) -> Self {
-        let heights = chunk_heights(cx, cz);
+        let gen = GenChunk::generate(cx, cz);
         if let Some(grid) = super::storage::load_chunk(cx, cz) {
-            return Self::from_grid(heights, &grid);
+            return Self::from_grid(gen, &grid);
         }
         Self {
-            heights,
+            gen,
             edits: HashMap::new(),
             wire: None,
             dirty: false,
@@ -79,7 +84,7 @@ impl ChunkData {
     /// the regenerated terrain baseline becomes an edit, so the in-memory chunk
     /// reproduces the saved blocks exactly. Generation is deterministic, so a
     /// chunk saved by Vela reloads to precisely its original edit set.
-    fn from_grid(heights: [i32; COLUMNS], grid: &[BlockState]) -> Self {
+    fn from_grid(gen: GenChunk, grid: &[BlockState]) -> Self {
         let mut edits = HashMap::new();
         for section in 0..SECTION_COUNT {
             let base_y = MIN_Y + section * 16;
@@ -90,7 +95,7 @@ impl ChunkData {
                         let cell = (section as usize) * CELLS
                             + ((ly << 8) | (lz << 4) | lx) as usize;
                         let loaded = grid[cell];
-                        let generated = state_at(world_y, heights[(lz * 16 + lx) as usize]);
+                        let generated = gen.base_state(lx, world_y, lz);
                         if loaded != generated {
                             if let Some(key) = edit_key(lx, world_y, lz) {
                                 edits.insert(key, loaded);
@@ -101,7 +106,7 @@ impl ChunkData {
             }
         }
         Self {
-            heights,
+            gen,
             edits,
             wire: None,
             dirty: false,
@@ -116,7 +121,7 @@ impl ChunkData {
                 return s;
             }
         }
-        state_at(y, self.heights[(lz * 16 + lx) as usize])
+        self.gen.base_state(lx, y, lz)
     }
 
     /// Record an edit and (only on an actual change) invalidate the wire cache,
@@ -127,7 +132,7 @@ impl ChunkData {
     fn set(&mut self, lx: i32, y: i32, lz: i32, state: BlockState) -> BlockState {
         let prev = self.state(lx, y, lz);
         if let Some(key) = edit_key(lx, y, lz) {
-            let generated = state_at(y, self.heights[(lz * 16 + lx) as usize]);
+            let generated = self.gen.base_state(lx, y, lz);
             let changed = if state == generated {
                 // Back to terrain: drop the override if one existed.
                 self.edits.remove(&key).is_some()
@@ -149,9 +154,9 @@ impl ChunkData {
     fn columns(&mut self) -> Arc<ChunkColumns> {
         if self.wire.is_none() {
             self.wire = Some(Arc::new(ChunkColumns {
-                blob: encode_blob(&self.heights, &self.edits),
-                heightmaps: compute_heightmaps(&self.heights, &self.edits),
-                light: super::light::compute_light(&self.heights, &self.edits),
+                blob: encode_blob(&self.gen, &self.edits),
+                heightmaps: compute_heightmaps(&self.gen, &self.edits),
+                light: super::light::compute_light(&self.gen, &self.edits),
             }));
         }
         Arc::clone(self.wire.as_ref().expect("wire just built"))
@@ -159,10 +164,10 @@ impl ChunkData {
 }
 
 /// The block-state at local `(lx, world_y, lz)`: an edit if present, else the
-/// generated terrain state. Shared by the wire encoder and the heightmap builder,
-/// which work on raw `(heights, edits)` rather than a borrowed `ChunkData`.
+/// generated baseline. Shared by the wire encoder, heightmap builder, and light
+/// engine, which work on raw `(gen, edits)` rather than a borrowed `ChunkData`.
 pub(super) fn cell_state(
-    heights: &[i32; COLUMNS],
+    gen: &GenChunk,
     edits: &HashMap<u32, BlockState>,
     lx: i32,
     world_y: i32,
@@ -173,16 +178,7 @@ pub(super) fn cell_state(
             return s;
         }
     }
-    state_at(world_y, heights[(lz * 16 + lx) as usize])
-}
-
-/// Encode `(lx, y, lz)` into a flat per-column-stack edit key, or `None` if `y`
-/// is outside the buildable world (`MIN_Y..MAX_Y_EXCL`).
-fn edit_key(lx: i32, y: i32, lz: i32) -> Option<u32> {
-    if !(MIN_Y..MAX_Y_EXCL).contains(&y) {
-        return None;
-    }
-    Some(((y - MIN_Y) as u32) * COLUMNS as u32 + (lz as u32) * 16 + lx as u32)
+    gen.base_state(lx, world_y, lz)
 }
 
 /// Process-wide store of chunks, keyed by `(cx, cz)`. Each chunk caches its wire
@@ -245,7 +241,7 @@ pub fn save_dirty_chunks(game_time: i64) {
     let mut guard = store().lock().expect("chunk store mutex poisoned");
     for ((cx, cz), chunk) in guard.iter_mut() {
         if chunk.dirty {
-            match super::storage::save_chunk(*cx, *cz, &chunk.heights, &chunk.edits, game_time) {
+            match super::storage::save_chunk(*cx, *cz, &chunk.gen, &chunk.edits, game_time) {
                 // Only clear the dirty flag once the write succeeds; on failure
                 // leave it set so the next autosave retries rather than dropping
                 // the edit.
@@ -268,12 +264,12 @@ mod tests {
     /// Build the wire columns for a chunk from its generated heights with no
     /// edits — the pre-mutable-world `generate`, kept for the encoding tests.
     fn generate(cx: i32, cz: i32) -> ChunkColumns {
-        let heights = chunk_heights(cx, cz);
+        let gen = GenChunk::generate(cx, cz);
         let edits = HashMap::new();
         ChunkColumns {
-            blob: encode_blob(&heights, &edits),
-            heightmaps: compute_heightmaps(&heights, &edits),
-            light: crate::world::light::compute_light(&heights, &edits),
+            blob: encode_blob(&gen, &edits),
+            heightmaps: compute_heightmaps(&gen, &edits),
+            light: crate::world::light::compute_light(&gen, &edits),
         }
     }
 
@@ -333,8 +329,9 @@ mod tests {
 
     #[test]
     fn set_block_returns_previous_and_reads_back() {
-        // Use a far-away column so other tests' edits can't interfere.
-        let (x, y, z) = (10_000, 100, 10_000);
+        // Use a far-away column so other tests' edits can't interfere; y is well
+        // above any generated terrain, tree, or feature so it starts as air.
+        let (x, y, z) = (10_000, 250, 10_000);
         // Above the surface here is air; place stone, then read it back.
         assert_eq!(block_state_at(x, y, z), states::AIR);
         let prev = set_block(x, y, z, states::STONE);
@@ -348,12 +345,14 @@ mod tests {
 
     #[test]
     fn breaking_surface_block_is_reflected() {
-        // Break the generated surface grass at a column and confirm it reads air.
+        // Break the generated surface block at a column (whatever the biome makes
+        // it) and confirm the break reads back as air.
         let (wx, wz) = (10_016, 10_048);
         let h = surface_height(wx, wz);
-        assert_eq!(block_state_at(wx, h, wz), states::GRASS_BLOCK);
+        let top = block_state_at(wx, h, wz);
+        assert_ne!(top, states::AIR, "the surface cell should be solid ground");
         let prev = set_block(wx, h, wz, states::AIR);
-        assert_eq!(prev, states::GRASS_BLOCK);
+        assert_eq!(prev, top);
         assert_eq!(block_state_at(wx, h, wz), states::AIR);
     }
 
@@ -386,7 +385,9 @@ mod tests {
         let (lx, lz) = (2, 3);
         let (wx, wz) = (cx * 16 + lx, cz * 16 + lz);
         let surface = surface_height(wx, wz);
-        let place_y = surface + 5; // a floating block, air between
+        // Place well above sea level and any tree canopy so the stone is
+        // unambiguously the topmost block in its column.
+        let place_y = surface.max(crate::world::SURFACE_Y) + 30;
         set_block(wx, place_y, wz, states::STONE);
         let cols = chunk_columns(cx, cz);
         // Unpack the column's WORLD_SURFACE value (9-bit, 7 per long).
@@ -406,13 +407,15 @@ mod tests {
         let (cx, cz) = (4_242, -4_242);
         let (lx, lz) = (5, 6);
         let (wx, wz) = (cx * 16 + lx, cz * 16 + lz);
-        let h = surface_height(wx, wz);
-        let generated = block_state_at(wx, h, wz); // grass surface
-        set_block(wx, h, wz, states::STONE);
+        // Pick a cell well above the surface (and any tree) so the generated
+        // baseline is unambiguously air, distinct from the stone we place.
+        let y = surface_height(wx, wz).max(crate::world::SURFACE_Y) + 40;
+        let generated = block_state_at(wx, y, wz); // air above the terrain
+        set_block(wx, y, wz, states::STONE);
         with_chunk(cx, cz, |c| assert_eq!(c.edits.len(), 1));
         // Back to the generated state: override is dropped, not stored.
-        set_block(wx, h, wz, generated);
+        set_block(wx, y, wz, generated);
         with_chunk(cx, cz, |c| assert!(c.edits.is_empty()));
-        assert_eq!(block_state_at(wx, h, wz), generated);
+        assert_eq!(block_state_at(wx, y, wz), generated);
     }
 }
