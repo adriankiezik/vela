@@ -44,26 +44,8 @@ impl BlockState {
     }
 }
 
-impl From<i32> for ItemId {
-    fn from(id: i32) -> Self {
-        ItemId(id)
-    }
-}
-
-impl From<ItemId> for i32 {
-    fn from(id: ItemId) -> Self {
-        id.0
-    }
-}
-
 impl From<u32> for BlockState {
     fn from(state: u32) -> Self {
         BlockState(state)
-    }
-}
-
-impl From<BlockState> for u32 {
-    fn from(state: BlockState) -> Self {
-        state.0
     }
 }

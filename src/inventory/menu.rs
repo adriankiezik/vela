@@ -42,11 +42,13 @@ pub enum ClickType {
     PickupAll,
 }
 
-impl From<i32> for ClickType {
-    /// Decode the wire ordinal. Out-of-range values fall back to `Pickup`,
-    /// matching `ContainerInput`'s `ByIdMap.continuous(..., ZERO)` strategy — the
-    /// decode is total, so this is `From`, not `TryFrom`.
-    fn from(id: i32) -> ClickType {
+impl ClickType {
+    /// Decode the wire ordinal from a `ServerboundContainerClickPacket`.
+    /// Out-of-range values fall back to `Pickup`, matching `ContainerInput`'s
+    /// `ByIdMap.continuous(..., ZERO)` strategy — the decode is total, so this is
+    /// an infallible constructor rather than a `TryFrom`. The lossy fallback is why
+    /// it's a named `from_wire` and not an `impl From<i32>`.
+    pub fn from_wire(id: i32) -> ClickType {
         match id {
             0 => ClickType::Pickup,
             1 => ClickType::QuickMove,

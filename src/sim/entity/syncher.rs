@@ -102,6 +102,10 @@ pub struct DataItem {
     /// order down the entity class hierarchy (`Entity` uses 0..=7).
     pub index: u8,
     pub value: DataValue,
+    /// Whether this binding changed since the last `pack_dirty`
+    /// (`SynchedEntityData.DataItem.dirty`). A freshly-set item is dirty until
+    /// the next incremental flush emits it.
+    dirty: bool,
 }
 
 /// An entity's synchronized data — the list of accessor bindings that
@@ -123,11 +127,18 @@ impl EntityData {
     }
 
     /// Set an accessor's value, replacing any existing binding at that index.
-    /// Returns `&mut self` so bindings can be chained at construction.
+    /// Marks the binding dirty only when the value actually changes (matching
+    /// `SynchedEntityData.set`, which compares before flagging), so an unchanged
+    /// re-set produces no incremental update. Returns `&mut self` for chaining.
     pub fn set(&mut self, index: u8, value: DataValue) -> &mut Self {
         match self.items.iter_mut().find(|it| it.index == index) {
-            Some(it) => it.value = value,
-            None => self.items.push(DataItem { index, value }),
+            Some(it) => {
+                if it.value != value {
+                    it.value = value;
+                    it.dirty = true;
+                }
+            }
+            None => self.items.push(DataItem { index, value, dirty: true }),
         }
         self
     }
@@ -142,17 +153,61 @@ impl EntityData {
         &self.items
     }
 
-    /// Write the packed metadata list into `p`: each binding as `index` (u8) +
-    /// `serializer_id` (VarInt) + value, then the `0xFF` terminator. This is the
-    /// body of `ClientboundSetEntityDataPacket` after the entity id.
+    /// Write the full packed metadata list into `p`: every binding as `index`
+    /// (u8) + `serializer_id` (VarInt) + value, then the `0xFF` terminator. This
+    /// is the spawn/join-replay body of `ClientboundSetEntityDataPacket` after the
+    /// entity id — vanilla `getNonDefaultValues` packed in full (a "pack all").
+    /// It leaves dirty flags untouched; use [`Self::write_dirty`] for incremental
+    /// updates.
     pub fn write_packed(&self, p: &mut PacketWriter) {
-        for it in &self.items {
-            p.write_u8(it.index);
-            p.write_varint(it.value.serializer_id());
-            it.value.encode(p);
+        write_items(self.items.iter(), p);
+    }
+
+    /// Emit only the bindings changed since the last flush and clear their dirty
+    /// flags (`SynchedEntityData.packDirty` semantics), returning the emitted
+    /// entries. An incremental `ClientboundSetEntityDataPacket` should be sent
+    /// only when the result is non-empty. Note this is *not* wired into any tick
+    /// loop yet — it's the ready-to-use API for post-spawn metadata updates.
+    pub fn pack_dirty(&mut self) -> Vec<DataItem> {
+        let mut out = Vec::new();
+        for it in self.items.iter_mut() {
+            if it.dirty {
+                it.dirty = false;
+                out.push(it.clone());
+            }
+        }
+        out
+    }
+
+    /// Like [`Self::pack_dirty`], but writes the changed bindings straight into
+    /// `p` as the `ClientboundSetEntityDataPacket` body (packed entries + `0xFF`
+    /// terminator) and clears their dirty flags. Returns whether anything was
+    /// emitted, so the caller can skip sending an empty update.
+    pub fn write_dirty(&mut self, p: &mut PacketWriter) -> bool {
+        let mut any = false;
+        for it in self.items.iter_mut() {
+            if it.dirty {
+                it.dirty = false;
+                p.write_u8(it.index);
+                p.write_varint(it.value.serializer_id());
+                it.value.encode(p);
+                any = true;
+            }
         }
         p.write_u8(EOF_MARKER);
+        any
     }
+}
+
+/// Shared body writer: packed entries (`index` + `serializer_id` + value) then
+/// the `0xFF` terminator.
+fn write_items<'a>(items: impl Iterator<Item = &'a DataItem>, p: &mut PacketWriter) {
+    for it in items {
+        p.write_u8(it.index);
+        p.write_varint(it.value.serializer_id());
+        it.value.encode(p);
+    }
+    p.write_u8(EOF_MARKER);
 }
 
 #[cfg(test)]
@@ -245,6 +300,53 @@ mod tests {
         data.set(8, DataValue::Int(1)).set(8, DataValue::Int(2));
         assert_eq!(data.items().len(), 1);
         assert_eq!(data.items()[0].value, DataValue::Int(2));
+    }
+
+    #[test]
+    fn pack_dirty_emits_then_clears() {
+        let mut data = EntityData::new();
+        data.set(0, DataValue::Byte(0x0A))
+            .set(8, DataValue::Int(7));
+
+        // A freshly-set binding is dirty and packs once.
+        let dirty = data.pack_dirty();
+        assert_eq!(dirty.len(), 2);
+        assert_eq!(dirty[0].index, 0);
+        assert_eq!(dirty[0].value, DataValue::Byte(0x0A));
+        assert_eq!(dirty[1].index, 8);
+        assert_eq!(dirty[1].value, DataValue::Int(7));
+
+        // Flags cleared: a second flush with no further changes emits nothing.
+        assert!(data.pack_dirty().is_empty());
+
+        // Re-setting the same value stays clean; a real change re-dirties only it.
+        data.set(8, DataValue::Int(7));
+        assert!(data.pack_dirty().is_empty());
+        data.set(8, DataValue::Int(9));
+        let dirty = data.pack_dirty();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].index, 8);
+        assert_eq!(dirty[0].value, DataValue::Int(9));
+        assert!(data.pack_dirty().is_empty());
+    }
+
+    #[test]
+    fn write_dirty_reports_and_clears() {
+        let mut data = EntityData::new();
+        data.set(6, DataValue::Pose(5));
+
+        let mut p = PacketWriter::new();
+        assert!(data.write_dirty(&mut p)); // emitted the one dirty entry
+        let mut r = PacketReader::new(Bytes::from(p.buf.to_vec()));
+        assert_eq!(r.read_u8().unwrap(), 6);
+        assert_eq!(r.read_varint().unwrap(), SERIALIZER_POSE);
+        assert_eq!(r.read_varint().unwrap(), 5);
+        assert_eq!(r.read_u8().unwrap(), EOF_MARKER);
+
+        // Nothing left dirty: still writes the terminator, but reports false.
+        let mut p2 = PacketWriter::new();
+        assert!(!data.write_dirty(&mut p2));
+        assert_eq!(&p2.buf[..], &[EOF_MARKER]);
     }
 
     #[test]

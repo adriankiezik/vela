@@ -322,7 +322,7 @@ fn on_container_click(
 ) {
     use crate::inventory::{ClickType, Menu, OpenContainer};
 
-    let click = ClickType::from(mode);
+    let click = ClickType::from_wire(mode);
     // Snapshot the inventory (and drag state) up front so we can build the menu
     // without holding a borrow across the menu run.
     let (slots, carried, drag_status, drag_type, drag_slots) = {

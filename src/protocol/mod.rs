@@ -37,16 +37,21 @@ pub enum Intent {
     Transfer,
 }
 
+/// The error from [`Intent::try_from`]: the handshake carried an intent id
+/// outside the known `STATUS`/`LOGIN`/`TRANSFER` range. Carries the bad value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownIntent(pub i32);
+
 impl TryFrom<i32> for Intent {
-    type Error = ();
+    type Error = UnknownIntent;
 
     /// Decode the handshake intent id; an out-of-range value is the sole error.
-    fn try_from(id: i32) -> Result<Self, ()> {
+    fn try_from(id: i32) -> Result<Self, UnknownIntent> {
         match id {
             1 => Ok(Intent::Status),
             2 => Ok(Intent::Login),
             3 => Ok(Intent::Transfer),
-            _ => Err(()),
+            _ => Err(UnknownIntent(id)),
         }
     }
 }

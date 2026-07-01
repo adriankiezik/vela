@@ -88,7 +88,8 @@ mod tests {
     #[test]
     fn add_entity_generic_layout() {
         let uuid = Uuid::from_u128(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10);
-        // type 72 = minecraft:item in the 26.2 entity_type registry.
+        // 72 is an arbitrary entity type id for this layout test; the real
+        // dropped-item type is ENTITY_TYPE_ITEM = 71 in the 26.2 registry.
         let (id, mut r) = unframe(add_entity(9, uuid, 72, (1.0, 64.0, -2.0), 0, 0, 0, 0));
         assert_eq!(id, CB_PLAY_ADD_ENTITY);
         assert_eq!(r.read_varint().unwrap(), 9); // entity id
