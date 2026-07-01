@@ -14,12 +14,14 @@
 
 mod biome;
 mod blocks;
+pub mod density;
 mod feature;
 mod noise;
 pub mod random;
 mod rng;
 pub mod synth;
 mod surface;
+pub mod vanilla_jsons;
 
 use std::sync::OnceLock;
 

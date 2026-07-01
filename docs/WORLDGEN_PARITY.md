@@ -4,6 +4,33 @@ What Vela must implement so that, for a given seed, generated chunks are
 block-for-block and biome-for-biome identical to a vanilla 26.2 server.
 Reference decompile: `C:\Users\kiezi\mc-decompile\src-server`.
 
+## Progress
+
+| Milestone | Status | Where |
+|---|---|---|
+| **P0 — RNG foundation** | **done** | `src/world/gen/random.rs`: Xoroshiro128++, Stafford-mix13 seed upgrade, MD5 `seedFromHashOf`, `Mth.getSeed`, both `RandomSource` algorithms + positional factories, `WorldgenRandom` with all four seed setters. 13 golden tests vs JVM reference values. |
+| **P1 — Noise primitives** | **done** | `src/world/gen/synth.rs`: `ImprovedNoise` (incl. smear/fudge variant), `PerlinNoise` (new + legacy init), `NormalNoise`, `BlendedNoise`. 6 golden tests vs JVM reference values at overworld parameters. |
+| **P2 — Density engine + router + fill** | **done** | `src/world/gen/density.rs`: full density-function node graph (JSON-codec-driven from the vendored datapack under `data/minecraft/worldgen/`, embedded via `src/world/gen/vanilla_jsons.rs`), exact min/max propagation + constant folding, `CubicSpline` in f32, `RandomState` noise wiring, `NoiseChunk` cache wrappers (`Interpolated`/`FlatCache`/`Cache2D`/`CacheOnce`/`CacheAllInCell`) with counter/fill-array semantics, `doFill` with the disabled-aquifer filler. Golden fixture (`testdata/p2_golden.txt`, 390 checks from a JVM harness on the real 26.2 server classes): all 15 router outputs bit-exact at 8 positions × 3 seeds; full-chunk fill digests, columns, and preliminary surface levels exact for 2 chunks × 3 seeds. Terrain *shape* now matches vanilla seed-for-seed (with aquifers/veins off, pending P3). |
+| **P3 — Aquifers + ore veins** | **next** | `Aquifer.NoiseBasedAquifer` (grid cells, 3-nearest similarity blending, barrier pressure, fluid levels), `OreVeinifier`; then flip `aquifers_enabled`/`ore_veins_enabled` to the vanilla-true settings and refresh the golden fixture. |
+| P4 — Climate/biomes (RTree, parameter list) | pending | |
+| P5 — Surface rules | pending | |
+| P6 — Staged chunk pipeline | pending | |
+| P7 — Carvers | pending | |
+| P8 — Features/decoration | pending | |
+| P9 — Structures | pending | |
+
+Golden values are produced by transcription harnesses run on a local JVM
+(kept outside the repo); only the resulting constants live in the Rust tests.
+Since P2 the harness compiles directly against the (unobfuscated) 26.2 server
+classes and its dump is committed as a test fixture. End-to-end `.mca` diffing
+against a real vanilla server becomes possible at P2 (see "Verification
+strategy").
+
+Since P2 the vanilla built-in datapack's worldgen JSON (dumped via the
+official data generator, per "Data extraction" below) is vendored under
+`data/minecraft/worldgen/` and embedded at compile time — the engine is
+data-driven rather than a transcription of `NoiseRouterData`.
+
 ## Where we stand
 
 Vela's current generator (`src/world/gen/`) is an intentional approximation
