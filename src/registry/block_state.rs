@@ -1260,6 +1260,27 @@ pub fn block_of_state(state_id: u32) -> Option<i32> {
     Some(idx as i32)
 }
 
+/// Describe a global state id as `(block name, [(property, value), …])` — the
+/// exact shape the Anvil chunk NBT palette stores each entry as (`{Name,
+/// Properties}` in `SerializableChunkData`). Properties are listed in the block's
+/// definition order, each carrying the value this state selects. Returns `None`
+/// for an out-of-range id.
+pub fn describe_state(state_id: u32) -> Option<(&'static str, Vec<(&'static str, &'static str)>)> {
+    let block = block_of_state(state_id)? as usize;
+    let name = super::builtin::BLOCK.name_of(block as i32)?;
+    let b = &STATES[block];
+    let mut offset = state_id - b.base;
+    let mut stride: u32 = b.count as u32;
+    let mut props = Vec::with_capacity(b.properties.len());
+    for p in b.properties {
+        stride /= p.values.len() as u32;
+        let index = (offset / stride) as usize % p.values.len();
+        props.push((p.name, p.values[index]));
+        offset %= stride;
+    }
+    Some((name, props))
+}
+
 /// Decode one property's value for a state id, e.g. `facing` of a stair state.
 #[allow(dead_code)]
 pub fn property_value(state_id: u32, property: &str) -> Option<&'static str> {
@@ -1324,6 +1345,28 @@ mod tests {
         assert_eq!(block_of_state(9), BLOCK.id_of("minecraft:grass_block"));
         assert_eq!(default_state_of("minecraft:not_a_block"), None);
         assert_eq!(block_of_state(TOTAL_STATES), None);
+    }
+
+    #[test]
+    fn describe_state_round_trips_through_with_properties() {
+        // A propertyless block: name only, no properties.
+        let (name, props) = describe_state(1).unwrap();
+        assert_eq!(name, "minecraft:stone");
+        assert!(props.is_empty());
+
+        // grass_block default (snowy=false) describes with its one property, and
+        // feeding that description back to with_properties recovers the id.
+        let (name, props) = describe_state(9).unwrap();
+        assert_eq!(name, "minecraft:grass_block");
+        assert_eq!(props, vec![("snowy", "false")]);
+        assert_eq!(with_properties(name, &props), Some(9));
+
+        // A multi-property block round-trips every state exactly.
+        let door = with_properties("minecraft:oak_door", &[("facing", "west"), ("open", "true")]).unwrap();
+        let (name, props) = describe_state(door).unwrap();
+        assert_eq!(with_properties(name, &props), Some(door));
+
+        assert_eq!(describe_state(TOTAL_STATES), None);
     }
 
     #[test]

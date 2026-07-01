@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::encoding::encode_blob;
 use super::heightmap::compute_heightmaps;
 use super::terrain::{state_at, surface_height};
-use super::{states, COLUMNS, MAX_Y_EXCL, MIN_Y};
+use super::{states, CELLS, COLUMNS, MAX_Y_EXCL, MIN_Y, SECTION_COUNT};
 
 /// Compute the 256 column surface heights for chunk `(cx, cz)`, indexed
 /// `lz * 16 + lx` to mirror the `(z << 4) | x` part of the cell index.
@@ -41,14 +41,61 @@ struct ChunkData {
     /// broken surface block is represented explicitly).
     edits: HashMap<u32, u32>,
     wire: Option<Arc<ChunkColumns>>,
+    /// Set when an edit changed a cell since the last save; drives which chunks
+    /// [`save_dirty_chunks`] persists. A freshly generated or just-loaded chunk
+    /// is clean (already matches, or already on, disk).
+    dirty: bool,
 }
 
 impl ChunkData {
+    /// Generate or load chunk `(cx, cz)` on first touch: if a saved payload
+    /// exists on disk it is decoded into edits (the diff of the stored blocks
+    /// against freshly generated terrain), otherwise the chunk is pure generated
+    /// terrain with no edits. Either way the chunk starts clean.
     fn new(cx: i32, cz: i32) -> Self {
+        let heights = chunk_heights(cx, cz);
+        if let Some(grid) = super::storage::load_chunk(cx, cz) {
+            return Self::from_grid(heights, &grid);
+        }
         Self {
-            heights: chunk_heights(cx, cz),
+            heights,
             edits: HashMap::new(),
             wire: None,
+            dirty: false,
+        }
+    }
+
+    /// Reconstruct a chunk from a loaded dense block grid (indexed
+    /// `section * CELLS + (ly << 8 | lz << 4 | lx)`). Every cell that differs from
+    /// the regenerated terrain baseline becomes an edit, so the in-memory chunk
+    /// reproduces the saved blocks exactly. Generation is deterministic, so a
+    /// chunk saved by Vela reloads to precisely its original edit set.
+    fn from_grid(heights: [i32; COLUMNS], grid: &[u32]) -> Self {
+        let mut edits = HashMap::new();
+        for section in 0..SECTION_COUNT {
+            let base_y = MIN_Y + section * 16;
+            for ly in 0..16i32 {
+                let world_y = base_y + ly;
+                for lz in 0..16i32 {
+                    for lx in 0..16i32 {
+                        let cell = (section as usize) * CELLS
+                            + ((ly << 8) | (lz << 4) | lx) as usize;
+                        let loaded = grid[cell];
+                        let generated = state_at(world_y, heights[(lz * 16 + lx) as usize]);
+                        if loaded != generated {
+                            if let Some(key) = edit_key(lx, world_y, lz) {
+                                edits.insert(key, loaded);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            heights,
+            edits,
+            wire: None,
+            dirty: false,
         }
     }
 
@@ -83,6 +130,7 @@ impl ChunkData {
             };
             if changed {
                 self.wire = None;
+                self.dirty = true;
             }
         }
         prev
@@ -174,6 +222,25 @@ pub fn set_block(x: i32, y: i32, z: i32, state: u32) -> u32 {
     let (cx, cz) = (x >> 4, z >> 4);
     let (lx, lz) = (x & 15, z & 15);
     with_chunk(cx, cz, |c| c.set(lx, y, lz, state))
+}
+
+/// Persist every chunk edited since the last save, stamping each with
+/// `game_time` as its `LastUpdate`, then flush the region files. A no-op when
+/// persistence is disabled (`storage::save_chunk`/`flush` short-circuit). Called
+/// periodically and on shutdown by the simulation.
+pub fn save_dirty_chunks(game_time: i64) {
+    if !super::storage::is_enabled() {
+        return;
+    }
+    let mut guard = store().lock().expect("chunk store mutex poisoned");
+    for ((cx, cz), chunk) in guard.iter_mut() {
+        if chunk.dirty {
+            super::storage::save_chunk(*cx, *cz, &chunk.heights, &chunk.edits, game_time);
+            chunk.dirty = false;
+        }
+    }
+    drop(guard);
+    super::storage::flush();
 }
 
 #[cfg(test)]

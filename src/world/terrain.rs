@@ -8,8 +8,11 @@
 use super::{states, MIN_Y, SURFACE_Y};
 
 /// Fixed world seed. We do not thread the server.properties seed through here —
-/// a constant keeps generation deterministic and reproducible.
-const SEED: u32 = 0x5EED_C0DE;
+/// a constant keeps generation deterministic and reproducible. Exposed so
+/// `level.dat` can persist the seed the world was generated with (loading a saved
+/// seed back into the generator is out of scope — generation stays deterministic
+/// on this constant).
+pub const SEED: u32 = 0x5EED_C0DE;
 
 /// Lowest possible surface height the generator will emit.
 const HEIGHT_MIN: i32 = 56;

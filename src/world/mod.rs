@@ -24,11 +24,12 @@ mod block_item;
 mod chunk_data;
 mod encoding;
 mod heightmap;
+pub mod storage;
 mod terrain;
 
 pub use block_item::block_state_for_item;
-pub use chunk_data::{block_state_at, chunk_columns, set_block};
-pub use terrain::surface_height;
+pub use chunk_data::{block_state_at, chunk_columns, save_dirty_chunks, set_block};
+pub use terrain::{surface_height, SEED};
 
 // The wire-columns type is reached through `chunk_columns`' return value rather
 // than named directly, but stays part of the public API surface.

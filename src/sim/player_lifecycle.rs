@@ -44,16 +44,35 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
         next.0 += 1;
         v
     };
-    let (sx, sz) = SPAWN_XZ;
+    let (mut sx, mut sz) = SPAWN_XZ;
     // The column places grass at `surface_height` with air above, so stand the
     // player one block higher (their feet rest on top of the grass block).
-    let sy = (crate::world::surface_height(sx as i32, sz as i32) + 1) as f64;
+    let mut sy = (crate::world::surface_height(sx as i32, sz as i32) + 1) as f64;
+    let mut syaw = 0.0f32;
+    let mut spitch = 0.0f32;
+    let mut son_ground = false;
+    // Restore a returning player's saved position/orientation, if any. A read
+    // error is logged and the fresh-spawn defaults above are kept.
+    if let Some(dir) = crate::world::storage::player_data_dir() {
+        match crate::world::storage::PlayerData::load(&dir, id) {
+            Ok(Some(pd)) => {
+                sx = pd.x;
+                sy = pd.y;
+                sz = pd.z;
+                syaw = pd.yaw;
+                spitch = pd.pitch;
+                son_ground = pd.on_ground;
+            }
+            Ok(None) => {}
+            Err(e) => warn!(%name, error = %e, "failed to read player data; spawning fresh"),
+        }
+    }
     let join = world.resource::<Config>().join_params();
 
     // The whole join sequence flows through the outbox. If it overflows mid-burst
     // (slow or hostile client) drop the connection rather than register a player
     // who never received the world.
-    if !send_join_sequence(&outbox, entity_id, sx, sy, sz, &join) {
+    if !send_join_sequence(&outbox, entity_id, sx, sy, sz, syaw, spitch, &join) {
         warn!(%name, "outbox full during join sequence; dropping");
         let _ = outbox.try_send(Outbound::Close);
         return;
@@ -152,7 +171,16 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
         uuid: id,
         name: name.clone(),
     }]);
-    let newcomer_spawn = packets::add_entity(entity_id, id, (sx, sy, sz), 0, 0, 0);
+    let packed_yaw = packets::pack_angle(syaw);
+    let packed_pitch = packets::pack_angle(spitch);
+    let newcomer_spawn = packets::add_entity(
+        entity_id,
+        id,
+        (sx, sy, sz),
+        packed_yaw,
+        packed_pitch,
+        packed_yaw,
+    );
     // A fresh join is neither sneaking nor sprinting, but send the metadata for
     // parity with the existing-player path (and so the pose is explicitly reset).
     let newcomer_meta = packets::set_entity_data(entity_id, false, false);
@@ -170,18 +198,18 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
                 x: sx,
                 y: sy,
                 z: sz,
-                yaw: 0.0,
-                pitch: 0.0,
-                on_ground: false,
+                yaw: syaw,
+                pitch: spitch,
+                on_ground: son_ground,
             },
             Tracking {
                 base_x: sx,
                 base_y: sy,
                 base_z: sz,
-                yaw: 0,
-                pitch: 0,
-                head: 0,
-                on_ground: false,
+                yaw: packed_yaw,
+                pitch: packed_pitch,
+                head: packed_yaw,
+                on_ground: son_ground,
                 teleport_delay: 0,
                 tick_count: 0,
             },
@@ -204,12 +232,15 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
 /// Build and push the join sequence. Ordering matters: the GameEvent puts the
 /// client in its "waiting for chunks" state, the chunks satisfy that wait, then
 /// the teleport settles the player. Returns `false` if any send fails.
+#[allow(clippy::too_many_arguments)]
 fn send_join_sequence(
     outbox: &OutboxTx,
     entity_id: i32,
     sx: f64,
     sy: f64,
     sz: f64,
+    syaw: f32,
+    spitch: f32,
     join: &packets::JoinParams,
 ) -> bool {
     let mut ok = send(outbox, packets::play_login(entity_id, join));
@@ -236,7 +267,7 @@ fn send_join_sequence(
     }
     ok &= send(
         outbox,
-        packets::player_position(SPAWN_TELEPORT_ID, sx, sy, sz),
+        packets::player_position(SPAWN_TELEPORT_ID, sx, sy, sz, syaw, spitch),
     );
     ok
 }
@@ -276,6 +307,7 @@ pub(super) fn on_left(world: &mut World, id: Uuid) {
     let entity = world.resource_mut::<PlayerIndex>().0.remove(&id);
     if let Some(e) = entity {
         let profile = world.get::<Profile>(e).map(|p| (p.name.clone(), p.entity_id));
+        save_player_data(world, e, id);
         world.despawn(e);
         if let Some((name, entity_id)) = profile {
             // Drop the leaver from every remaining client's tab list and world.
@@ -288,6 +320,35 @@ pub(super) fn on_left(world: &mut World, id: Uuid) {
             }
             info!(%name, "left");
         }
+    }
+}
+
+/// Persist a leaving player's position, orientation, and held slot to
+/// `playerdata/<uuid>.dat`. A no-op when persistence is disabled. The held slot
+/// comes from the player's `Inventory` if one was attached this session (else 0);
+/// the full inventory round-trip is deferred.
+fn save_player_data(world: &World, entity: Entity, id: Uuid) {
+    let Some(dir) = crate::world::storage::player_data_dir() else {
+        return;
+    };
+    let Some(pos) = world.get::<Pos>(entity) else {
+        return;
+    };
+    let selected_slot = world
+        .get::<crate::inventory::Inventory>(entity)
+        .map(|inv| inv.selected as i32)
+        .unwrap_or(0);
+    let data = crate::world::storage::PlayerData {
+        x: pos.x,
+        y: pos.y,
+        z: pos.z,
+        yaw: pos.yaw,
+        pitch: pos.pitch,
+        on_ground: pos.on_ground,
+        selected_slot,
+    };
+    if let Err(e) = data.save(&dir, id) {
+        warn!(error = %e, "failed to save player data");
     }
 }
 

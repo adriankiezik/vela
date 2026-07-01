@@ -90,6 +90,48 @@ impl Default for GameRules {
     }
 }
 
+impl GameRules {
+    /// The rules as `(id, value-string)` pairs for `level.dat`, using the 26.2
+    /// registry ids and vanilla's string serialization (booleans as `true`/`false`,
+    /// integers in decimal — `GameRule.serialize`).
+    pub fn to_saved(self) -> Vec<(String, String)> {
+        vec![
+            ("advance_time".into(), self.advance_time.to_string()),
+            ("advance_weather".into(), self.advance_weather.to_string()),
+            ("keep_inventory".into(), self.keep_inventory.to_string()),
+            ("spawn_monsters".into(), self.spawn_monsters.to_string()),
+            ("random_tick_speed".into(), self.random_tick_speed.to_string()),
+        ]
+    }
+
+    /// Overwrite the rules we model from a saved `(id, value)` list; unknown ids
+    /// and unparsable values are ignored (the rule keeps its current value).
+    pub fn apply_saved(&mut self, saved: &[(String, String)]) {
+        for (id, value) in saved {
+            match id.as_str() {
+                "advance_time" => set_bool(&mut self.advance_time, value),
+                "advance_weather" => set_bool(&mut self.advance_weather, value),
+                "keep_inventory" => set_bool(&mut self.keep_inventory, value),
+                "spawn_monsters" => set_bool(&mut self.spawn_monsters, value),
+                "random_tick_speed" => {
+                    if let Ok(v) = value.parse() {
+                        self.random_tick_speed = v;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Parse a saved boolean rule value into `slot`, leaving it unchanged if the
+/// string is neither `true` nor `false`.
+fn set_bool(slot: &mut bool, value: &str) {
+    if let Ok(v) = value.parse() {
+        *slot = v;
+    }
+}
+
 /// The world clock. `game_time` is the always-advancing world age; the remaining
 /// fields are the overworld clock's `ClockNetworkState` (`day_time` == totalTicks).
 #[derive(Resource)]
