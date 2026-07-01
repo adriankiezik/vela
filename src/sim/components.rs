@@ -232,8 +232,16 @@ impl ChunkSender {
     /// nearest-first order and only for columns *newly* entering the loaded set,
     /// so `pending` stays duplicate-free without a membership scan (the loaded set
     /// is the dedup gate — see `stream_chunks`).
+    ///
+    /// Also hands the column to the background prefetch pool so it is
+    /// generated, lit, and encoded off the simulation thread by the time the
+    /// batch pacer reaches it (see `send_queued_chunks`' readiness gate).
     pub fn mark_pending(&mut self, coord: (i32, i32)) {
         self.pending.push(coord);
+        // Unit tests drive mark_pending with synthetic coordinates; don't spin
+        // up worker threads generating real chunks there.
+        #[cfg(not(test))]
+        crate::world::prefetch([coord]);
     }
 
     /// `dropChunk`'s pending half: remove a column that left view before it was
@@ -275,7 +283,26 @@ impl ChunkSender {
     /// non-empty return the batch is already accounted — the outstanding count is
     /// incremented and the quota debited by the batch size — exactly as vanilla
     /// does after emitting the start/finished frames.
+    /// Ungated form, kept for the flow-control unit tests (the live send path
+    /// always gates on wire readiness).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn next_batch(&mut self) -> Vec<(i32, i32)> {
+        self.next_batch_ready(|_| true)
+    }
+
+    /// [`next_batch`](Self::next_batch) with a readiness gate: the batch takes
+    /// the longest *ready* prefix of the pending queue (stopping at the first
+    /// cold column preserves strict nearest-first delivery). When the head is
+    /// cold nothing is taken and nothing is accounted — the quota keeps
+    /// accumulating and the batch goes out a tick or two later once the
+    /// prefetch workers have warmed it.
+    ///
+    /// Documented deviation: vanilla has no such gate because a chunk only
+    /// becomes sendable after its (asynchronous) generation reached FULL —
+    /// readiness is implied by tracking. Vela tracks columns at enqueue time,
+    /// so the send path checks readiness instead; the observable pacing
+    /// matches (chunks ship as generation completes, ticks never stall).
+    pub fn next_batch_ready(&mut self, ready: impl Fn((i32, i32)) -> bool) -> Vec<(i32, i32)> {
         // `if (this.unacknowledgedBatches < this.maxUnacknowledgedBatches)`.
         if self.unacknowledged_batches >= self.max_unacknowledged_batches {
             return Vec::new();
@@ -287,8 +314,13 @@ impl ChunkSender {
         if self.batch_quota < 1.0 || self.pending.is_empty() {
             return Vec::new();
         }
-        // `collectChunksToSend`: up to `Mth.floor(batchQuota)` nearest columns.
-        let count = (self.batch_quota.floor() as usize).min(self.pending.len());
+        // `collectChunksToSend`: up to `Mth.floor(batchQuota)` nearest columns,
+        // bounded by the ready prefix.
+        let mut count = (self.batch_quota.floor() as usize).min(self.pending.len());
+        count = self.pending[..count]
+            .iter()
+            .position(|&c| !ready(c))
+            .unwrap_or(count);
         if count == 0 {
             return Vec::new();
         }
@@ -551,6 +583,29 @@ mod tests {
         assert!(s.drop_pending((2, 2)), "was queued");
         assert!(!s.drop_pending((9, 9)), "never queued");
         assert_eq!(s.pending, vec![(1, 1), (3, 3)]);
+    }
+
+    /// The readiness gate takes only the warm prefix (strict nearest-first),
+    /// accounts nothing on a cold head, and resumes once the head warms.
+    #[test]
+    fn readiness_gate_takes_warm_prefix_only() {
+        let mut s = ChunkSender::new();
+        for i in 1..=5 {
+            s.mark_pending((i, 0));
+        }
+        // Head warm, (3,0) cold: only the prefix before it ships.
+        let batch = s.next_batch_ready(|c| c != (3, 0));
+        assert_eq!(batch, vec![(1, 0), (2, 0)]);
+        assert_eq!(s.unacknowledged_batches, 1);
+        s.on_ack(9.0);
+        // Cold head: nothing ships, nothing is accounted, the queue keeps order.
+        let quota_before = s.batch_quota;
+        assert!(s.next_batch_ready(|_| false).is_empty());
+        assert_eq!(s.unacknowledged_batches, 0);
+        assert!(s.batch_quota >= quota_before, "no quota debited on a cold head");
+        assert_eq!(s.pending, vec![(3, 0), (4, 0), (5, 0)]);
+        // Head warmed: the stream resumes in order.
+        assert_eq!(s.next_batch_ready(|_| true), vec![(3, 0), (4, 0), (5, 0)]);
     }
 
     /// `onChunkBatchReceivedByClient` decrements the outstanding count, never

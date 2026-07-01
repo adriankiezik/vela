@@ -208,8 +208,19 @@ pub fn apply_view_distance_change(world: &mut World, entity: Entity) {
 /// that stops fast travel from flooding the client's chunk-decode backlog.
 pub fn send_queued_chunks(mut players: Query<(&Conn, &mut ChunkSender)>) {
     for (conn, mut sender) in players.iter_mut() {
-        let batch = sender.next_batch();
+        // Readiness-gated batching: only ship columns whose wire data the
+        // background prefetch pool has already built, so `level_chunk` below
+        // is a cache hit and the tick never blocks on generation (a parity
+        // chunk costs ~40 ms to generate — most of a tick budget).
+        let batch = sender.next_batch_ready(|(cx, cz)| crate::world::chunk_wire_ready(cx, cz));
         if batch.is_empty() {
+            // A cold head can also mean its wire cache was *invalidated* (an
+            // edit landed after the prefetch). Re-request warming for the
+            // queue head so the stream always makes progress; for
+            // already-warm columns this is a cheap cache hit in the pool.
+            if let Some(&head) = sender.pending.first() {
+                crate::world::prefetch([head]);
+            }
             continue;
         }
         // A chunk batch is an atomic, ordered unit: start, its level_chunks, then

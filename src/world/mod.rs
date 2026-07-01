@@ -34,8 +34,8 @@ pub mod storage;
 
 pub use block_item::block_state_for_item;
 pub use chunk_data::{
-    block_state_at, chunk_columns, evict_chunk, evict_unused_chunks, raw_brightness,
-    save_dirty_chunks, set_block,
+    block_state_at, chunk_columns, chunk_wire_ready, evict_chunk, evict_unused_chunks, prefetch,
+    raw_brightness, save_dirty_chunks, set_block,
 };
 pub use gen::{biome_at, seed, set_seed, spawn_column, surface_height, DEFAULT_SEED};
 pub use light::ChunkLight;

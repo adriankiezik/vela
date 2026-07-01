@@ -2,8 +2,8 @@
 //! generated baseline plus sparse per-cell edits, and the lazily-built/cached
 //! wire `ChunkColumns`. The public block read/write API lives here.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use tracing::warn;
 
@@ -197,12 +197,16 @@ fn region_key(cx: i32, cz: i32) -> RegionKey {
 /// Invariant: `region_counts[r]` equals the number of `columns` keys whose
 /// `region_key` is `r`, and an entry is present iff that count is nonzero. Every
 /// insert into / removal from `columns` must go through [`ChunkStore::insert`] /
-/// [`ChunkStore::remove_column`] (or [`ChunkStore::get_or_generate`]) so the two
+/// [`ChunkStore::remove_column`] (or [`with_chunk`]'s insert-after-build) so the two
 /// maps can never drift.
 #[derive(Default)]
 struct ChunkStore {
     columns: HashMap<(i32, i32), ChunkData>,
     region_counts: HashMap<RegionKey, usize>,
+    /// Columns being generated *outside* the store lock right now (see
+    /// [`with_chunk`]): membership means one thread owns the build; other
+    /// interested threads wait on the store condvar for the insert.
+    inflight: HashSet<(i32, i32)>,
 }
 
 impl ChunkStore {
@@ -237,17 +241,6 @@ impl ChunkStore {
         removed
     }
 
-    /// Get chunk `(cx, cz)`, generating and inserting it (and bumping the region
-    /// count) on first touch.
-    fn get_or_generate(&mut self, cx: i32, cz: i32) -> &mut ChunkData {
-        if !self.columns.contains_key(&(cx, cz)) {
-            self.insert((cx, cz), ChunkData::new(cx, cz));
-        }
-        self.columns
-            .get_mut(&(cx, cz))
-            .expect("column just inserted")
-    }
-
     /// Whether the region owning `(cx, cz)` retains no resident column — an O(1)
     /// lookup against the resident-count map.
     fn region_is_empty(&self, cx: i32, cz: i32) -> bool {
@@ -255,20 +248,99 @@ impl ChunkStore {
     }
 }
 
-/// Process-wide store of chunks, keyed by `(cx, cz)`. Each chunk caches its wire
-/// data and carries its edits. Guarded by a `Mutex` because, while the
-/// simulation is single-threaded today, nothing about the signatures promises
-/// that; the lock is uncontended in practice.
-fn store() -> &'static Mutex<ChunkStore> {
-    static STORE: OnceLock<Mutex<ChunkStore>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(ChunkStore::default()))
+/// Process-wide store of chunks, keyed by `(cx, cz)`, paired with the condvar
+/// that publishes out-of-lock generation (see [`with_chunk`]). Each chunk
+/// caches its wire data and carries its edits. The prefetch workers
+/// ([`prefetch`]) and the simulation share this store, so generation must not
+/// happen while holding the lock — a 40 ms+ parity chunk build under the lock
+/// would stall every block read in the tick.
+fn store() -> &'static (Mutex<ChunkStore>, Condvar) {
+    static STORE: OnceLock<(Mutex<ChunkStore>, Condvar)> = OnceLock::new();
+    STORE.get_or_init(|| (Mutex::new(ChunkStore::default()), Condvar::new()))
 }
 
 /// Run `f` against chunk `(cx, cz)`'s `ChunkData`, generating it on first touch.
+///
+/// Generation runs *outside* the store lock: the first thread to want a
+/// missing column claims it in `inflight`, releases the lock, builds the
+/// `ChunkData` (pure in `(seed, cx, cz)` plus the on-disk payload), then
+/// re-locks, inserts, and wakes waiters. Threads that lose the claim race
+/// wait on the condvar instead of generating twice. Block reads/writes on
+/// *other* columns proceed concurrently throughout.
 fn with_chunk<R>(cx: i32, cz: i32, f: impl FnOnce(&mut ChunkData) -> R) -> R {
-    let mut guard = store().lock().expect("chunk store mutex poisoned");
-    let chunk = guard.get_or_generate(cx, cz);
-    f(chunk)
+    let (lock, cvar) = store();
+    let mut guard = lock.lock().expect("chunk store mutex poisoned");
+    loop {
+        if guard.columns.contains_key(&(cx, cz)) {
+            let chunk = guard.columns.get_mut(&(cx, cz)).expect("just checked");
+            return f(chunk);
+        }
+        if guard.inflight.insert((cx, cz)) {
+            drop(guard);
+            let data = ChunkData::new(cx, cz);
+            guard = lock.lock().expect("chunk store mutex poisoned");
+            guard.inflight.remove(&(cx, cz));
+            // A racing insert is impossible (inflight is the claim), but an
+            // eviction sweep may have run — `insert` handles both counts.
+            guard.insert((cx, cz), data);
+            cvar.notify_all();
+        } else {
+            // Another thread is generating this column; wait for its insert.
+            guard = cvar.wait(guard).expect("chunk store mutex poisoned");
+        }
+    }
+}
+
+/// Whether chunk `(cx, cz)` is resident with its wire columns already built —
+/// the send path's readiness gate: a batch only ships columns whose
+/// `level_chunk` is a cache hit, leaving cold columns to the prefetch workers
+/// instead of building them on the simulation thread.
+pub fn chunk_wire_ready(cx: i32, cz: i32) -> bool {
+    let guard = store().0.lock().expect("chunk store mutex poisoned");
+    guard.columns.get(&(cx, cz)).is_some_and(|c| c.wire.is_some())
+}
+
+/// How many worker threads warm queued chunks. Parity generation serializes
+/// on the pipeline mutex, but disk loads, lighting, and encoding overlap —
+/// and in legacy mode generation itself parallelizes.
+const PREFETCH_WORKERS: usize = 3;
+
+/// Queue columns for background warming: each is generated (if missing) and
+/// its wire columns built off the simulation thread, so `send_queued_chunks`
+/// finds them ready. Duplicate and already-warm coordinates are cheap no-ops
+/// (cache hits); a column that got evicted or was never sent is reclaimed by
+/// the periodic untracked-chunk sweep, so a stale prefetch only wastes work,
+/// never leaks. Fire-and-forget: send failures (impossible — the workers
+/// never exit) are ignored.
+pub fn prefetch(coords: impl IntoIterator<Item = (i32, i32)>) {
+    static QUEUE: OnceLock<std::sync::mpsc::Sender<(i32, i32)>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(i32, i32)>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..PREFETCH_WORKERS {
+            let rx = Arc::clone(&rx);
+            std::thread::Builder::new()
+                .name(format!("chunk-prefetch-{i}"))
+                .spawn(move || loop {
+                    // Holding the receiver lock only while blocked in `recv`:
+                    // the winner takes one coordinate and releases, so the
+                    // pool processes in parallel while dispatch stays FIFO
+                    // (nearest-first, matching the pending queue's order).
+                    let coord = { rx.lock().expect("prefetch receiver poisoned").recv() };
+                    match coord {
+                        Ok((cx, cz)) => {
+                            let _ = chunk_columns(cx, cz);
+                        }
+                        Err(_) => return, // sender dropped — process exit
+                    }
+                })
+                .expect("spawn chunk-prefetch worker");
+        }
+        tx
+    });
+    for coord in coords {
+        let _ = queue.send(coord);
+    }
 }
 
 /// The wire columns for chunk `(cx, cz)`, generating and caching on first
@@ -318,7 +390,7 @@ pub fn save_dirty_chunks(game_time: i64) {
     if !super::storage::is_enabled() {
         return;
     }
-    let mut guard = store().lock().expect("chunk store mutex poisoned");
+    let mut guard = store().0.lock().expect("chunk store mutex poisoned");
     for ((cx, cz), chunk) in guard.columns.iter_mut() {
         if chunk.dirty {
             match super::storage::save_chunk(*cx, *cz, &chunk.gen, &chunk.edits, game_time) {
@@ -355,7 +427,7 @@ pub fn save_dirty_chunks(game_time: i64) {
 pub fn evict_chunk(cx: i32, cz: i32, game_time: i64) -> bool {
     let enabled = super::storage::is_enabled();
     let (evicted, saved, region_now_empty) = {
-        let mut guard = store().lock().expect("chunk store mutex poisoned");
+        let mut guard = store().0.lock().expect("chunk store mutex poisoned");
         let (evicted, saved) = evict_one_from(&mut guard, (cx, cz), enabled, game_time);
         // Whether this region retains any resident chunk, read in O(1) from the
         // per-region resident count (kept in lockstep with `columns`), so the
@@ -421,7 +493,7 @@ fn evict_one_from(
 pub fn evict_unused_chunks(keep: &std::collections::HashSet<(i32, i32)>, game_time: i64) -> usize {
     let enabled = super::storage::is_enabled();
     let (evicted, saved_any) = {
-        let mut guard = store().lock().expect("chunk store mutex poisoned");
+        let mut guard = store().0.lock().expect("chunk store mutex poisoned");
         evict_from(&mut guard, keep, enabled, game_time)
     };
     if saved_any {
