@@ -95,6 +95,9 @@ pub const LIVING_ENTITY_DATA_HEALTH: u8 = 9;
 /// flag (`Mob.setNoAi`).
 #[allow(dead_code)]
 pub const MOB_DATA_FLAGS: u8 = 15;
+/// `AgeableMob.DATA_BABY_ID` — the baby flag (index 16, BOOLEAN). The client
+/// registers a default of `false`, so it is only emitted for an actual baby.
+pub const AGEABLE_MOB_DATA_BABY: u8 = 16;
 /// `Sheep.DATA_WOOL_ID` — the wool byte (index 18): low nibble is the `DyeColor`
 /// id, bit 0x10 is the sheared flag. `Entity` 0..=7, `LivingEntity` 8..=14,
 /// `Mob` 15, `AgeableMob` 16..=17 (baby, age-locked), then `Sheep`'s first field.

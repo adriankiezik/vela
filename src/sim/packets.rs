@@ -54,6 +54,9 @@ const CB_PLAY_SET_HEALTH: i32 = 104;
 const CB_PLAY_SET_CHUNK_CACHE_CENTER: i32 = 94;
 const CB_PLAY_SECTION_BLOCKS_UPDATE: i32 = 84;
 const CB_PLAY_SET_ENTITY_DATA: i32 = 99;
+// After SET_ENTITY_DATA (line 232 → 99) come SET_ENTITY_LINK (line 233 → 100)
+// then SET_ENTITY_MOTION (line 234 → 101) in the clientbound registration order.
+const CB_PLAY_SET_ENTITY_MOTION: i32 = 101;
 const CB_PLAY_SET_TIME: i32 = 113;
 const CB_PLAY_SYSTEM_CHAT: i32 = 121;
 
@@ -497,6 +500,71 @@ pub fn entity_position_sync(
     frame(CB_PLAY_ENTITY_POSITION_SYNC, &p.buf)
 }
 
+// --- LpVec3 (the 26.2 low-precision vector codec) ----------------------------
+// `net.minecraft.network.LpVec3` constants: values below `ABS_MIN_VALUE` encode
+// as the single byte 0; the rest packs a per-axis 15-bit fraction of the
+// chessboard length (`ceil` of the largest |component|), whose low 2 bits ride
+// in the header byte with bit 4 flagging a VarInt continuation for the high bits.
+/// `LpVec3.ABS_MAX_VALUE` — components are clamped to ±this before encoding.
+const LP_VEC3_ABS_MAX: f64 = 1.7179869183E10;
+/// `LpVec3.ABS_MIN_VALUE` — a vector whose largest |component| is below this is
+/// written as the single zero byte.
+const LP_VEC3_ABS_MIN: f64 = 3.051944088384301E-5;
+
+/// Write a vector as vanilla `LpVec3.write` does: sanitize (NaN → 0, clamp to
+/// `±ABS_MAX_VALUE`), take `scale = ceil(max |component|)`; if that is below
+/// `ABS_MIN_VALUE` emit a single `0` byte, else pack each component's
+/// `round((v/scale * 0.5 + 0.5) * 32766)` 15-bit value at bit offsets 3/18/33 of
+/// a 64-bit buffer whose low 3 bits carry `scale & 3` plus the continuation flag
+/// (bit 4), emitted as byte, byte, i32 BE, then a VarInt of `scale >> 2` when the
+/// scale did not fit the 2 header bits.
+fn write_lp_vec3(p: &mut PacketWriter, x: f64, y: f64, z: f64) {
+    fn sanitize(v: f64) -> f64 {
+        if v.is_nan() {
+            0.0
+        } else {
+            v.clamp(-LP_VEC3_ABS_MAX, LP_VEC3_ABS_MAX)
+        }
+    }
+    // `Math.round((v * 0.5 + 0.5) * 32766.0)`; the input is in [0, 1] so Rust's
+    // half-away-from-zero `round` matches Java's half-up on the non-negative range.
+    fn pack(v: f64) -> i64 {
+        ((v * 0.5 + 0.5) * 32766.0).round() as i64
+    }
+    let (x, y, z) = (sanitize(x), sanitize(y), sanitize(z));
+    // `Mth.absMax` chain — the chessboard (Chebyshev) length.
+    let chessboard = x.abs().max(y.abs()).max(z.abs());
+    if chessboard < LP_VEC3_ABS_MIN {
+        p.write_u8(0);
+        return;
+    }
+    let scale = chessboard.ceil() as i64; // Mth.ceilLong
+    let is_partial = (scale & 3) != scale;
+    let markers = if is_partial { (scale & 3) | 4 } else { scale };
+    let buffer = markers
+        | (pack(x / scale as f64) << 3)
+        | (pack(y / scale as f64) << 18)
+        | (pack(z / scale as f64) << 33);
+    p.write_u8(buffer as u8);
+    p.write_u8((buffer >> 8) as u8);
+    p.write_i32((buffer >> 16) as i32);
+    if is_partial {
+        p.write_varint((scale >> 2) as i32);
+    }
+}
+
+/// ClientboundSetEntityMotionPacket — an entity's `deltaMovement` (blocks/tick),
+/// broadcast by `ServerEntity.sendChanges` when the tracked entity's velocity
+/// drifts from the last-sent value. Layout (`STREAM_CODEC`): entity id (VarInt)
+/// then the movement as `Vec3.LP_STREAM_CODEC` (the [`write_lp_vec3`] format —
+/// 26.2 replaced the old clamped ±3.9 / ×8000 short triple with `LpVec3`).
+pub fn set_entity_motion(entity_id: i32, vx: f64, vy: f64, vz: f64) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(entity_id);
+    write_lp_vec3(&mut p, vx, vy, vz);
+    frame(CB_PLAY_SET_ENTITY_MOTION, &p.buf)
+}
+
 /// `ClientboundAnimatePacket.SWING_MAIN_HAND` — the main-arm swing action byte.
 pub const ANIMATE_SWING_MAIN_HAND: u8 = 0;
 /// `ClientboundAnimatePacket.SWING_OFF_HAND` — the off-hand swing action byte.
@@ -762,6 +830,43 @@ mod tests {
         assert_eq!(r.read_u16().unwrap() as i16, -8);
         assert_eq!(r.read_u16().unwrap() as i16, 0);
         assert!(r.read_bool().unwrap());
+    }
+
+    #[test]
+    fn set_entity_motion_zero_is_single_zero_byte() {
+        // A vector under LP_VEC3_ABS_MIN encodes as the lone header byte 0.
+        let (id, mut r) = unframe(set_entity_motion(7, 0.0, 0.0, 0.0));
+        assert_eq!(id, CB_PLAY_SET_ENTITY_MOTION);
+        assert_eq!(r.read_varint().unwrap(), 7); // entity id
+        assert_eq!(r.read_u8().unwrap(), 0); // zero LpVec3
+        assert!(r.read_u8().is_err(), "no trailing bytes");
+    }
+
+    #[test]
+    fn set_entity_motion_round_trips_through_lp_vec3() {
+        // Decode per `LpVec3.read` and check the velocity survives quantization
+        // (15 bits per axis at scale 1 → ~6e-5 blocks/tick resolution).
+        let (vx, vy, vz) = (0.05, -0.0784, 0.12);
+        let (id, mut r) = unframe(set_entity_motion(3, vx, vy, vz));
+        assert_eq!(id, CB_PLAY_SET_ENTITY_MOTION);
+        assert_eq!(r.read_varint().unwrap(), 3);
+        let lowest = r.read_u8().unwrap() as u64;
+        assert_ne!(lowest, 0, "non-negligible vector must not encode as zero");
+        let middle = r.read_u8().unwrap() as u64;
+        let hb = r.read_bytes(4).unwrap();
+        let highest = u32::from_be_bytes([hb[0], hb[1], hb[2], hb[3]]) as u64;
+        let buffer = (highest << 16) | (middle << 8) | lowest;
+        let mut scale = lowest & 3;
+        if lowest & 4 == 4 {
+            scale |= (r.read_varint().unwrap() as u64) << 2;
+        }
+        assert_eq!(scale, 1); // ceil(0.12) — all components under one block/tick
+        let unpack =
+            |v: u64| ((v & 32767).min(32766) as f64) * 2.0 / 32766.0 - 1.0;
+        let s = scale as f64;
+        assert!((unpack(buffer >> 3) * s - vx).abs() < 1e-4);
+        assert!((unpack(buffer >> 18) * s - vy).abs() < 1e-4);
+        assert!((unpack(buffer >> 33) * s - vz).abs() < 1e-4);
     }
 
     #[test]

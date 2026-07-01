@@ -288,6 +288,16 @@ pub fn block_state_at(x: i32, y: i32, z: i32) -> BlockState {
     with_chunk(cx, cz, |c| c.state(lx, y, lz))
 }
 
+/// `LevelReader.getRawBrightness((x, y, z), 0)` — `max(skyLight, blockLight)`
+/// with no sky darkening subtracted. Reads the column's converged
+/// [`super::light::ChunkLight`] (built and cached with the wire blob), generating
+/// the chunk on first touch. The natural spawner's animal light gate consults it.
+pub fn raw_brightness(x: i32, y: i32, z: i32) -> u8 {
+    let (cx, cz) = (x >> 4, z >> 4);
+    let (lx, lz) = (x & 15, z & 15);
+    chunk_columns(cx, cz).light.raw_brightness(lx, y, lz)
+}
+
 /// Set the block-state at world `(x, y, z)`, returning the previous state id.
 /// A no-op (returns air) for out-of-world `y`. Invalidates the chunk's cached
 /// wire blob so a freshly-streamed `level_chunk` reflects the edit.
