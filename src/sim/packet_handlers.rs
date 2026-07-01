@@ -26,6 +26,9 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
             pitch,
             on_ground,
         } => {
+            // Snapshot the pre-move position so fall distance (and sprint
+            // exhaustion) can be derived from the delta the client just reported.
+            let before = world.get::<Pos>(entity).map(|p| (p.x, p.y, p.z));
             if let Some(mut pos) = world.get_mut::<Pos>(entity) {
                 if let Some(v) = x {
                     pos.x = v;
@@ -44,6 +47,14 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
                 }
                 pos.on_ground = on_ground;
                 debug!(x = pos.x, y = pos.y, z = pos.z, yaw = pos.yaw, pitch = pos.pitch, on_ground = pos.on_ground, "move");
+            }
+            // Fall-distance tracking / fall damage / sprint exhaustion (only when
+            // the player carries survival state — a real player always does).
+            if let (Some(before), Some(after)) =
+                (before, world.get::<Pos>(entity).map(|p| (p.x, p.y, p.z)))
+            {
+                let sprinting = world.get::<Meta>(entity).is_some_and(|m| m.sprinting);
+                super::survival::handle_move(world, entity, before, after, on_ground, sprinting);
             }
         }
         Serverbound::Chat {
@@ -160,6 +171,13 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         // The player closed the open screen.
         Serverbound::ContainerClose { container_id } => {
             on_container_close(world, entity, container_id)
+        }
+        // Death-screen "Respawn" button (and stats/gamerule requests we ignore).
+        // 0 = PERFORM_RESPAWN.
+        Serverbound::ClientCommand { action } => {
+            if action == 0 {
+                super::survival::respawn_player(world, entity);
+            }
         }
         // Block dig. The server advertises SURVIVAL (`GAME_TYPE_SURVIVAL`), so we
         // mirror `ServerPlayerGameMode.handleBlockBreakAction` for a non-instabuild

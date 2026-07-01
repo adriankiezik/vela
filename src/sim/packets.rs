@@ -37,11 +37,14 @@ const CB_PLAY_MOVE_ENTITY_POS: i32 = 53;
 const CB_PLAY_MOVE_ENTITY_POS_ROT: i32 = 54;
 const CB_PLAY_MOVE_ENTITY_ROT: i32 = 56;
 const CB_PLAY_PLAYER_ABILITIES: i32 = 64;
+const CB_PLAY_PLAYER_COMBAT_KILL: i32 = 68;
 const CB_PLAY_PLAYER_INFO_REMOVE: i32 = 69;
 const CB_PLAY_PLAYER_INFO_UPDATE: i32 = 70;
 const CB_PLAY_PLAYER_POSITION: i32 = 72;
 const CB_PLAY_REMOVE_ENTITIES: i32 = 77;
+const CB_PLAY_RESPAWN: i32 = 82;
 const CB_PLAY_ROTATE_HEAD: i32 = 83;
+const CB_PLAY_SET_HEALTH: i32 = 104;
 const CB_PLAY_SET_CHUNK_CACHE_CENTER: i32 = 94;
 const CB_PLAY_SECTION_BLOCKS_UPDATE: i32 = 84;
 const CB_PLAY_SET_ENTITY_DATA: i32 = 99;
@@ -133,20 +136,59 @@ pub fn play_login(entity_id: i32, p_in: &JoinParams) -> Bytes {
     p.write_bool(false); // reduced debug info
     p.write_bool(true); // show death screen
     p.write_bool(false); // limited crafting
-    // CommonPlayerSpawnInfo:
+    write_common_spawn_info(&mut p, p_in.game_type, 0xFF); // previous game type = -1 (none)
+    p.write_bool(p_in.online_mode); // online mode
+    p.write_bool(false); // enforces secure chat
+    frame(CB_PLAY_LOGIN, &p.buf)
+}
+
+/// Write a `CommonPlayerSpawnInfo` — the shared dimension/game-mode block carried
+/// by both `ClientboundLoginPacket` and `ClientboundRespawnPacket`
+/// (`CommonPlayerSpawnInfo.write`). A single overworld dimension, cosmetic seed,
+/// no last-death location, sea level 63.
+fn write_common_spawn_info(p: &mut PacketWriter, game_type: u8, previous_game_type: u8) {
     p.write_varint(1); // dimensionType holder: overworld is registry index 0 -> id+1
     p.write_identifier("minecraft:overworld"); // dimension
     p.write_i64(0); // seed (hashed, cosmetic)
-    p.write_u8(p_in.game_type); // game type
-    p.write_u8(0xFF); // previous game type = -1 (none)
+    p.write_u8(game_type); // game type
+    p.write_u8(previous_game_type); // previous game type
     p.write_bool(false); // is debug
     p.write_bool(false); // is flat: false now that terrain is noise-generated (normal horizon/fog)
     p.write_bool(false); // last death location: absent
     p.write_varint(0); // portal cooldown
     p.write_varint(63); // sea level
-    p.write_bool(p_in.online_mode); // online mode
-    p.write_bool(false); // enforces secure chat
-    frame(CB_PLAY_LOGIN, &p.buf)
+}
+
+/// `ClientboundSetHealthPacket` — the player's own HUD state: `health` (float),
+/// `food` (VarInt 0..=20), `saturation` (float). Sent on join and whenever any
+/// of the three changes (`ServerPlayer.doTick`).
+pub fn set_health(health: f32, food: i32, saturation: f32) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_f32(health);
+    p.write_varint(food);
+    p.write_f32(saturation);
+    frame(CB_PLAY_SET_HEALTH, &p.buf)
+}
+
+/// `ClientboundPlayerCombatKillPacket` — opens the death screen for the dying
+/// player. Layout (`record(int playerId, Component message)`): the victim's
+/// entity id (VarInt) then the death-message component (trusted network NBT).
+pub fn player_combat_kill(entity_id: i32, message: &Nbt) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(entity_id);
+    write_network(&mut p.buf, message);
+    frame(CB_PLAY_PLAYER_COMBAT_KILL, &p.buf)
+}
+
+/// `ClientboundRespawnPacket` — re-create the player's client-side level after a
+/// death (or dimension change). Layout: a `CommonPlayerSpawnInfo` then the
+/// `dataToKeep` byte (bit 0x01 KEEP_ATTRIBUTE_MODIFIERS, 0x02 KEEP_ENTITY_DATA).
+/// A death respawn keeps nothing (`data_to_keep == 0`).
+pub fn respawn(game_type: u8, data_to_keep: u8) -> Bytes {
+    let mut p = PacketWriter::new();
+    write_common_spawn_info(&mut p, game_type, game_type);
+    p.write_u8(data_to_keep);
+    frame(CB_PLAY_RESPAWN, &p.buf)
 }
 
 pub fn game_event(event: u8, param: f32) -> Bytes {
@@ -932,6 +974,43 @@ mod tests {
         assert!(last.iter().all(|&b| b == 0xFF));
         // Block array list is empty.
         assert_eq!(r.read_varint().unwrap(), 0);
+    }
+
+    #[test]
+    fn set_health_layout() {
+        let (id, mut r) = unframe(set_health(15.5, 17, 2.5));
+        assert_eq!(id, CB_PLAY_SET_HEALTH);
+        assert_eq!(r.read_f32().unwrap(), 15.5); // health
+        assert_eq!(r.read_varint().unwrap(), 17); // food
+        assert_eq!(r.read_f32().unwrap(), 2.5); // saturation
+    }
+
+    #[test]
+    fn player_combat_kill_layout() {
+        let msg = super::super::text::text("Steve died");
+        let (id, mut r) = unframe(player_combat_kill(7, &msg));
+        assert_eq!(id, CB_PLAY_PLAYER_COMBAT_KILL);
+        assert_eq!(r.read_varint().unwrap(), 7); // player entity id
+        // followed by the trusted network-NBT death component (not decoded here).
+    }
+
+    #[test]
+    fn respawn_layout() {
+        // CommonPlayerSpawnInfo then the dataToKeep byte. Assert the header fields
+        // (dimension type holder id+1, dimension identifier, seed, game type).
+        let (id, mut r) = unframe(respawn(GAME_TYPE_SURVIVAL, 0));
+        assert_eq!(id, CB_PLAY_RESPAWN);
+        assert_eq!(r.read_varint().unwrap(), 1); // dimensionType holder (overworld id+1)
+        assert_eq!(r.read_utf(32767).unwrap(), "minecraft:overworld"); // dimension identifier
+        assert_eq!(r.read_i64().unwrap(), 0); // seed
+        assert_eq!(r.read_u8().unwrap(), GAME_TYPE_SURVIVAL); // game type
+        assert_eq!(r.read_u8().unwrap(), GAME_TYPE_SURVIVAL); // previous game type
+        assert!(!r.read_bool().unwrap()); // is debug
+        assert!(!r.read_bool().unwrap()); // is flat
+        assert!(!r.read_bool().unwrap()); // last death location absent
+        assert_eq!(r.read_varint().unwrap(), 0); // portal cooldown
+        assert_eq!(r.read_varint().unwrap(), 63); // sea level
+        assert_eq!(r.read_u8().unwrap(), 0); // dataToKeep
     }
 
     #[test]

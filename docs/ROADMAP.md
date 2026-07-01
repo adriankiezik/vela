@@ -146,11 +146,11 @@ marked accordingly.
 - `M` — `[partial]` **Movement handling (serverbound)**: `MovePlayerPos/Rot/PosRot/StatusOnly` decoded and applied; `AcceptTeleportation` handled; the result is rebroadcast to other players. Server-side validation (move speed / clipping) still pending
 - `M` — `[partial]` **Player actions**: `PlayerAction` (dig, breaks on STOP), `UseItemOn` (simplified block placement), `SwingArm` handled (`src/sim/packet_handlers.rs`). `UseItem`, `PlayerCommand` (sneak/sprint), `Interact`, and dig-timing/hardness pending
 - `M` — **Abilities & game mode**: `PlayerAbilities`, `GameMode` change, flying/creative
-- `M` — **Health / food / damage**: `SetHealth`, `DamageEvent`, death + `Respawn`, combat
+- `M` — `[partial]` **Health / food / damage**: full survival loop in `src/sim/survival.rs` — health (max 20, clamp, i-frame cooldown), a 1:1 `FoodData.tick` (exhaustion→saturation→food drain, fast + slow natural regen, difficulty-floored starvation), damage sources (fall via tracked fall-distance, void, starvation; drown/suffocation exposed but unprobed), death (`PlayerCombatKill` death screen + broadcast death message + inventory drop), and respawn (`ClientCommand`→`Respawn` reset + re-stream chunks). `SetHealth` sent on join/change (`src/sim/packets.rs`), health/food persisted (`player_dat.rs`), new `natural_health_regeneration`/`show_death_messages` game rules. **Deferred**: armor/absorption/status-effect mitigation, knockback, `HurtAnimation`/`DamageEvent` visuals, and mob combat — the latter wires through the single `survival::hurt` seam (`DamageKind::MobAttack`) in the entities milestone
 - `S` — `[partial]` **Held-item / hotbar**: `SetCarriedItem` ↔ `SetHeldSlot` —
   serverbound `SetCarriedItem` decoded and applied to the per-player selected
-  hotbar slot (`Inventory.selected`); the clientbound `SetHeldSlot` builder
-  exists but is not yet pushed on a server-initiated change (e.g. respawn)
+  hotbar slot (`Inventory.selected`); the clientbound `SetHeldSlot` is now pushed
+  on respawn (`src/sim/survival.rs`) alongside the inventory re-sync
 - `M` — `[partial]` **Inventory state**: 46-slot player inventory container with
   cursor + state id, `ContainerSetContent` resync on click/close, and
   `ContainerSetSlot`/`ContainerClose`/`OpenScreen` builders. Pick-item and
@@ -228,7 +228,7 @@ marked accordingly.
   `MAX_STACK_SIZE` — is modelled via a per-item override table in
   `registry/item.rs`. Full typed component map (read/write of arbitrary
   components) still pending
-- `S` — **Damage sources** (`world/damagesource`)
+- `S` — `[partial]` **Damage sources** (`world/damagesource`): `DamageKind` in `src/sim/survival.rs` models the parity-relevant `DamageType` bits (death-message `msgId`, food `exhaustion`, difficulty `scaling`, `BYPASSES_INVULNERABILITY`) for fall/void/starve/drown/suffocation/generic/mob. No full registry-backed `DamageType`/tag sync yet
 - `S` — `[partial]` **UUID / GameProfile utilities**: offline UUID done (MD5 `OfflinePlayer:<name>`, tested); online-mode profiles resolved via `hasJoined` carry their UUID and signed skin/cape properties (forwarded in `LoginFinished`). Threading those properties through to the in-game player list / entity skin still to add
 - `M` — **Region/chunk coordinate + seed-based RNG utilities** (`util/random`, `valueproviders`)
 - `XL` — **Data generation pipeline**: extract blocks/items/registries from the reference data so content isn't hand-written (clean-room: derive from observable IDs, not copied code)

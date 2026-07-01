@@ -75,6 +75,12 @@ pub struct GameRules {
     pub spawn_monsters: bool,
     /// `random_tick_speed` — random ticks per chunk section per tick.
     pub random_tick_speed: i32,
+    /// `natural_health_regeneration` — players heal from a full food bar (the
+    /// `FoodData.tick` regen paths gate on this, `GameRules.NATURAL_HEALTH_REGENERATION`).
+    pub natural_regeneration: bool,
+    /// `show_death_messages` — broadcast a death message when a player dies
+    /// (`GameRules.SHOW_DEATH_MESSAGES`).
+    pub show_death_messages: bool,
 }
 
 impl Default for GameRules {
@@ -86,6 +92,8 @@ impl Default for GameRules {
             keep_inventory: false,
             spawn_monsters: true,
             random_tick_speed: 3,
+            natural_regeneration: true,
+            show_death_messages: true,
         }
     }
 }
@@ -101,6 +109,8 @@ impl GameRules {
             ("keep_inventory".into(), self.keep_inventory.to_string()),
             ("spawn_monsters".into(), self.spawn_monsters.to_string()),
             ("random_tick_speed".into(), self.random_tick_speed.to_string()),
+            ("natural_health_regeneration".into(), self.natural_regeneration.to_string()),
+            ("show_death_messages".into(), self.show_death_messages.to_string()),
         ]
     }
 
@@ -118,6 +128,8 @@ impl GameRules {
                         self.random_tick_speed = v;
                     }
                 }
+                "natural_health_regeneration" => set_bool(&mut self.natural_regeneration, value),
+                "show_death_messages" => set_bool(&mut self.show_death_messages, value),
                 _ => {}
             }
         }

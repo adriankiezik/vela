@@ -55,6 +55,10 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
     // below if the player has saved data.
     let mut inv_slots = [None; crate::inventory::PLAYER_INVENTORY_SLOTS];
     let mut inv_selected: u8 = 0;
+    // Fresh-spawn survival defaults (full health, full food bar), replaced below if
+    // the player has saved data.
+    let mut health = super::survival::Health::new(super::survival::MAX_HEALTH);
+    let mut food = super::survival::FoodData::default();
     // Restore a returning player's saved position/orientation/inventory, if any. A
     // read error is logged and the fresh-spawn defaults above are kept.
     if let Some(dir) = crate::world::storage::player_data_dir() {
@@ -68,6 +72,13 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
                 son_ground = pd.on_ground;
                 inv_slots = pd.inventory;
                 inv_selected = pd.selected_slot.clamp(0, 8) as u8;
+                health = super::survival::Health::new(pd.health);
+                food = super::survival::FoodData {
+                    food_level: pd.food_level,
+                    saturation_level: pd.food_saturation,
+                    exhaustion_level: pd.food_exhaustion,
+                    tick_timer: pd.food_tick_timer,
+                };
             }
             Ok(None) => {}
             Err(e) => warn!(%name, error = %e, "failed to read player data; spawning fresh"),
@@ -268,9 +279,15 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
             },
             inventory,
             game_mode,
+            health,
+            food,
         ))
         .id();
     world.resource_mut::<PlayerIndex>().0.insert(id, entity);
+
+    // Sync the player's HUD (health/food/saturation) now that the entity exists,
+    // mirroring the initial `SetHealth` vanilla sends in the join sequence.
+    super::survival::send_initial_health(world, entity);
 }
 
 /// Build and push the join sequence. Ordering matters: the GameEvent puts the
@@ -400,6 +417,13 @@ fn save_player_data(world: &World, entity: Entity, id: Uuid) {
         .get::<crate::inventory::Inventory>(entity)
         .map(|inv| (inv.selected as i32, inv.slots))
         .unwrap_or((0, [None; crate::inventory::PLAYER_INVENTORY_SLOTS]));
+    // Health/food fall back to a fresh player's defaults if the components are
+    // somehow absent (they're attached at join for every real player).
+    let health = world
+        .get::<super::survival::Health>(entity)
+        .map(|h| h.current)
+        .unwrap_or(super::survival::MAX_HEALTH);
+    let food = world.get::<super::survival::FoodData>(entity).copied().unwrap_or_default();
     let data = crate::world::storage::PlayerData {
         x: pos.x,
         y: pos.y,
@@ -407,6 +431,11 @@ fn save_player_data(world: &World, entity: Entity, id: Uuid) {
         yaw: pos.yaw,
         pitch: pos.pitch,
         on_ground: pos.on_ground,
+        health,
+        food_level: food.food_level,
+        food_saturation: food.saturation_level,
+        food_exhaustion: food.exhaustion_level,
+        food_tick_timer: food.tick_timer,
         selected_slot,
         inventory,
     };

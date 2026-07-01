@@ -277,6 +277,21 @@ impl ServerProperties {
             }
         }
     }
+
+    /// The world difficulty as the wire/ordinal id (0=peaceful, 1=easy, 2=normal,
+    /// 3=hard; `Difficulty.byId`). Accepts the vanilla name or numeric form.
+    pub fn difficulty(&self) -> u8 {
+        match self.str("difficulty") {
+            "0" | "peaceful" => 0,
+            "1" | "easy" => 1,
+            "2" | "normal" => 2,
+            "3" | "hard" => 3,
+            other => {
+                warn!(value = other, "unknown difficulty; defaulting to easy");
+                1
+            }
+        }
+    }
 }
 
 /// Parse the body of a `java.util.Properties` file into key/value pairs, shared

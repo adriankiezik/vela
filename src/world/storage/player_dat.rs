@@ -35,6 +35,16 @@ pub struct PlayerData {
     pub yaw: f32,
     pub pitch: f32,
     pub on_ground: bool,
+    /// Current health (vanilla `Health` float; `getMaxHealth()` = 20 when absent).
+    pub health: f32,
+    /// `foodLevel` (0..=20).
+    pub food_level: i32,
+    /// `foodSaturationLevel`.
+    pub food_saturation: f32,
+    /// `foodExhaustionLevel`.
+    pub food_exhaustion: f32,
+    /// `foodTickTimer`.
+    pub food_tick_timer: i32,
     /// Selected hotbar slot (0..9), vanilla `Inventory.selected`.
     pub selected_slot: i32,
     /// The player's inventory in the 46-slot menu-store layout (see
@@ -57,6 +67,11 @@ impl PlayerData {
                 Nbt::List(vec![Nbt::Float(self.yaw), Nbt::Float(self.pitch)]),
             ),
             ("OnGround".to_string(), Nbt::bool(self.on_ground)),
+            ("Health".to_string(), Nbt::Float(self.health)),
+            ("foodLevel".to_string(), Nbt::Int(self.food_level)),
+            ("foodSaturationLevel".to_string(), Nbt::Float(self.food_saturation)),
+            ("foodExhaustionLevel".to_string(), Nbt::Float(self.food_exhaustion)),
+            ("foodTickTimer".to_string(), Nbt::Int(self.food_tick_timer)),
             ("Inventory".to_string(), Nbt::List(inventory)),
             ("SelectedItemSlot".to_string(), Nbt::Int(self.selected_slot)),
         ];
@@ -82,6 +97,19 @@ impl PlayerData {
             _ => (0.0, 0.0),
         };
         let on_ground = matches!(tag.get("OnGround"), Some(Nbt::Byte(b)) if *b != 0);
+        // Health / food default to a fresh player (`getMaxHealth()` = 20, FoodData
+        // defaults) when the key is absent, matching vanilla's `getFloatOr` reads.
+        let health = as_float(tag.get("Health").unwrap_or(&Nbt::End)).unwrap_or(20.0);
+        let food_level = match tag.get("foodLevel") {
+            Some(Nbt::Int(v)) => *v,
+            _ => 20,
+        };
+        let food_saturation = as_float(tag.get("foodSaturationLevel").unwrap_or(&Nbt::End)).unwrap_or(5.0);
+        let food_exhaustion = as_float(tag.get("foodExhaustionLevel").unwrap_or(&Nbt::End)).unwrap_or(0.0);
+        let food_tick_timer = match tag.get("foodTickTimer") {
+            Some(Nbt::Int(v)) => *v,
+            _ => 0,
+        };
         let selected_slot = match tag.get("SelectedItemSlot") {
             Some(Nbt::Int(s)) => *s,
             _ => 0,
@@ -98,6 +126,11 @@ impl PlayerData {
             yaw,
             pitch,
             on_ground,
+            health,
+            food_level,
+            food_saturation,
+            food_exhaustion,
+            food_tick_timer,
             selected_slot,
             inventory,
         })
@@ -198,6 +231,11 @@ mod tests {
             yaw: 45.0,
             pitch: -10.0,
             on_ground: true,
+            health: 15.5,
+            food_level: 17,
+            food_saturation: 2.5,
+            food_exhaustion: 1.25,
+            food_tick_timer: 3,
             selected_slot: 4,
             inventory,
         }
