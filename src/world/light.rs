@@ -77,6 +77,34 @@ pub struct ChunkLight {
     pub block: Vec<Option<Vec<u8>>>,
 }
 
+impl ChunkLight {
+    /// `LevelReader.getRawBrightness(pos, 0)` — the brightness seen at a world
+    /// position with **no** sky-darkening subtracted (`amount == 0`):
+    /// `max(skyLight, blockLight)`. `(lx, lz)` are chunk-relative `0..16`; a `y`
+    /// outside the lit volume (or a section stored empty) reads as dark `0`.
+    /// Used by the natural spawner's `Animal.isBrightEnoughToSpawn` gate
+    /// (`getRawBrightness(pos, 0) > 8`).
+    pub fn raw_brightness(&self, lx: i32, y: i32, lz: i32) -> u8 {
+        section_nibble(&self.sky, lx, y, lz).max(section_nibble(&self.block, lx, y, lz))
+    }
+}
+
+/// Read a single nibble out of a per-section `DataLayer` list at chunk-relative
+/// `(lx, lz)` and world-`y`, mirroring the `y<<8 | z<<4 | x` packing in
+/// [`pack_layers`]. An out-of-range `y` or an empty (`None`) section reads `0`.
+fn section_nibble(layers: &[Option<Vec<u8>>], lx: i32, y: i32, lz: i32) -> u8 {
+    if !(LIGHT_Y_MIN..LIGHT_Y_MAX).contains(&y) {
+        return 0;
+    }
+    let section = ((y - LIGHT_Y_MIN) / 16) as usize;
+    let Some(bytes) = layers.get(section).and_then(|s| s.as_ref()) else {
+        return 0;
+    };
+    let ly = y - (LIGHT_Y_MIN + section as i32 * 16);
+    let cell = ((ly << 8) | (lz << 4) | lx) as usize;
+    (bytes[cell >> 1] >> (4 * (cell & 1))) & 0xF
+}
+
 /// Light this block state dampens, as `getOpacity` sees it *before* the `max(1,
 /// …)` floor: 0 for fully transparent cells (air, plants, thin snow), 1 for
 /// translucent blocks (water, ice, leaves) that let light through attenuating by

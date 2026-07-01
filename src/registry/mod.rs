@@ -538,6 +538,19 @@ pub const SYNCED: &[(&str, &[&str])] = &[
     ("minecraft:test_instance", &["minecraft:always_pass"]),
 ];
 
+/// The network id of an entry in a datapack-synced registry (its index in the
+/// [`SYNCED`] list for `registry`). The client rebuilds each registry in the
+/// order sent, so this index is exactly the wire id other packets reference —
+/// e.g. `ClientboundDamageEventPacket.sourceType` is a `Holder<DamageType>`
+/// encoded (via `ByteBufCodecs.holderRegistry`) as `this id + 1`.
+pub fn synced_id(registry: &str, entry: &str) -> Option<i32> {
+    SYNCED
+        .iter()
+        .find(|(reg, _)| *reg == registry)
+        .and_then(|(_, entries)| entries.iter().position(|e| *e == entry))
+        .map(|i| i as i32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::SYNCED;
