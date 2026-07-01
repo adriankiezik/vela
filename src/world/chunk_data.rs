@@ -33,6 +33,10 @@ pub(super) fn chunk_heights(cx: i32, cz: i32) -> [i32; COLUMNS] {
 pub struct ChunkColumns {
     pub blob: Vec<u8>,
     pub heightmaps: Vec<(i32, Vec<i64>)>,
+    /// Converged sky/block light for the column's 26 light sections, computed
+    /// together with the block blob so an edit that invalidates one re-lights the
+    /// other. See [`super::light`].
+    pub light: super::light::ChunkLight,
 }
 
 /// A chunk's mutable state: its generated baseline heights, a sparse map of
@@ -147,6 +151,7 @@ impl ChunkData {
             self.wire = Some(Arc::new(ChunkColumns {
                 blob: encode_blob(&self.heights, &self.edits),
                 heightmaps: compute_heightmaps(&self.heights, &self.edits),
+                light: super::light::compute_light(&self.heights, &self.edits),
             }));
         }
         Arc::clone(self.wire.as_ref().expect("wire just built"))
@@ -268,6 +273,7 @@ mod tests {
         ChunkColumns {
             blob: encode_blob(&heights, &edits),
             heightmaps: compute_heightmaps(&heights, &edits),
+            light: crate::world::light::compute_light(&heights, &edits),
         }
     }
 

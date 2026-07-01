@@ -71,7 +71,17 @@ marked accordingly.
 - `L` — **Block-state model**: `Block` registry, `BlockState` with properties, global palette IDs
 - `L` — **Chunk data structures**: `LevelChunk`, 16×16×16 sections, heightmaps, biome storage
 - `XL` — `[partial]` **Chunk serialization** (`ClientboundLevelChunkWithLight`): packet wire format implemented with **per-chunk-varying terrain** (noise heightmap) and the full indirect (4–8 bit) + direct/global palette path (`src/world/encoding.rs`), real `WORLD_SURFACE`/`MOTION_BLOCKING` heightmaps, empty light. Dynamic edits supported. Block entities still pending
-- `M` — `[partial]` **Light engine**: empty-light payload sent (four empty BitSets + two empty arrays); no real sky/block light propagation yet
+- `M` — `[partial]` **Light engine**: real per-chunk sky + block light, computed
+  as the converged output of a faithful 1:1 port of `LightEngine`'s propagation
+  rules (`getOpacity = max(1, dampening)`, sky sources at/above `lowestSourceY`
+  shining straight down at 15, 6-direction attenuating flood) and serialized into
+  `ClientboundLightUpdatePacketData` (sky/block/empty BitSets + 2048-byte
+  `DataLayer`s across all 26 light sections) on chunk send (`src/world/light.rs`).
+  Two known gaps remain: it is a **whole-chunk recompute** rather than vanilla's
+  incremental graph engine, and it is **chunk-local** (no cross-chunk light bleed
+  at borders — invisible for open terrain, only edit-made overhangs straddling a
+  chunk boundary differ). A standalone `ClientboundLightUpdatePacket` on block
+  edits is still pending (the client relights locally in the meantime)
 - `M` — `[done]` **Chunk streaming**: `SetChunkCacheCenter` + dynamic load/unload by movement with a rounded-corner tracking-view diff (`src/sim/chunking.rs`)
 - `M` — `[done]` **Heightmaps** computation & maintenance: `WORLD_SURFACE`/`MOTION_BLOCKING` computed and sent; live recomputation of edited columns on block change (`src/world/heightmap.rs`)
 - `S` — `[partial]` **Block-change packets**: `BlockUpdate` implemented and broadcast on edits (`src/sim/packets.rs`); `SectionBlocksUpdate` built + tested but not yet wired into a batched-edit path

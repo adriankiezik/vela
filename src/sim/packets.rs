@@ -473,9 +473,9 @@ pub fn set_entity_data(entity_id: i32, sneaking: bool, sprinting: bool) -> Bytes
 }
 
 /// A generated chunk column: bedrock floor, stone fill, dirt + grass surface
-/// following the noise heightmap, air above. The block data and heightmaps come
-/// from `crate::world` and vary per chunk `(cx, cz)`. Light is still sent empty
-/// — without a real light engine the client falls back to full brightness.
+/// following the noise heightmap, air above. The block data, heightmaps, and
+/// per-section sky/block light come from `crate::world` and vary per chunk
+/// `(cx, cz)`.
 pub fn level_chunk(cx: i32, cz: i32) -> Bytes {
     let columns = crate::world::chunk_columns(cx, cz);
 
@@ -495,14 +495,61 @@ pub fn level_chunk(cx: i32, cz: i32) -> Bytes {
     p.write_varint(columns.blob.len() as i32); // section blob length
     p.write_bytes(&columns.blob);
     p.write_varint(0); // block entities: none
-    // --- ClientboundLightUpdatePacketData --- (four empty BitSets, two empty lists)
-    p.write_varint(0); // sky-light mask
-    p.write_varint(0); // block-light mask
-    p.write_varint(0); // empty sky-light mask
-    p.write_varint(0); // empty block-light mask
-    p.write_varint(0); // sky-light arrays
-    p.write_varint(0); // block-light arrays
+    // --- ClientboundLightUpdatePacketData ---
+    write_light(&mut p, &columns.light);
     frame(CB_PLAY_LEVEL_CHUNK, &p.buf)
+}
+
+/// Serialize a chunk's light into a `ClientboundLightUpdatePacketData` body: four
+/// `BitSet`s (which sections carry sky data, block data, empty sky, empty block)
+/// then the two lists of 2048-byte `DataLayer`s. A `Some` section sets the data
+/// mask and contributes its bytes; a `None` (all-zero) section sets the *empty*
+/// mask and sends nothing (`ClientboundLightUpdatePacketData.prepareSectionData`).
+fn write_light(p: &mut PacketWriter, light: &crate::world::ChunkLight) {
+    let sky_mask: Vec<bool> = light.sky.iter().map(Option::is_some).collect();
+    let block_mask: Vec<bool> = light.block.iter().map(Option::is_some).collect();
+    let empty_sky: Vec<bool> = light.sky.iter().map(Option::is_none).collect();
+    let empty_block: Vec<bool> = light.block.iter().map(Option::is_none).collect();
+
+    write_bitset(p, &sky_mask);
+    write_bitset(p, &block_mask);
+    write_bitset(p, &empty_sky);
+    write_bitset(p, &empty_block);
+    write_light_arrays(p, &light.sky);
+    write_light_arrays(p, &light.block);
+}
+
+/// Write one light layer's data list: a VarInt count of present sections, then
+/// each as a length-prefixed 2048-byte array (`ByteBufCodecs.byteArray(2048)`),
+/// in ascending section order.
+fn write_light_arrays(p: &mut PacketWriter, layer: &[Option<Vec<u8>>]) {
+    let present = layer.iter().filter(|s| s.is_some()).count();
+    p.write_varint(present as i32);
+    for section in layer.iter().flatten() {
+        p.write_varint(section.len() as i32);
+        p.write_bytes(section);
+    }
+}
+
+/// Write a `java.util.BitSet` as `FriendlyByteBuf.writeBitSet` does — a `long[]`
+/// (VarInt length + big-endian longs) with trailing all-zero words dropped
+/// (`BitSet.toLongArray`). `bits[i]` is bit `i`; bit `i` lands in word `i / 64`
+/// at position `i % 64`.
+fn write_bitset(p: &mut PacketWriter, bits: &[bool]) {
+    let mut words: Vec<u64> = Vec::new();
+    for (i, &set) in bits.iter().enumerate() {
+        if set {
+            let word = i / 64;
+            if word >= words.len() {
+                words.resize(word + 1, 0);
+            }
+            words[word] |= 1u64 << (i % 64);
+        }
+    }
+    p.write_varint(words.len() as i32);
+    for w in words {
+        p.write_i64(w as i64);
+    }
 }
 
 /// ClientboundForgetLevelChunkPacket — tell the client to drop a chunk column it
@@ -780,6 +827,75 @@ mod tests {
         assert_eq!(r.read_varlong().unwrap(), 6_000);
         assert_eq!(r.read_f32().unwrap(), 0.0);
         assert_eq!(r.read_f32().unwrap(), 0.0); // rate 0 ⇒ paused
+    }
+
+    /// Read a `writeBitSet` long array and return the set bit indices.
+    fn read_bitset(r: &mut PacketReader) -> Vec<usize> {
+        let words = r.read_varint().unwrap() as usize;
+        let mut bits = Vec::new();
+        for w in 0..words {
+            let word = r.read_i64().unwrap() as u64;
+            for b in 0..64 {
+                if word & (1u64 << b) != 0 {
+                    bits.push(w * 64 + b);
+                }
+            }
+        }
+        bits
+    }
+
+    #[test]
+    fn level_chunk_light_payload_layout() {
+        // Parse a full level_chunk down to the light block and assert the light
+        // masks/arrays are internally consistent and carry real data.
+        let (id, mut r) = unframe(level_chunk(0, 0));
+        assert_eq!(id, CB_PLAY_LEVEL_CHUNK);
+        assert_eq!(r.read_bytes(4).unwrap(), [0, 0, 0, 0]); // cx (i32 BE)
+        assert_eq!(r.read_bytes(4).unwrap(), [0, 0, 0, 0]); // cz (i32 BE)
+        // Heightmaps map, then the section blob, then block entities.
+        let hm = r.read_varint().unwrap();
+        for _ in 0..hm {
+            let _type = r.read_varint().unwrap();
+            let longs = r.read_varint().unwrap();
+            for _ in 0..longs {
+                r.read_i64().unwrap();
+            }
+        }
+        let blob_len = r.read_varint().unwrap() as usize;
+        r.read_bytes(blob_len).unwrap();
+        assert_eq!(r.read_varint().unwrap(), 0); // block entities: none
+
+        // --- ClientboundLightUpdatePacketData ---
+        let sky_mask = read_bitset(&mut r);
+        let block_mask = read_bitset(&mut r);
+        let empty_sky = read_bitset(&mut r);
+        let empty_block = read_bitset(&mut r);
+
+        // Every one of the 26 light sections is in exactly one sky mask, and
+        // likewise for block; the two masks never overlap.
+        assert_eq!(sky_mask.len() + empty_sky.len(), 26);
+        assert_eq!(block_mask.len() + empty_block.len(), 26);
+        assert!(sky_mask.iter().all(|s| !empty_sky.contains(s)));
+        // An open world has real sky data (the surface + air sections) and no
+        // block light at all (no emitters).
+        assert!(!sky_mask.is_empty());
+        assert!(block_mask.is_empty());
+        // The topmost section (index 25) is open sky → carries data, not empty.
+        assert!(sky_mask.contains(&25));
+
+        // Sky array list: one length-prefixed 2048-byte DataLayer per sky bit.
+        let sky_arrays = r.read_varint().unwrap() as usize;
+        assert_eq!(sky_arrays, sky_mask.len());
+        let mut last = Vec::new();
+        for _ in 0..sky_arrays {
+            let len = r.read_varint().unwrap() as usize;
+            assert_eq!(len, 2048);
+            last = r.read_bytes(len).unwrap();
+        }
+        // The last (highest) sky section is full-bright: every nibble 15.
+        assert!(last.iter().all(|&b| b == 0xFF));
+        // Block array list is empty.
+        assert_eq!(r.read_varint().unwrap(), 0);
     }
 
     #[test]
