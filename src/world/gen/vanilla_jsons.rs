@@ -97,3 +97,12 @@ pub const DENSITY_FUNCTIONS: &[(&str, &str)] = &[
 /// surface rules, default block/fluid, sea level.
 pub const OVERWORLD_NOISE_SETTINGS: &str =
     include_str!("../../../data/minecraft/worldgen/noise_settings/overworld.json");
+
+/// The expanded overworld multi-noise parameter list — the ~7600 climate
+/// parameter points of `OverworldBiomeBuilder`, dumped via the official data
+/// generator's biome-parameters report (the built-in datapack stores only a
+/// `"preset"` reference). Entry order is load-bearing: it is the RTree build
+/// input order.
+pub const OVERWORLD_BIOME_PARAMETERS: &str = include_str!(
+    "../../../data/minecraft/worldgen/multi_noise_biome_source_parameter_list/overworld.json"
+);
