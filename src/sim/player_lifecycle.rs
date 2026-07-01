@@ -162,6 +162,12 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
         let _ = e.outbox.try_send(Outbound::Packet(newcomer_meta.clone()));
     }
 
+    // Replay non-player entities (dropped items, XP orbs, …) already in the world
+    // to the newcomer, scoped to the columns they just loaded — the non-player
+    // arm of the entity tracker (see `sim::entity`). Done before `outbox`/`loaded`
+    // are moved into the player's components below.
+    super::entity::spawn_existing_entities_for(world, &outbox, &loaded);
+
     let entity = world
         .spawn((
             PlayerId(id),
