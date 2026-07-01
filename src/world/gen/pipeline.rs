@@ -643,16 +643,25 @@ fn global() -> &'static std::sync::Mutex<SendPipeline> {
 const PROTO_CACHE_LIMIT: usize = 2048;
 const PROTO_KEEP_RADIUS: i32 = 16;
 
-/// Generate chunk `(cx, cz)` to FULL through the pipeline and extract it.
-/// The consumed proto leaves the cache (its data moves into the returned
-/// `ParityChunk`); partially generated neighbors stay resident so the
-/// dependency pyramid amortizes as the player moves.
+/// The status the live path generates to. SURFACE is the last stage that
+/// mutates blocks today — everything between it and FULL (carvers, features,
+/// light, spawn) is a no-op, but their *dependencies* are not: targeting
+/// FULL drags a 5×5 neighborhood through noise+surface per consumed chunk
+/// for byte-identical output (~5× the wall-clock, measured 164 ms vs 36 ms
+/// per chunk in release). Bump toward FULL as P7–P9 land and those stages
+/// start doing work.
+const LIVE_TARGET: ChunkStatus = ChunkStatus::Surface;
+
+/// Generate chunk `(cx, cz)` through the pipeline (to [`LIVE_TARGET`]) and
+/// extract it. The consumed proto leaves the cache (its data moves into the
+/// returned `ParityChunk`); partially generated neighbors stay resident so
+/// the dependency pyramid amortizes as the player moves.
 pub fn generate_full(cx: i32, cz: i32) -> ParityChunk {
     let mut pipeline = global().lock().expect("parity pipeline mutex poisoned");
-    pipeline.advance(cx, cz, ChunkStatus::Full);
+    pipeline.advance(cx, cz, LIVE_TARGET);
     let proto = pipeline.chunks.remove(&(cx, cz)).expect("chunk just advanced");
-    let blocks = proto.blocks.expect("FULL chunk has blocks");
-    let sections = proto.biome_sections.expect("FULL chunk has biomes");
+    let blocks = proto.blocks.expect("surfaced chunk has blocks");
+    let sections = proto.biome_sections.expect("surfaced chunk has biomes");
 
     let min_section_y = blocks.min_y >> 4;
     let quart_min_y = blocks.min_y >> 2;
