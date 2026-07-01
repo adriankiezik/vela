@@ -94,7 +94,14 @@ marked accordingly.
 
 ## Entities
 
-- `XL` — **Entity base + type registry** (~120 entity types): id, bounding box, tracking
+- `XL` — `[partial]` **Entity base + type registry** (~120 entity types): id,
+  bounding box, tracking. The `entity_type` registry (158 entries) and a generic
+  server-side net-entity model (id/uuid/type/pos/rotation/velocity, per-viewer
+  chunk-culled tracking) exist and now back **living passive mobs**
+  (`src/sim/mob.rs`): pig/cow/sheep/chicken spawn with the correct `AddEntity`
+  type id. Bounding boxes are still ad-hoc (a single vertical ground probe, no
+  per-type AABB table / horizontal collision); the full ~120-type dimension table
+  and attribute system remain
 - `L` — **Entity metadata / data-syncher** (`network/syncher` — `SynchedEntityData`, `SetEntityData`)
 - `L` — `[partial]` **Entity spawn/remove/track**: `AddEntity` (players, type `minecraft:player`) + `RemoveEntities` on join/leave. Every player tracks every other — correct here, since the whole world sits well inside the 32-chunk player tracking range. Per-player view-distance culling / dynamic add-remove on movement still pending
 - `M` — `[partial]` **Entity movement packets**: `MoveEntityPos/Rot/PosRot` + `RotateHead` + `EntityPositionSync` (absolute resync fallback), broadcast per tick via a 1:1 port of `ServerEntity.sendChanges` (update interval 2, `VecDeltaCodec` deltas, on-ground-flip / >8-block / 400-tick resync). `TeleportEntity`/`SetEntityMotion`/velocity pending (player velocity not modelled yet, so it stays zero)
@@ -102,7 +109,23 @@ marked accordingly.
 - `M` — **Equipment & passengers**: `SetEquipment`, `SetPassengers`, `SetEntityLink` (leash)
 - `M` — **Attributes** (`world/attribute` — `UpdateAttributes`)
 - `M` — **Mob effects / potions** (`world/effect`, `UpdateMobEffect`/`RemoveMobEffect`)
-- `XL` — **Entity AI / brain / pathfinding** (`entity/ai`, `pathfinder`) — large, defer; needed for living mobs to behave
+- `XL` — `[partial]` **Entity AI / brain / pathfinding** (`entity/ai`,
+  `pathfinder`): a first-cut wander AI drives the passive mobs — a simplified
+  `RandomStrollGoal` (occasional random nearby target, walk-to at a per-kind
+  speed, face the movement direction) plus gravity + ground collision, broadcast
+  via the shared `ServerEntity.sendChanges`-style delta packets
+  (`src/sim/mob.rs`). No real navigation graph / pathfinder, no goal-selector
+  priority, and none of the breed/panic/tempt/follow goals yet — the large brain
+  remains deferred
+- `M` — `[partial]` **Living-entity mobs + metadata + spawning**: pig/cow/sheep/
+  chicken spawn with real `SynchedEntityData` (shared-flags byte, LivingEntity
+  health float at its accessor index, random Sheep wool colour), a `LivingEntity`
+  health field, `RemoveEntities` on death, and a simple global-capped natural
+  spawner that places them on the surface near players (`src/sim/mob.rs`).
+  Type-specific variant holders (pig/cow/chicken variants), the Mob no-AI flag,
+  baby/breeding, equipment, and attributes are left to the client's defaults /
+  future work. Damage-taking is a clean seam (`mob::damage`) for the combat
+  milestone — no damage source wired yet
 - `L` — **Projectiles, vehicles, item entities, decorations** (per-family behavior)
 - `S` — **Experience orbs / XP** (`AddExperienceOrb`, `SetExperience`)
 

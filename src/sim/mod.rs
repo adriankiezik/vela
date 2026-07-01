@@ -13,6 +13,7 @@ mod commands;
 mod components;
 mod entity;
 mod item_tick;
+mod mob;
 mod movement;
 mod packet_handlers;
 mod packets;
@@ -75,6 +76,11 @@ pub fn run(
             // their own movement packets here rather than through the player-only
             // broadcast_movement path.
             item_tick::item_tick,
+            // Living mobs: the natural spawner tops the world up (self-gated on the
+            // clock), then the AI/physics pass wanders them and broadcasts their
+            // movement (its own per-chunk fan-out, like item_tick).
+            mob::mob_spawn,
+            mob::mob_tick,
             movement::broadcast_movement,
             // Dynamic chunk streaming: must run after movement is applied so the
             // loaded-chunk set follows the player's current position this tick.
