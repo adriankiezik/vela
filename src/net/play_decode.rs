@@ -14,6 +14,9 @@ const SB_PLAY_CHAT: i32 = 9;
 // ChatSessionUpdate follows Chat in SERVERBOUND_TEMPLATE (line 71 → 10); it
 // publishes the client's chat session (session id + profile public key).
 const SB_PLAY_CHAT_SESSION_UPDATE: i32 = 10;
+// ClientCommand (respawn request / stats) is index 12 in SERVERBOUND_TEMPLATE
+// (CHUNK_BATCH_RECEIVED at 11, CLIENT_COMMAND at 12).
+const SB_PLAY_CLIENT_COMMAND: i32 = 12;
 // CommandSuggestion (tab-completion request) is index 15 in SERVERBOUND_TEMPLATE
 // (ACCEPT_TELEPORTATION..COMMAND_SUGGESTION, with CLIENT_INFORMATION at 14).
 const SB_PLAY_COMMAND_SUGGESTION: i32 = 15;
@@ -221,6 +224,10 @@ pub(super) fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbo
         // ServerboundContainerClosePacket: a single VarInt container id.
         SB_PLAY_CONTAINER_CLOSE => Some(Serverbound::ContainerClose {
             container_id: reader.read_varint().ok()?,
+        }),
+        // ServerboundClientCommandPacket: a single `Action` enum ordinal (VarInt).
+        SB_PLAY_CLIENT_COMMAND => Some(Serverbound::ClientCommand {
+            action: reader.read_varint().ok()?,
         }),
         _ => None,
     }

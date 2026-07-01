@@ -18,6 +18,7 @@ mod packet_handlers;
 mod packets;
 mod persistence;
 mod player_lifecycle;
+mod survival;
 mod systems;
 mod text;
 mod world_tick;
@@ -69,6 +70,10 @@ pub fn run(
         (
             systems::advance_tick,
             systems::drain_ingress,
+            // Survival: food drain / regen / void / starvation and the SetHealth
+            // sync. Runs after drain_ingress so fall damage from this tick's moves
+            // (applied in packet_handlers) is already reflected in the HUD sync.
+            survival::survival_tick,
             world_tick::world_tick,
             // Dropped-item physics/pickup/merge/despawn. Runs after world_tick
             // (its own state) and before broadcast_movement; item entities emit

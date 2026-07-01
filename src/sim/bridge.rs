@@ -146,6 +146,13 @@ pub enum Serverbound {
     ContainerClose {
         container_id: i32,
     },
+    /// `ServerboundClientCommandPacket` — a client status request. `action` is the
+    /// `Action` enum ordinal (0 PERFORM_RESPAWN, 1 REQUEST_STATS,
+    /// 2 REQUEST_GAMERULE_VALUES). We act on PERFORM_RESPAWN (the click on the
+    /// death screen's "Respawn" button); the others are ignored.
+    ClientCommand {
+        action: i32,
+    },
     /// `ServerboundPlayerActionPacket` — block-dig (and item-drop) actions. The
     /// `BlockPos` long is unpacked to `(x, y, z)` by `net`. `action` is the
     /// `Action` enum ordinal (0 START_DESTROY_BLOCK, 1 ABORT_DESTROY_BLOCK,
