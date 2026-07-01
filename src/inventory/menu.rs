@@ -42,10 +42,11 @@ pub enum ClickType {
     PickupAll,
 }
 
-impl ClickType {
+impl From<i32> for ClickType {
     /// Decode the wire ordinal. Out-of-range values fall back to `Pickup`,
-    /// matching `ContainerInput`'s `ByIdMap.continuous(..., ZERO)` strategy.
-    pub fn from_id(id: i32) -> ClickType {
+    /// matching `ContainerInput`'s `ByIdMap.continuous(..., ZERO)` strategy — the
+    /// decode is total, so this is `From`, not `TryFrom`.
+    fn from(id: i32) -> ClickType {
         match id {
             0 => ClickType::Pickup,
             1 => ClickType::QuickMove,
