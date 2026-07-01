@@ -53,6 +53,29 @@ const ITEM_ENTITY_DATA_ITEM: u8 = 8;
 #[allow(dead_code)]
 const EXPERIENCE_ORB_DATA_VALUE: u8 = 8;
 
+// --- LivingEntity / Mob metadata accessor indices ----------------------------
+// `SynchedEntityData.defineId` continues numbering down the class hierarchy:
+// `Entity` occupies 0..=7 (shared flags, air, custom-name, silent, no-gravity,
+// pose, ticks-frozen), so `LivingEntity`'s first field is 8 and `Mob`'s is 15.
+// Only the indices the mob spawn path actually emits are named here.
+/// `LivingEntity.DATA_LIVING_ENTITY_FLAGS` — the living-entity flags byte (index 8).
+#[allow(dead_code)]
+pub const LIVING_ENTITY_DATA_FLAGS: u8 = 8;
+/// `LivingEntity.DATA_HEALTH_ID` — the current-health float (index 9). The client
+/// registers a default of `1.0`, so this must be sent for a full-health render.
+pub const LIVING_ENTITY_DATA_HEALTH: u8 = 9;
+/// `Mob.DATA_MOB_FLAGS_ID` — the mob flags byte (index 15); bit 0 is the "no AI"
+/// flag (`Mob.setNoAi`).
+#[allow(dead_code)]
+pub const MOB_DATA_FLAGS: u8 = 15;
+/// `Sheep.DATA_WOOL_ID` — the wool byte (index 18): low nibble is the `DyeColor`
+/// id, bit 0x10 is the sheared flag. `Entity` 0..=7, `LivingEntity` 8..=14,
+/// `Mob` 15, `AgeableMob` 16..=17 (baby, age-locked), then `Sheep`'s first field.
+pub const SHEEP_DATA_WOOL: u8 = 18;
+/// `Entity.DATA_SHARED_FLAGS_ID` — the shared flags byte (index 0), shared by
+/// every entity. Sent as `0` for a plain standing mob.
+pub const ENTITY_DATA_SHARED_FLAGS: u8 = 0;
+
 /// A world entity that is not a player: the identity the client needs to spawn
 /// and address it. Players carry `Profile` instead (their numeric id lives there).
 #[derive(Component)]
@@ -123,12 +146,35 @@ pub fn spawn_item_entity(world: &mut World, pos: (f64, f64, f64), stack: ItemSta
         world,
         NetEntity { id, uuid, type_id: ENTITY_TYPE_ITEM },
         pos,
+        0.0,
         meta,
         |ec| {
             ec.insert(ItemDrop);
         },
     );
     id
+}
+
+/// Spawn an arbitrary net entity of `type_id` at `pos` facing `yaw`, showing it to
+/// every player tracking that column, and run `tag` to attach any type-specific
+/// components (e.g. a mob's AI/health state) onto the new ECS entity. Returns the
+/// network id and the ECS [`Entity`].
+///
+/// This is the generic spawn used by the mob module — the counterpart to the
+/// fixed-type [`spawn_item_entity`]/[`spawn_xp_orb`] helpers. `meta` is the
+/// initial [`EntityData`] sent right after the `AddEntity`.
+pub fn spawn_net_entity(
+    world: &mut World,
+    type_id: i32,
+    pos: (f64, f64, f64),
+    yaw: f32,
+    meta: EntityData,
+    tag: impl FnOnce(&mut bevy_ecs::world::EntityWorldMut),
+) -> (i32, Entity) {
+    let id = alloc_id(world);
+    let uuid = random_uuid();
+    let entity = spawn_tracked(world, NetEntity { id, uuid, type_id }, pos, yaw, meta, tag);
+    (id, entity)
 }
 
 /// Spawn an XP orb worth `value` at `(x, y, z)` and show it to every player
@@ -148,6 +194,7 @@ pub fn spawn_xp_orb(world: &mut World, pos: (f64, f64, f64), value: i32) -> i32 
         world,
         NetEntity { id, uuid, type_id: ENTITY_TYPE_EXPERIENCE_ORB },
         pos,
+        0.0,
         meta,
         |ec| {
             ec.insert(XpOrb);
@@ -157,29 +204,36 @@ pub fn spawn_xp_orb(world: &mut World, pos: (f64, f64, f64), value: i32) -> i32 
 }
 
 /// Spawn a net entity into the world and pair it to every tracking viewer.
-/// `tag` inserts any type-specific marker component onto the new entity.
+/// `tag` inserts any type-specific marker/state component onto the new entity.
+/// Returns the ECS [`Entity`] so callers that need to address it further can.
 fn spawn_tracked(
     world: &mut World,
     net: NetEntity,
     pos: (f64, f64, f64),
+    yaw: f32,
     meta: EntityData,
     tag: impl FnOnce(&mut bevy_ecs::world::EntityWorldMut),
-) {
+) -> Entity {
     let (x, y, z) = pos;
     let (id, uuid, type_id) = (net.id, net.uuid, net.type_id);
 
-    // Build the pairing packets once, then fan out to viewers.
-    let add = packets::add_entity(id, uuid, type_id, pos, 0, 0, 0, 0);
+    // Build the pairing packets once, then fan out to viewers. The body yaw is
+    // packed (`Mth.packDegrees`) and reused for the head yaw — mobs spawn facing a
+    // single direction with head and body aligned.
+    let packed_yaw = super::packets::pack_angle(yaw);
+    let add = packets::add_entity(id, uuid, type_id, pos, packed_yaw, 0, packed_yaw, 0);
     let data = packets::set_entity_data(id, &meta);
 
     let mut ec = world.spawn((
         net,
-        Pos { x, y, z, yaw: 0.0, pitch: 0.0, on_ground: false },
+        Pos { x, y, z, yaw, pitch: 0.0, on_ground: false },
         EntityMeta(meta),
     ));
     tag(&mut ec);
+    let entity = ec.id();
 
     send_to_viewers(world, chunk_of(x, z), &[add, data]);
+    entity
 }
 
 /// Send framed packets to every player whose loaded-chunk set covers `chunk`.
