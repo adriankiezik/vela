@@ -12,6 +12,10 @@
 //! generator, Stafford's mix13 and the Java LCG are published algorithms, and
 //! the seed plumbing constants are observable data.
 
+// Consumed by the P2 density-function engine; until that lands only the tests
+// exercise this module.
+#![allow(dead_code)]
+
 use md5::{Digest, Md5};
 
 /// `BitRandomSource.FLOAT_MULTIPLIER` / `XoroshiroRandomSource.FLOAT_UNIT`.

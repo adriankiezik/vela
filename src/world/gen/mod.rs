@@ -18,6 +18,7 @@ mod feature;
 mod noise;
 pub mod random;
 mod rng;
+pub mod synth;
 mod surface;
 
 use std::sync::OnceLock;
