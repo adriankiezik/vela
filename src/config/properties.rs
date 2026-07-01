@@ -243,6 +243,17 @@ impl ServerProperties {
         self.bool("hardcore", false)
     }
 
+    /// `level-name` — the save-directory name (relative to the working
+    /// directory). Falls back to `world` when blank, as vanilla does.
+    pub fn level_name(&self) -> &str {
+        let name = self.str("level-name");
+        if name.is_empty() {
+            "world"
+        } else {
+            name
+        }
+    }
+
     /// `view-distance`, clamped to the protocol's sane 2..=32 chunk range.
     pub fn view_distance(&self) -> i32 {
         self.int("view-distance", 10).clamp(2, 32)

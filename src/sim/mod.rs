@@ -14,6 +14,7 @@ mod entity;
 mod movement;
 mod packet_handlers;
 mod packets;
+mod persistence;
 mod player_lifecycle;
 mod systems;
 mod text;
@@ -50,6 +51,10 @@ pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
     world.init_resource::<world_tick::WorldTime>();
     world.init_resource::<world_tick::Weather>();
 
+    // Enable world persistence and load `level.dat` (world clock + game rules)
+    // before the first tick, so a restarted world resumes where it left off.
+    persistence::boot(&mut world);
+
     let mut schedule = Schedule::default();
     schedule.add_systems(
         (
@@ -72,8 +77,12 @@ pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
 
         schedule.run(&mut world);
 
+        // Periodic autosave (self-gates on the world clock).
+        persistence::autosave(&mut world);
+
         if world.resource::<Control>().stop {
             info!("ingress closed; simulation stopping");
+            persistence::shutdown(&mut world);
             return;
         }
 

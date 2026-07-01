@@ -41,7 +41,7 @@ marked accordingly.
 - `M` — **SNBT / text-component parsing** (chat components as NBT in 26.2, not JSON)
 - `M` — `[done]` **Text component model**: typed Style/Color, hover/click events, serialization to network NBT (`src/protocol/text.rs`, tested)
 - `S` — **Resource location / identifier** type (`namespace:path`) with validation
-- `M` — `[partial]` **Bit-packed `PalettedContainer`** (block states + biomes storage, the core chunk encoding primitive): wire serialization done incl. palette growth (single-value → 4–8 bit indirect → direct/global palette ≥256 states, `src/world/encoding.rs`). Mutable edits supported via a sparse per-cell edit map (`set_block`/`block_state_at`, `src/world/chunk_data.rs`). Remaining gap: the network *read* path for incoming/foreign palettes
+- `M` — `[done]` **Bit-packed `PalettedContainer`** (block states + biomes storage, the core chunk encoding primitive): wire serialization done incl. palette growth (single-value → 4–8 bit indirect → direct/global palette ≥256 states, `src/world/encoding.rs`). Mutable edits supported via a sparse per-cell edit map (`set_block`/`block_state_at`, `src/world/chunk_data.rs`). The storage *read* path for foreign palettes is done: the Anvil `{palette, data}` block-state container is decoded back to global state ids at any width (`src/world/storage/chunk_nbt.rs`)
 
 ## Login → Configuration → Play handshake
 
@@ -76,7 +76,7 @@ marked accordingly.
 - `M` — `[done]` **Heightmaps** computation & maintenance: `WORLD_SURFACE`/`MOTION_BLOCKING` computed and sent; live recomputation of edited columns on block change (`src/world/heightmap.rs`)
 - `S` — `[partial]` **Block-change packets**: `BlockUpdate` implemented and broadcast on edits (`src/sim/packets.rs`); `SectionBlocksUpdate` built + tested but not yet wired into a batched-edit path
 - `M` — **Block entities** (`BlockEntityData`, chests/signs/etc. NBT) — model + per-type data
-- `M` — **Region / `.mca` persistence** (Anvil format) — or start with in-memory only and defer
+- `M` — `[done]` **Region / `.mca` persistence** (Anvil format): the 32×32-chunk region container (1024-entry location + timestamp tables, sector allocator, zlib chunk streams) and chunk NBT (de)serialization (`sections`/`Heightmaps`/paletted block containers). Chunks load from disk on first touch and dirty chunks save periodically + on shutdown (`src/world/storage/`, wired through `src/world/chunk_data.rs`). Block entities and the oversized-chunk `.mcc` external-file path are still out of scope
 - `L` — `[partial]` **World generation**: a real per-chunk noise heightmap generator is in place (fbm value noise, continuous across chunk boundaries — `src/world/terrain.rs`). Full `levelgen` (biomes, carvers, features, structures) is `XL` and still out of early scope
 - `S` — **World border** (`world/level/border`, `SetBorder*` packets)
 
@@ -179,7 +179,7 @@ marked accordingly.
 - `M` — **RCON** (`server/rcon`) — optional remote console
 - `S` — **Query protocol** (legacy UDP server query) — optional
 - `M` — **JSON-RPC management API** (`server/jsonrpc`) — new 26.x, optional
-- `L` — **World save/load** (`world/level/storage` — `level.dat`, player data, region files)
+- `L` — `[partial]` **World save/load** (`world/level/storage` — `level.dat`, player data, region files): region files + chunk NBT done (see above). `level.dat` persists seed/spawn/time/game-rules as gzip NBT and reloads the clock + rules on boot (`src/world/storage/level_dat.rs`); per-player `<uuid>.dat` persists position/orientation/held-slot and is restored on rejoin (`src/world/storage/player_dat.rs`). Deferred: feeding the saved seed/spawn back into generation (terrain stays on a fixed seed, spawn stays the origin column), player inventory round-trip, and per-chunk save-on-eviction (the store never evicts; dirty chunks flush on the 6000-tick autosave + shutdown)
 - `S` — `[partial]` **Console / log handling, command-line args, ticking watchdog**: `tracing` logging (`RUST_LOG`) and a bind-address CLI arg in place; ticking watchdog pending
 - `M` — **Datapack / tag loading** (`server/packs`, `tags`) — feed registry & tag sync
 - `S` — `[partial]` **Brand & version reporting**: brand send + version reporting wired (`src/net/connection.rs`); ping debug charts (`util/debugchart`) pending

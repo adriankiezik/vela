@@ -189,7 +189,7 @@ pub fn set_chunk_center(x: i32, z: i32) -> Bytes {
     frame(CB_PLAY_SET_CHUNK_CACHE_CENTER, &p.buf)
 }
 
-pub fn player_position(teleport_id: i32, x: f64, y: f64, z: f64) -> Bytes {
+pub fn player_position(teleport_id: i32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Bytes {
     let mut p = PacketWriter::new();
     p.write_varint(teleport_id);
     // PositionMoveRotation: position, delta movement, yaw, pitch.
@@ -199,8 +199,8 @@ pub fn player_position(teleport_id: i32, x: f64, y: f64, z: f64) -> Bytes {
     p.write_f64(0.0); // dx
     p.write_f64(0.0); // dy
     p.write_f64(0.0); // dz
-    p.write_f32(0.0); // yaw
-    p.write_f32(0.0); // pitch
+    p.write_f32(yaw);
+    p.write_f32(pitch);
     p.write_i32(0); // relative flags: all absolute
     frame(CB_PLAY_PLAYER_POSITION, &p.buf)
 }

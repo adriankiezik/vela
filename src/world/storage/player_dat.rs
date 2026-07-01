@@ -1,0 +1,180 @@
+//! Per-player `<uuid>.dat` — a player's saved position, orientation, and held
+//! hotbar slot. Stored as gzip-compressed NBT (an empty-named root compound), the
+//! same framing vanilla `PlayerDataStorage.save` writes.
+//!
+//! Vanilla persists the full player entity (health, inventory, abilities, …).
+//! Vela stores the movement/hotbar subset the simulation currently owns; the
+//! inventory round-trip is deferred (the menu framework holds it live but it is
+//! not yet threaded here). Field names match vanilla so a saved file is
+//! forward-compatible: `Pos`, `Rotation`, `OnGround`, `SelectedItemSlot`.
+
+use std::io::{self, Read, Write};
+use std::path::Path;
+
+use bytes::BytesMut;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use uuid::Uuid;
+
+use crate::protocol::nbt::{self, Nbt};
+
+/// A player's persisted state (the subset Vela currently tracks).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerData {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub on_ground: bool,
+    /// Selected hotbar slot (0..9), vanilla `Inventory.selected`.
+    pub selected_slot: i32,
+}
+
+impl PlayerData {
+    /// Serialize to the player entity NBT compound.
+    fn to_nbt(&self) -> Nbt {
+        Nbt::compound([
+            (
+                "Pos",
+                Nbt::List(vec![Nbt::Double(self.x), Nbt::Double(self.y), Nbt::Double(self.z)]),
+            ),
+            (
+                "Rotation",
+                Nbt::List(vec![Nbt::Float(self.yaw), Nbt::Float(self.pitch)]),
+            ),
+            ("OnGround", Nbt::bool(self.on_ground)),
+            ("SelectedItemSlot", Nbt::Int(self.selected_slot)),
+        ])
+    }
+
+    /// Parse the player entity NBT compound, defaulting missing fields.
+    fn from_nbt(tag: &Nbt) -> Option<Self> {
+        let (x, y, z) = match tag.get("Pos") {
+            Some(Nbt::List(p)) if p.len() == 3 => (
+                as_double(&p[0])?,
+                as_double(&p[1])?,
+                as_double(&p[2])?,
+            ),
+            _ => return None,
+        };
+        let (yaw, pitch) = match tag.get("Rotation") {
+            Some(Nbt::List(r)) if r.len() == 2 => (as_float(&r[0])?, as_float(&r[1])?),
+            _ => (0.0, 0.0),
+        };
+        let on_ground = matches!(tag.get("OnGround"), Some(Nbt::Byte(b)) if *b != 0);
+        let selected_slot = match tag.get("SelectedItemSlot") {
+            Some(Nbt::Int(s)) => *s,
+            _ => 0,
+        };
+        Some(Self {
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+            on_ground,
+            selected_slot,
+        })
+    }
+
+    /// Write to `dir/<uuid>.dat` as gzip-compressed NBT.
+    pub fn save(&self, dir: &Path, uuid: Uuid) -> io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let mut body = BytesMut::new();
+        nbt::write_named(&mut body, "", &self.to_nbt());
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&body)?;
+        std::fs::write(player_path(dir, uuid), enc.finish()?)
+    }
+
+    /// Read `dir/<uuid>.dat`. `None` if the player has no saved data yet; an
+    /// `Err` for an unreadable/corrupt file.
+    pub fn load(dir: &Path, uuid: Uuid) -> io::Result<Option<Self>> {
+        let gz = match std::fs::read(player_path(dir, uuid)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut raw = Vec::new();
+        GzDecoder::new(&gz[..]).read_to_end(&mut raw)?;
+        let mut slice = bytes::Bytes::from(raw);
+        let (_, root) = nbt::read_named(&mut slice)?;
+        Ok(Self::from_nbt(&root))
+    }
+}
+
+/// The on-disk path for a player's data file (`<dir>/<uuid>.dat`), using the
+/// canonical hyphenated UUID string vanilla uses.
+fn player_path(dir: &Path, uuid: Uuid) -> std::path::PathBuf {
+    dir.join(format!("{uuid}.dat"))
+}
+
+fn as_double(tag: &Nbt) -> Option<f64> {
+    match tag {
+        Nbt::Double(v) => Some(*v),
+        _ => None,
+    }
+}
+
+fn as_float(tag: &Nbt) -> Option<f32> {
+    match tag {
+        Nbt::Float(v) => Some(*v),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "vela-playerdata-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    fn sample() -> PlayerData {
+        PlayerData {
+            x: 12.5,
+            y: 71.0,
+            z: -3.25,
+            yaw: 45.0,
+            pitch: -10.0,
+            on_ground: true,
+            selected_slot: 4,
+        }
+    }
+
+    #[test]
+    fn nbt_round_trips_in_memory() {
+        let data = sample();
+        assert_eq!(PlayerData::from_nbt(&data.to_nbt()), Some(data));
+    }
+
+    #[test]
+    fn file_round_trips_through_gzip() {
+        let dir = temp_dir();
+        let uuid = Uuid::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7788);
+        let data = sample();
+        data.save(&dir, uuid).unwrap();
+        assert_eq!(PlayerData::load(&dir, uuid).unwrap(), Some(data));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn absent_player_is_none() {
+        let dir = temp_dir();
+        let uuid = Uuid::from_u128(1);
+        assert_eq!(PlayerData::load(&dir, uuid).unwrap(), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
