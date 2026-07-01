@@ -1,6 +1,7 @@
 //! Per-chunk wire encoding: the 24-section block blob, mirroring vanilla's
 //! `LevelChunkSection` / `PalettedContainer` serialization.
 
+use crate::ids::BlockState;
 use crate::protocol::buffer::PacketWriter;
 
 use super::bitpack::pack_bits;
@@ -10,7 +11,7 @@ use super::{states, CELLS, COLUMNS, MIN_Y, PLAINS_BIOME, SECTION_COUNT};
 /// Encode the 24-section block blob for a chunk from its heights and edits.
 pub(super) fn encode_blob(
     heights: &[i32; COLUMNS],
-    edits: &std::collections::HashMap<u32, u32>,
+    edits: &std::collections::HashMap<u32, BlockState>,
 ) -> Vec<u8> {
     let mut out = PacketWriter::new();
     for section in 0..SECTION_COUNT {
@@ -26,7 +27,7 @@ pub(super) fn encode_blob(
 fn encode_section(
     base_y: i32,
     heights: &[i32; COLUMNS],
-    edits: &std::collections::HashMap<u32, u32>,
+    edits: &std::collections::HashMap<u32, BlockState>,
     out: &mut PacketWriter,
 ) {
     // Cell index is vanilla's `(y << 8) | (z << 4) | x`.
@@ -68,11 +69,11 @@ fn encode_section(
 /// Generated terrain uses ≤5 states per section; only block placement can push a
 /// section past the linear/hashmap ceiling, but the direct path is exercised for
 /// correctness rather than silently corrupting the section at 9 bits.
-fn write_block_palette(cells: &[u32; CELLS], out: &mut PacketWriter) {
+fn write_block_palette(cells: &[BlockState; CELLS], out: &mut PacketWriter) {
     // First-seen distinct states. Sections are overwhelmingly uniform or hold a
     // handful of states, so a linear `Vec` scan beats a hashed map here (the map
     // allocation + hashing dominates for tiny palettes on this hot path).
-    let mut palette: Vec<u32> = Vec::new();
+    let mut palette: Vec<BlockState> = Vec::new();
     for &c in cells.iter() {
         if !palette.contains(&c) {
             palette.push(c);
@@ -80,16 +81,18 @@ fn write_block_palette(cells: &[u32; CELLS], out: &mut PacketWriter) {
     }
 
     if palette.len() == 1 {
-        write_single_value(palette[0], out);
+        write_single_value(palette[0].get(), out);
         return;
     }
 
     if palette.len() > 256 {
-        // Direct/global palette: raw ids, no palette list.
-        let max_state = cells.iter().copied().max().unwrap_or(0);
+        // Direct/global palette: raw ids, no palette list. From here down we work
+        // in raw palette integers — the values packed into the data array are bit
+        // positions / ids, not `BlockState` identities.
+        let max_state = cells.iter().map(|c| c.get()).max().unwrap_or(0);
         let bits = bits_for_global(max_state);
         out.write_u8(bits as u8);
-        let indices: Vec<u64> = cells.iter().map(|&c| c as u64).collect();
+        let indices: Vec<u64> = cells.iter().map(|&c| c.get() as u64).collect();
         for long in pack_bits(&indices, bits) {
             out.write_i64(long as i64);
         }
@@ -101,7 +104,7 @@ fn write_block_palette(cells: &[u32; CELLS], out: &mut PacketWriter) {
     out.write_u8(bits as u8);
     out.write_varint(palette.len() as i32);
     for &state in &palette {
-        out.write_varint(state as i32);
+        out.write_varint(state.get() as i32);
     }
     let indices: Vec<u64> = cells
         .iter()
@@ -164,7 +167,7 @@ mod tests {
         // palette: a >8 bits byte, NO palette list, then the raw-id data array.
         let mut cells = [states::AIR; CELLS];
         for (i, c) in cells.iter_mut().take(300).enumerate() {
-            *c = i as u32 + 1; // ids 1..=300, all distinct
+            *c = BlockState(i as u32 + 1); // ids 1..=300, all distinct
         }
         let mut out = PacketWriter::new();
         write_block_palette(&cells, &mut out);
@@ -186,7 +189,7 @@ mod tests {
         let heights = chunk_heights(0, 0);
         for section in 0..SECTION_COUNT {
             let base_y = MIN_Y + section * 16;
-            let mut distinct: Vec<u32> = Vec::new();
+            let mut distinct: Vec<BlockState> = Vec::new();
             for ly in 0..16i32 {
                 for &h in heights.iter() {
                     let s = state_at(base_y + ly, h);

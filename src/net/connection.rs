@@ -95,7 +95,7 @@ pub async fn handle(
                 let protocol = reader.read_varint()?;
                 let host = reader.read_utf(255)?;
                 let port = reader.read_u16()?;
-                let intent = Intent::from_id(reader.read_varint()?);
+                let intent = Intent::try_from(reader.read_varint()?).ok();
                 info!(%peer, protocol, %host, port, ?intent, "handshake");
                 match intent {
                     Some(Intent::Status) => state = State::Status,

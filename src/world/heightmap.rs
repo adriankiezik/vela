@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::ids::BlockState;
+
 use super::bitpack::pack_bits;
 use super::chunk_data::cell_state;
 use super::{states, COLUMNS, MAX_Y_EXCL, MIN_Y, WORLD_HEIGHT};
@@ -18,7 +20,7 @@ use super::{states, COLUMNS, MAX_Y_EXCL, MIN_Y, WORLD_HEIGHT};
 /// broken surface lowers it.
 pub(super) fn compute_heightmaps(
     heights: &[i32; COLUMNS],
-    edits: &HashMap<u32, u32>,
+    edits: &HashMap<u32, BlockState>,
 ) -> Vec<(i32, Vec<i64>)> {
     // Bits = ceil(log2(worldHeight + 1)); a 384-tall column -> 9.
     let bits = ((WORLD_HEIGHT + 1) as u32)
@@ -50,7 +52,7 @@ pub(super) fn compute_heightmaps(
 /// are scanned downward from the world top. A fully-air column returns `MIN_Y`.
 fn column_first_empty(
     heights: &[i32; COLUMNS],
-    edits: &HashMap<u32, u32>,
+    edits: &HashMap<u32, BlockState>,
     edited_cols: &HashSet<u32>,
     lx: i32,
     lz: i32,

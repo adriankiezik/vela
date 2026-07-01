@@ -231,7 +231,7 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
 /// The block-state the player would place: their selected hotbar item mapped
 /// through the item→block table. `None` if no inventory, an empty slot, or a
 /// non-placeable item.
-fn held_block_state(world: &World, entity: Entity) -> Option<u32> {
+fn held_block_state(world: &World, entity: Entity) -> Option<crate::ids::BlockState> {
     let inv = world.get::<crate::inventory::Inventory>(entity)?;
     let slot = crate::inventory::HOTBAR_START + inv.selected as usize;
     let item_id = inv.slots[slot]?.id;
@@ -322,7 +322,7 @@ fn on_container_click(
 ) {
     use crate::inventory::{ClickType, Menu, OpenContainer};
 
-    let click = ClickType::from_id(mode);
+    let click = ClickType::from(mode);
     // Snapshot the inventory (and drag state) up front so we can build the menu
     // without holding a borrow across the menu run.
     let (slots, carried, drag_status, drag_type, drag_slots) = {

@@ -42,10 +42,11 @@ pub enum ClickType {
     PickupAll,
 }
 
-impl ClickType {
+impl From<i32> for ClickType {
     /// Decode the wire ordinal. Out-of-range values fall back to `Pickup`,
-    /// matching `ContainerInput`'s `ByIdMap.continuous(..., ZERO)` strategy.
-    pub fn from_id(id: i32) -> ClickType {
+    /// matching `ContainerInput`'s `ByIdMap.continuous(..., ZERO)` strategy — the
+    /// decode is total, so this is `From`, not `TryFrom`.
+    fn from(id: i32) -> ClickType {
         match id {
             0 => ClickType::Pickup,
             1 => ClickType::QuickMove,
@@ -324,6 +325,9 @@ impl Menu {
 
     // --- moveItemStackTo / quickMove ------------------------------------------
 
+    // See [`directed`] (module bottom) for the shared forward/backward slot walk
+    // used by the two passes below and `do_pickup_all`.
+
     /// `AbstractContainerMenu.moveItemStackTo` — merge then place `stack` into the
     /// `[start, end)` slot range, optionally scanning backwards. Mutates `stack`
     /// (the remainder) and returns whether anything moved.
@@ -332,9 +336,10 @@ impl Menu {
 
         // Pass 1: merge into existing matching stacks.
         if stack.is_stackable() {
-            let mut idx = if backwards { end as i32 - 1 } else { start as i32 };
-            while !stack.is_empty() && (if backwards { idx >= start as i32 } else { idx < end as i32 }) {
-                let slot = idx as usize;
+            for slot in directed(start, end, backwards) {
+                if stack.is_empty() {
+                    break;
+                }
                 let target = self.get_item(slot);
                 if !target.is_empty() && ItemStack::same_item_same_components(stack, &target) {
                     let total = target.count + stack.count;
@@ -353,15 +358,12 @@ impl Menu {
                         changed = true;
                     }
                 }
-                idx += if backwards { -1 } else { 1 };
             }
         }
 
         // Pass 2: drop the remainder into the first empty placeable slot.
         if !stack.is_empty() {
-            let mut idx = if backwards { end as i32 - 1 } else { start as i32 };
-            while if backwards { idx >= start as i32 } else { idx < end as i32 } {
-                let slot = idx as usize;
+            for slot in directed(start, end, backwards) {
                 let target = self.get_item(slot);
                 if target.is_empty() && self.may_place(slot, stack) {
                     let max = self.slot_max_stack_size(slot, stack);
@@ -370,7 +372,6 @@ impl Menu {
                     changed = true;
                     break;
                 }
-                idx += if backwards { -1 } else { 1 };
             }
         }
 
@@ -677,12 +678,14 @@ impl Menu {
         if carried.is_empty() || (self.has_item(slot) && self.may_pickup(slot)) {
             return;
         }
-        let size = self.slots.len() as i32;
-        let (start, step) = if button == 0 { (0i32, 1i32) } else { (size - 1, -1) };
+        let size = self.slots.len();
+        // Button 0 scans forward from the first slot, 1 backwards from the last.
+        let backwards = button != 0;
         for pass in 0..2 {
-            let mut i = start;
-            while i >= 0 && i < size && carried.count < carried.max_stack_size() {
-                let t = i as usize;
+            for t in directed(0, size, backwards) {
+                if carried.count >= carried.max_stack_size() {
+                    break;
+                }
                 let item = self.get_item(t);
                 if !item.is_empty()
                     && can_item_quick_replace(&item, &carried, true)
@@ -693,7 +696,6 @@ impl Menu {
                     let removed = self.safe_take(t, item.count, carried.max_stack_size() - carried.count);
                     carried.grow(removed.count);
                 }
-                i += step;
             }
         }
         self.carried = carried;
@@ -782,6 +784,40 @@ impl Menu {
         } else {
             self.reset_quick_craft();
         }
+    }
+}
+
+/// A `[start, end)` slot walk in forward or reverse order — the traversal shared
+/// by `moveItemStackTo`'s two passes and `do_pickup_all`. It replaces the
+/// hand-rolled `i32` cursor whose `if backwards` direction test had to be spelled
+/// three times per loop (init, bound, step) with the signed/`usize` casts that
+/// implied. A dedicated enum keeps it allocation-free: `Range` and `Rev<Range>`
+/// are distinct types, so they can't share an `impl Trait` return without either
+/// boxing or an external `Either`.
+enum Directed {
+    Forward(std::ops::Range<usize>),
+    Backward(std::iter::Rev<std::ops::Range<usize>>),
+}
+
+impl Iterator for Directed {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Directed::Forward(range) => range.next(),
+            Directed::Backward(range) => range.next(),
+        }
+    }
+}
+
+/// Walk `start..end` forwards, or `end-1..=start` backwards when `backwards`.
+/// `.rev()` visits exactly the same indices, so callers keep vanilla's two-pass
+/// `moveItemStackTo` semantics unchanged.
+fn directed(start: usize, end: usize, backwards: bool) -> Directed {
+    if backwards {
+        Directed::Backward((start..end).rev())
+    } else {
+        Directed::Forward(start..end)
     }
 }
 

@@ -37,13 +37,16 @@ pub enum Intent {
     Transfer,
 }
 
-impl Intent {
-    pub fn from_id(id: i32) -> Option<Self> {
+impl TryFrom<i32> for Intent {
+    type Error = ();
+
+    /// Decode the handshake intent id; an out-of-range value is the sole error.
+    fn try_from(id: i32) -> Result<Self, ()> {
         match id {
-            1 => Some(Intent::Status),
-            2 => Some(Intent::Login),
-            3 => Some(Intent::Transfer),
-            _ => None,
+            1 => Ok(Intent::Status),
+            2 => Ok(Intent::Login),
+            3 => Ok(Intent::Transfer),
+            _ => Err(()),
         }
     }
 }

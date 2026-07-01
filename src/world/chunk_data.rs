@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::ids::BlockState;
+
 use super::encoding::encode_blob;
 use super::heightmap::compute_heightmaps;
 use super::terrain::{state_at, surface_height};
@@ -38,8 +40,9 @@ pub struct ChunkColumns {
 struct ChunkData {
     heights: [i32; COLUMNS],
     /// `edit_key(lx, y, lz)` → overriding block-state id (AIR included, so a
-    /// broken surface block is represented explicitly).
-    edits: HashMap<u32, u32>,
+    /// broken surface block is represented explicitly). The key is a packed cell
+    /// position (a bit-index, not a state); the value is the confusable id.
+    edits: HashMap<u32, BlockState>,
     wire: Option<Arc<ChunkColumns>>,
     /// Set when an edit changed a cell since the last save; drives which chunks
     /// [`save_dirty_chunks`] persists. A freshly generated or just-loaded chunk
@@ -101,7 +104,7 @@ impl ChunkData {
 
     /// The block-state at local `(lx, y, lz)` — an edit if one exists, else the
     /// generated terrain state.
-    fn state(&self, lx: i32, y: i32, lz: i32) -> u32 {
+    fn state(&self, lx: i32, y: i32, lz: i32) -> BlockState {
         if let Some(key) = edit_key(lx, y, lz) {
             if let Some(&s) = self.edits.get(&key) {
                 return s;
@@ -115,7 +118,7 @@ impl ChunkData {
     /// removes any override instead of storing a redundant edit, and re-setting a
     /// cell to a value it already holds is a no-op — both keep the edit map sparse
     /// and avoid needlessly throwing away the cached wire blob.
-    fn set(&mut self, lx: i32, y: i32, lz: i32, state: u32) -> u32 {
+    fn set(&mut self, lx: i32, y: i32, lz: i32, state: BlockState) -> BlockState {
         let prev = self.state(lx, y, lz);
         if let Some(key) = edit_key(lx, y, lz) {
             let generated = state_at(y, self.heights[(lz * 16 + lx) as usize]);
@@ -153,11 +156,11 @@ impl ChunkData {
 /// which work on raw `(heights, edits)` rather than a borrowed `ChunkData`.
 pub(super) fn cell_state(
     heights: &[i32; COLUMNS],
-    edits: &HashMap<u32, u32>,
+    edits: &HashMap<u32, BlockState>,
     lx: i32,
     world_y: i32,
     lz: i32,
-) -> u32 {
+) -> BlockState {
     if let Some(key) = edit_key(lx, world_y, lz) {
         if let Some(&s) = edits.get(&key) {
             return s;
@@ -203,7 +206,7 @@ pub fn chunk_columns(cx: i32, cz: i32) -> Arc<ChunkColumns> {
 
 /// The block-state id at world `(x, y, z)` — an edit if present, else generated
 /// terrain. Out-of-world `y` reads as air.
-pub fn block_state_at(x: i32, y: i32, z: i32) -> u32 {
+pub fn block_state_at(x: i32, y: i32, z: i32) -> BlockState {
     if !(MIN_Y..MAX_Y_EXCL).contains(&y) {
         return states::AIR;
     }
@@ -215,7 +218,7 @@ pub fn block_state_at(x: i32, y: i32, z: i32) -> u32 {
 /// Set the block-state at world `(x, y, z)`, returning the previous state id.
 /// A no-op (returns air) for out-of-world `y`. Invalidates the chunk's cached
 /// wire blob so a freshly-streamed `level_chunk` reflects the edit.
-pub fn set_block(x: i32, y: i32, z: i32, state: u32) -> u32 {
+pub fn set_block(x: i32, y: i32, z: i32, state: BlockState) -> BlockState {
     if !(MIN_Y..MAX_Y_EXCL).contains(&y) {
         return states::AIR;
     }
