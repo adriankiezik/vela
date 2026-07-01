@@ -663,10 +663,8 @@ fn on_attack(world: &mut World, attacker: Entity, target_net_id: i32) {
         return; // unknown id, or the entity isn't a mob
     };
     // Reach check: reject a hit thrown from implausibly far away.
-    let within_reach = match (
-        world.get::<Pos>(attacker).map(|p| (p.x, p.y, p.z)),
-        world.get::<Pos>(target).map(|p| (p.x, p.y, p.z)),
-    ) {
+    let attacker_pos = world.get::<Pos>(attacker).map(|p| (p.x, p.y, p.z));
+    let within_reach = match (attacker_pos, world.get::<Pos>(target).map(|p| (p.x, p.y, p.z))) {
         (Some(a), Some(t)) => {
             let (dx, dy, dz) = (a.0 - t.0, a.1 - t.1, a.2 - t.2);
             dx * dx + dy * dy + dz * dz <= ATTACK_REACH_SQ
@@ -676,9 +674,23 @@ fn on_attack(world: &mut World, attacker: Entity, target_net_id: i32) {
     if !within_reach {
         return;
     }
-    // Land the blow: health subtraction, the hurt-animation flash, and the
-    // death/despawn all live in `mob::damage`.
-    super::mob::damage(world, target, PLAYER_ATTACK_DAMAGE);
+    // Land the blow: the i-frame gate, the `ClientboundDamageEventPacket`,
+    // knockback, hurt/death sounds, and the corpse/loot/XP all live in
+    // `mob::damage`. The attacker's id (for the damage event) and position (for the
+    // knockback direction) come from the player entity.
+    let attacker_id = world.get::<Profile>(attacker).map(|p| p.entity_id);
+    let ctx = match (attacker_id, attacker_pos) {
+        (Some(id), Some((ax, _ay, az))) => super::mob::DamageContext::player_attack(id, (ax, az)),
+        // No profile/pos (shouldn't happen for a real player): fall back to an
+        // attacker-less player-attack source so the hit still lands.
+        _ => super::mob::DamageContext {
+            attacker_id,
+            attacker_xz: None,
+            by_player: true,
+            damage_type: "minecraft:player_attack",
+        },
+    };
+    super::mob::damage(world, target, PLAYER_ATTACK_DAMAGE, &ctx);
     // causeFoodExhaustion(0.1) on a landed attack (`Player.attack`). Mobs have no
     // i-frames yet, so a hit within reach always connects.
     if let Some(mut food) = world.get_mut::<super::survival::FoodData>(attacker) {
