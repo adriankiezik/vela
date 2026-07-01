@@ -7,6 +7,7 @@
 //! `systems`. See `docs/ARCHITECTURE.md`.
 
 pub mod bridge;
+mod chat;
 mod chunking;
 mod commands;
 mod components;

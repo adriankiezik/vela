@@ -220,6 +220,7 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
                 tick_count: 0,
             },
             Meta::default(),
+            super::chat::ChatState::default(),
             LoadedChunks {
                 center: spawn_center,
                 loaded,

@@ -8,6 +8,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::bridge::{Outbound, Serverbound};
+use super::chat::{self, ChatSession, ChatState};
 use super::commands;
 use super::components::*;
 use super::packets;
@@ -45,17 +46,34 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
                 debug!(x = pos.x, y = pos.y, z = pos.z, yaw = pos.yaw, pitch = pos.pitch, on_ground = pos.on_ground, "move");
             }
         }
-        Serverbound::Chat(msg) => {
-            let Some(name) = world.get::<Profile>(entity).map(|p| p.name.clone()) else {
-                return;
-            };
-            info!(%name, message = %msg, "chat");
-            let bytes = packets::system_chat(&format!("<{name}> {msg}"));
-            // Fan out to every connection, including the sender.
-            let mut q = world.query::<&Conn>();
-            for conn in q.iter(world) {
-                let _ = conn.outbox.try_send(Outbound::Packet(bytes.clone()));
+        Serverbound::Chat {
+            message,
+            timestamp,
+            salt,
+            signature,
+        } => on_chat(world, entity, message, timestamp, salt, signature),
+        Serverbound::ChatSessionUpdate {
+            session_id,
+            expires_at,
+            public_key,
+            key_signature,
+        } => {
+            // Store the player's chat session (head of its signing chain). We
+            // keep the key/signature verbatim; verifying it against the yggdrasil
+            // service key is deferred (see `sim::chat`).
+            if let Some(mut state) = world.get_mut::<ChatState>(entity) {
+                state.session = Some(ChatSession {
+                    session_id,
+                    expires_at,
+                    public_key,
+                    key_signature,
+                });
+                debug!(%session_id, "chat session updated");
             }
+        }
+        Serverbound::CommandSuggestion { id, command } => {
+            let (start, length, matches) = commands::suggest(world, &command);
+            send_to_self(world, entity, chat::command_suggestions(id, start, length, &matches));
         }
         Serverbound::ChatCommand(line) => on_command(world, entity, &line),
         Serverbound::KeepAlive(echo) => {
@@ -478,19 +496,72 @@ fn inventory_mut(world: &mut World, entity: Entity) -> Mut<'_, crate::inventory:
         .expect("inventory just inserted")
 }
 
-/// Run a `/command` for `sender`. Like vanilla's `sendSuccess(..., false)`, the
+/// Run a `/command` for `sender`. Like vanilla's `sendSuccess(..., false)`, a
 /// reply goes only to the player who issued it; dispatch and the per-command
-/// handlers live in `commands`.
+/// handlers live in `commands`. A handler that fanned out its own output (chat
+/// broadcast, private message) returns `None` and no reply is sent here.
 fn on_command(world: &mut World, sender: Entity, line: &str) {
     let Some(name) = world.get::<Profile>(sender).map(|p| p.name.clone()) else {
         return;
     };
     info!(%name, command = %line, "command");
 
-    let reply = commands::run(world, sender, line);
-    let bytes = packets::system_chat_component(&reply);
-    if let Some(conn) = world.get::<Conn>(sender) {
-        let _ = conn.outbox.try_send(Outbound::Packet(bytes));
+    if let Some(reply) = commands::run(world, sender, line) {
+        let bytes = packets::system_chat_component(&reply);
+        send_to_self(world, sender, bytes);
+    }
+}
+
+/// Handle a `ServerboundChatPacket`: broadcast the message to every player as an
+/// (unsigned) `ClientboundPlayerChatPacket`, mirroring
+/// `ServerGamePacketListenerImpl.broadcastChatMessage` →
+/// `PlayerList.broadcastChatMessage`. The `globalIndex` is per-recipient
+/// (vanilla's `nextChatIndex`), so the packet is rebuilt for each viewer.
+///
+/// The signing fields (`timestamp`/`salt`/`signature`) are forwarded into the
+/// body but the message goes out **unsigned** (signature absent, link index 0):
+/// see `sim::chat` for why signed forwarding is deferred.
+fn on_chat(
+    world: &mut World,
+    sender: Entity,
+    message: String,
+    timestamp: i64,
+    salt: i64,
+    signature: Option<Vec<u8>>,
+) {
+    let Some((name, sender_uuid)) = world
+        .get::<Profile>(sender)
+        .map(|p| p.name.clone())
+        .zip(world.get::<PlayerId>(sender).map(|p| p.0))
+    else {
+        return;
+    };
+    info!(%name, message = %message, signed = signature.is_some(), "chat");
+
+    let name_component = super::text::text(name);
+    let recipients: Vec<Entity> = {
+        let mut q = world.query::<(Entity, &Conn)>();
+        q.iter(world).map(|(e, _)| e).collect()
+    };
+    for recipient in recipients {
+        let global_index = {
+            let Some(mut state) = world.get_mut::<ChatState>(recipient) else {
+                continue;
+            };
+            let gi = state.global_index;
+            state.global_index = state.global_index.wrapping_add(1);
+            gi
+        };
+        let bytes = chat::player_chat(
+            global_index,
+            sender_uuid,
+            &message,
+            timestamp,
+            salt,
+            chat::CHAT_TYPE_CHAT,
+            &name_component,
+        );
+        send_to_self(world, recipient, bytes);
     }
 }
 

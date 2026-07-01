@@ -52,11 +52,43 @@ pub enum Serverbound {
         pitch: Option<f32>,
         on_ground: bool,
     },
-    Chat(String),
+    /// `ServerboundChatPacket` — a chat message. The signing fields are decoded
+    /// faithfully (`timestamp`/`salt`/`signature`) so the message-signing chain
+    /// can be modelled; the `last_seen` acknowledgement window is decoded and
+    /// dropped (we don't yet maintain a per-player last-seen tracker).
+    Chat {
+        message: String,
+        /// Client timestamp in epoch milliseconds (`FriendlyByteBuf.readInstant`).
+        timestamp: i64,
+        /// The signing salt (0 when the message is unsigned).
+        salt: i64,
+        /// The 256-byte RSA message signature, when the client signed the message.
+        signature: Option<Vec<u8>>,
+    },
     /// A `/command` line (the client strips the leading `/`). Both the unsigned
     /// and signed serverbound variants collapse here — we run the same handlers
     /// and ignore signatures.
     ChatCommand(String),
+    /// `ServerboundChatSessionUpdatePacket` — the client publishing its chat
+    /// session (a session id plus the profile public key that signs its
+    /// messages). Stored per player as the head of the message-signing chain.
+    ChatSessionUpdate {
+        session_id: Uuid,
+        /// Key expiry in epoch milliseconds.
+        expires_at: i64,
+        /// The X.509-encoded RSA public key.
+        public_key: Vec<u8>,
+        /// Mojang's signature over the key (verified against the yggdrasil root
+        /// in full secure-chat; verification is stubbed here — see `sim::chat`).
+        key_signature: Vec<u8>,
+    },
+    /// `ServerboundCommandSuggestionPacket` — a tab-completion request for a
+    /// partial command line. `id` is the transaction id echoed in the reply;
+    /// `command` is the full text being completed (including the leading `/`).
+    CommandSuggestion {
+        id: i32,
+        command: String,
+    },
     KeepAlive(i64),
     AcceptTeleport(i32),
     /// `ServerboundSwingPacket` — an arm swing. `hand` is the `InteractionHand`
