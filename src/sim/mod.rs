@@ -10,6 +10,7 @@ pub mod bridge;
 mod chunking;
 mod commands;
 mod components;
+mod entity;
 mod movement;
 mod packet_handlers;
 mod packets;
