@@ -162,7 +162,7 @@ mod tests {
         // bedrock cell; dig that out too and the whole column is air, so
         // firstAvailable == minY -> stored 0. Exercises the `MIN_Y` return path.
         let mut heights = flat_heights(63);
-        let col = (0 * 16 + 0) as usize;
+        let col = 0usize; // column (x=0, z=0): index x * 16 + z
         heights[col] = MIN_Y - 1; // surface below the world floor
         let mut edits = HashMap::new();
         edits.insert(key(0, MIN_Y, 0), states::AIR); // remove the bedrock cell

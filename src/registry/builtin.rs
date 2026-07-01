@@ -1920,6 +1920,16 @@ pub static CREATIVE_MODE_TAB: Registry = Registry {
     ],
 };
 
+/// Every flat registry in this module, for exhaustive tests/iteration.
+#[allow(dead_code)]
+pub static ALL: &[&Registry] = &[
+        &ENTITY_TYPE, &BLOCK, &BLOCK_ENTITY_TYPE, &MENU, &DATA_COMPONENT_TYPE, &MOB_EFFECT,
+        &PARTICLE_TYPE, &SOUND_EVENT, &FLUID, &ATTRIBUTE, &POTION, &VILLAGER_PROFESSION, &VILLAGER_TYPE,
+        &GAME_EVENT, &RECIPE_SERIALIZER, &RECIPE_TYPE, &RECIPE_BOOK_CATEGORY, &COMMAND_ARGUMENT_TYPE,
+        &STAT_TYPE, &CUSTOM_STAT, &MAP_DECORATION_TYPE, &POINT_OF_INTEREST_TYPE, &POSITION_SOURCE_TYPE,
+        &CREATIVE_MODE_TAB,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1947,13 +1957,3 @@ mod tests {
         }
     }
 }
-
-/// Every flat registry in this module, for exhaustive tests/iteration.
-#[allow(dead_code)]
-pub static ALL: &[&Registry] = &[
-        &ENTITY_TYPE, &BLOCK, &BLOCK_ENTITY_TYPE, &MENU, &DATA_COMPONENT_TYPE, &MOB_EFFECT,
-        &PARTICLE_TYPE, &SOUND_EVENT, &FLUID, &ATTRIBUTE, &POTION, &VILLAGER_PROFESSION, &VILLAGER_TYPE,
-        &GAME_EVENT, &RECIPE_SERIALIZER, &RECIPE_TYPE, &RECIPE_BOOK_CATEGORY, &COMMAND_ARGUMENT_TYPE,
-        &STAT_TYPE, &CUSTOM_STAT, &MAP_DECORATION_TYPE, &POINT_OF_INTEREST_TYPE, &POSITION_SOURCE_TYPE,
-        &CREATIVE_MODE_TAB,
-];

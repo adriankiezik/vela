@@ -17,7 +17,7 @@ mod eula;
 mod players;
 mod properties;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tracing::{info, warn};
 
@@ -73,12 +73,6 @@ impl ServerConfig {
             players,
             favicon,
         })
-    }
-
-    /// Load config from the current working directory — the normal entry point.
-    /// Returns `None` when the EULA gate blocks startup (clean exit).
-    pub fn load_from_cwd() -> Option<Self> {
-        Self::load(PathBuf::from("."))
     }
 }
 

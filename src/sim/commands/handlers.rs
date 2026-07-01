@@ -8,7 +8,7 @@ use crate::protocol::nbt::Nbt;
 
 use crate::sim::bridge::Outbound;
 use crate::sim::chat;
-use crate::sim::components::{Config, Conn, PlayerId, Profile};
+use crate::sim::components::{Config, Conn, Control, PlayerId, Profile};
 use crate::sim::packets;
 use crate::sim::text;
 
@@ -45,6 +45,15 @@ pub(super) fn cmd_list(world: &mut World, _sender: Entity, args: &str) -> Option
             text::text(names.join(", ")),
         ],
     ))
+}
+
+/// `/stop` — request a graceful server shutdown. Vanilla replies
+/// `commands.stop.stopping` ("Stopping the server") as a broadcast success, then
+/// halts; here we raise the shared shutdown flag the run loop watches, so the
+/// next tick saves the world (`persistence::shutdown`) and the process exits.
+pub(super) fn cmd_stop(world: &mut World, _sender: Entity, _args: &str) -> Option<Nbt> {
+    world.resource::<Control>().request_shutdown();
+    Some(text::translatable("commands.stop.stopping", vec![]))
 }
 
 // --- Chat / messaging commands ----------------------------------------------

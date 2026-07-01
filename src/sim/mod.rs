@@ -12,6 +12,7 @@ mod chunking;
 mod commands;
 mod components;
 mod entity;
+mod item_tick;
 mod movement;
 mod packet_handlers;
 mod packets;
@@ -21,6 +22,7 @@ mod systems;
 mod text;
 mod world_tick;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,7 +40,11 @@ const TICK: Duration = Duration::from_millis(50);
 /// Run the simulation loop until the ingress channel closes (all connections
 /// gone and the listener dropped — i.e. shutdown). Blocks the calling thread;
 /// spawn it on a dedicated OS thread, not a tokio worker.
-pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
+pub fn run(
+    rx: tokio::sync::mpsc::Receiver<ToSim>,
+    config: Arc<ServerConfig>,
+    shutdown: Arc<AtomicBool>,
+) {
     let mut world = World::new();
     world.insert_resource(Ingress(Mutex::new(rx)));
     world.insert_resource(Config(config));
@@ -46,7 +52,9 @@ pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
     // Entity id 1 is the first player; the framing test pins the first join to 1.
     world.insert_resource(NextEntityId(1));
     world.init_resource::<PlayerIndex>();
-    world.init_resource::<Control>();
+    // The network half raises this flag on Ctrl+C; the run loop watches it (and
+    // the `/stop` command sets it) so an external shutdown saves the world.
+    world.insert_resource(Control { stop: false, signal: shutdown });
     // World clock / weather / game rules (day-night cycle, weather, rules).
     world.init_resource::<world_tick::GameRules>();
     world.init_resource::<world_tick::WorldTime>();
@@ -62,6 +70,11 @@ pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
             systems::advance_tick,
             systems::drain_ingress,
             world_tick::world_tick,
+            // Dropped-item physics/pickup/merge/despawn. Runs after world_tick
+            // (its own state) and before broadcast_movement; item entities emit
+            // their own movement packets here rather than through the player-only
+            // broadcast_movement path.
+            item_tick::item_tick,
             movement::broadcast_movement,
             // Dynamic chunk streaming: must run after movement is applied so the
             // loaded-chunk set follows the player's current position this tick.
@@ -81,8 +94,8 @@ pub fn run(rx: tokio::sync::mpsc::Receiver<ToSim>, config: Arc<ServerConfig>) {
         // Periodic autosave (self-gates on the world clock).
         persistence::autosave(&mut world);
 
-        if world.resource::<Control>().stop {
-            info!("ingress closed; simulation stopping");
+        if world.resource::<Control>().should_stop() {
+            info!("shutdown requested; simulation stopping");
             persistence::shutdown(&mut world);
             return;
         }

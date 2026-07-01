@@ -51,8 +51,12 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
     let mut syaw = 0.0f32;
     let mut spitch = 0.0f32;
     let mut son_ground = false;
-    // Restore a returning player's saved position/orientation, if any. A read
-    // error is logged and the fresh-spawn defaults above are kept.
+    // Fresh-spawn inventory defaults (empty, first hotbar slot selected), replaced
+    // below if the player has saved data.
+    let mut inv_slots = [None; crate::inventory::PLAYER_INVENTORY_SLOTS];
+    let mut inv_selected: u8 = 0;
+    // Restore a returning player's saved position/orientation/inventory, if any. A
+    // read error is logged and the fresh-spawn defaults above are kept.
     if let Some(dir) = crate::world::storage::player_data_dir() {
         match crate::world::storage::PlayerData::load(&dir, id) {
             Ok(Some(pd)) => {
@@ -62,11 +66,23 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
                 syaw = pd.yaw;
                 spitch = pd.pitch;
                 son_ground = pd.on_ground;
+                inv_slots = pd.inventory;
+                inv_selected = pd.selected_slot.clamp(0, 8) as u8;
             }
             Ok(None) => {}
             Err(e) => warn!(%name, error = %e, "failed to read player data; spawning fresh"),
         }
     }
+    // The player's game mode is attached at join (seeded from the server-default
+    // `gamemode`) so every system can rely on it being present — matching vanilla,
+    // where a `ServerPlayer` always has a `GameType`. Per-player persistence /
+    // `/gamemode` is a separate follow-up; for now every player gets the default.
+    let game_mode = GameMode::from_id(world.resource::<Config>().0.properties.gamemode());
+    // Seed the player's inventory component from the saved (or empty) snapshot so
+    // it, too, exists from the first tick — no lazy attach.
+    let mut inventory = crate::inventory::Inventory::new();
+    inventory.slots = inv_slots;
+    inventory.selected = inv_selected;
     let join = world.resource::<Config>().join_params();
 
     // The whole join sequence flows through the outbox. If it overflows mid-burst
@@ -196,6 +212,25 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
     // are moved into the player's components below.
     super::entity::spawn_existing_entities_for(world, &outbox, &loaded);
 
+    // Sync the (loaded or fresh) inventory to the newcomer, mirroring vanilla
+    // `PlayerList.sendAllPlayerInfo`: a full `ContainerSetContent` for the player
+    // menu (window 0) plus the selected-hotbar `SetHeldSlot`. Without this the
+    // server holds a restored inventory the client never hears about, so a
+    // returning player sees an empty inventory until an interaction forces a
+    // resync. (Vela has no per-tick `broadcastChanges`; this is the one-shot
+    // equivalent.)
+    let inv_state_id = inventory.next_state_id();
+    send(
+        &outbox,
+        crate::inventory::container_set_content(
+            0,
+            inv_state_id,
+            &inventory.slots,
+            inventory.carried.as_ref(),
+        ),
+    );
+    send(&outbox, crate::inventory::set_held_slot(inventory.selected as i32));
+
     let entity = world
         .spawn((
             PlayerId(id),
@@ -231,6 +266,8 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
                 awaiting: false,
                 last_tick: tick,
             },
+            inventory,
+            game_mode,
         ))
         .id();
     world.resource_mut::<PlayerIndex>().0.insert(id, entity);
@@ -330,10 +367,28 @@ pub(super) fn on_left(world: &mut World, id: Uuid) {
     }
 }
 
-/// Persist a leaving player's position, orientation, and held slot to
-/// `playerdata/<uuid>.dat`. A no-op when persistence is disabled. The held slot
-/// comes from the player's `Inventory` if one was attached this session (else 0);
-/// the full inventory round-trip is deferred.
+/// Persist every currently-online player's data, mirroring vanilla
+/// `PlayerList.saveAll`. Called from the periodic autosave and the shutdown save
+/// so a server stopped (Ctrl+C / `/stop`) with players still connected does not
+/// lose their inventory/position — `on_left` only runs on an individual
+/// disconnect, which never happens for a player online at shutdown.
+pub(super) fn save_all_players(world: &mut World) {
+    if crate::world::storage::player_data_dir().is_none() {
+        return;
+    }
+    let players: Vec<(Entity, Uuid)> = {
+        let mut q = world.query::<(Entity, &PlayerId)>();
+        q.iter(world).map(|(e, pid)| (e, pid.0)).collect()
+    };
+    for (entity, id) in players {
+        save_player_data(world, entity, id);
+    }
+}
+
+/// Persist a leaving player's position, orientation, and inventory to
+/// `playerdata/<uuid>.dat`. A no-op when persistence is disabled. The inventory
+/// (and selected hotbar slot) come from the player's `Inventory` component, which
+/// is now attached at join, so both are always present for a real player.
 fn save_player_data(world: &World, entity: Entity, id: Uuid) {
     let Some(dir) = crate::world::storage::player_data_dir() else {
         return;
@@ -341,10 +396,10 @@ fn save_player_data(world: &World, entity: Entity, id: Uuid) {
     let Some(pos) = world.get::<Pos>(entity) else {
         return;
     };
-    let selected_slot = world
+    let (selected_slot, inventory) = world
         .get::<crate::inventory::Inventory>(entity)
-        .map(|inv| inv.selected as i32)
-        .unwrap_or(0);
+        .map(|inv| (inv.selected as i32, inv.slots))
+        .unwrap_or((0, [None; crate::inventory::PLAYER_INVENTORY_SLOTS]));
     let data = crate::world::storage::PlayerData {
         x: pos.x,
         y: pos.y,
@@ -353,6 +408,7 @@ fn save_player_data(world: &World, entity: Entity, id: Uuid) {
         pitch: pos.pitch,
         on_ground: pos.on_ground,
         selected_slot,
+        inventory,
     };
     if let Err(e) = data.save(&dir, id) {
         warn!(error = %e, "failed to save player data");

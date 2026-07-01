@@ -34,13 +34,11 @@ use syncher::{DataValue, EntityData};
 // Hard-coded (like the player's id in `sim::packets`) with a test below pinning
 // them to the registry so a reordering is caught.
 //
-// These, and the spawn API below, have no in-game trigger yet (pickup/drop and
-// mob spawning land in a later milestone), so they read as dead in a non-test
-// build — the same "scaffolding the sim will use once the gameplay path exists"
-// state as several `crate::inventory` builders. The tracking half
-// (`spawn_existing_entities_for`) is already live on the join path.
+// The item path is now live: breaking a block in survival spawns a
+// `minecraft:item` via `spawn_item_entity` (see `sim::packet_handlers`). The XP
+// orb path still has no in-game trigger (mob/ore XP lands later), so its spawn
+// helper and constant read as dead in a non-test build.
 /// `minecraft:item` — the dropped-item entity type.
-#[allow(dead_code)]
 const ENTITY_TYPE_ITEM: i32 = 71;
 /// `minecraft:experience_orb`.
 #[allow(dead_code)]
@@ -50,7 +48,6 @@ const ENTITY_TYPE_EXPERIENCE_ORB: i32 = 49;
 // `SynchedEntityData.defineId` assigns indices in class-hierarchy order; `Entity`
 // itself occupies 0..=7, so the first field of a direct `Entity` subclass is 8.
 /// `ItemEntity.DATA_ITEM` — the carried `ItemStack` (accessor index 8).
-#[allow(dead_code)]
 const ITEM_ENTITY_DATA_ITEM: u8 = 8;
 /// `ExperienceOrb.DATA_VALUE` — the orb's XP amount (accessor index 8).
 #[allow(dead_code)]
@@ -73,9 +70,11 @@ pub struct NetEntity {
 #[derive(Component)]
 pub struct EntityMeta(pub EntityData);
 
-/// Marker for dropped-item entities (`minecraft:item`).
+/// Marker for dropped-item entities (`minecraft:item`). Inserted by
+/// [`spawn_item_entity`] on every survival block break; the item-pickup system
+/// (another module) queries `(&NetEntity, &Pos, &ItemDrop, &EntityMeta)` to find
+/// stacks to hand to a nearby player.
 #[derive(Component)]
-#[allow(dead_code)] // classifies spawned items; queried once gameplay (pickup) exists.
 pub struct ItemDrop;
 
 /// Marker for XP orbs (`minecraft:experience_orb`).
@@ -90,7 +89,6 @@ fn chunk_of(x: f64, z: f64) -> (i32, i32) {
 }
 
 /// Allocate the next network entity id (shared with players).
-#[allow(dead_code)] // used by the spawn API, which has no in-game trigger yet.
 fn alloc_id(world: &mut World) -> i32 {
     let mut next = world.resource_mut::<NextEntityId>();
     let v = next.0;
@@ -100,7 +98,6 @@ fn alloc_id(world: &mut World) -> i32 {
 
 /// A fresh random entity UUID. Non-player entities have no account identity, so
 /// any unique value works (vanilla uses `Mth.createInsecureUUID`).
-#[allow(dead_code)] // used by the spawn API, which has no in-game trigger yet.
 fn random_uuid() -> Uuid {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -113,7 +110,9 @@ fn random_uuid() -> Uuid {
 /// The metadata mirrors `ItemEntity`: `DATA_ITEM` (index 8) holds the stack.
 /// Pickup and physics are not modelled yet — the item renders and sits where it
 /// spawned.
-#[allow(dead_code)] // public spawn API; no in-game trigger (drop/death) yet.
+///
+/// Live trigger: `sim::packet_handlers` calls this for each stack returned by
+/// `world::block_drop::drops_for` when a survival player finishes breaking a block.
 pub fn spawn_item_entity(world: &mut World, pos: (f64, f64, f64), stack: ItemStack) -> i32 {
     let id = alloc_id(world);
     let uuid = random_uuid();
@@ -159,7 +158,6 @@ pub fn spawn_xp_orb(world: &mut World, pos: (f64, f64, f64), value: i32) -> i32 
 
 /// Spawn a net entity into the world and pair it to every tracking viewer.
 /// `tag` inserts any type-specific marker component onto the new entity.
-#[allow(dead_code)] // used by the spawn API, which has no in-game trigger yet.
 fn spawn_tracked(
     world: &mut World,
     net: NetEntity,

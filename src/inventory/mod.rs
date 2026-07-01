@@ -26,11 +26,13 @@ mod container;
 mod item_stack;
 mod menu;
 mod packets;
+mod persistence;
 
 pub use container::{Inventory, HOTBAR_START, PLAYER_INVENTORY_SLOTS};
 pub use item_stack::{read_item_stack, ItemStack};
 pub use menu::{ClickType, Menu, OpenContainer};
 pub use packets::container_set_content;
+pub use persistence::{inventory_from_nbt, inventory_to_nbt};
 
 // Scaffolding surface: re-exported for a complete public API but not yet consumed
 // elsewhere in the crate. The underlying items carry their own `dead_code` allows;

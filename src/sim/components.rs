@@ -4,6 +4,7 @@
 //! `Conn` + `KeepAlive`. World-wide state lives in resources.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bevy_ecs::prelude::*;
@@ -79,6 +80,38 @@ pub struct Meta {
     pub flying: bool,
 }
 
+/// A player's game mode, mirroring vanilla `GameType`
+/// (`net.minecraft.world.level.GameType`, MC 26.2). The discriminants match the
+/// enum's ordinal / wire id exactly (`SURVIVAL=0, CREATIVE=1, ADVENTURE=2,
+/// SPECTATOR=3`), which is also what `GameType.getId()` returns.
+///
+/// Attached lazily to a player entity on first query (seeded from the
+/// server-default `gamemode` in `server.properties`); see `packet_handlers`.
+/// Per-player mode replaces the previous "everyone is whatever server.properties
+/// says" assumption, so e.g. block-break drops can be gated on the *breaking*
+/// player's mode.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GameMode {
+    Survival = 0,
+    Creative = 1,
+    Adventure = 2,
+    Spectator = 3,
+}
+
+impl GameMode {
+    /// Resolve a wire/registration id to a mode. Mirrors `GameType.byId`, whose
+    /// `ByIdMap.OutOfBoundsStrategy.ZERO` maps any out-of-range id to the first
+    /// entry (`SURVIVAL`) rather than failing.
+    pub fn from_id(id: u8) -> Self {
+        match id {
+            1 => GameMode::Creative,
+            2 => GameMode::Adventure,
+            3 => GameMode::Spectator,
+            _ => GameMode::Survival,
+        }
+    }
+}
+
 /// The set of chunk columns currently streamed to a player, plus the chunk
 /// center the set was last computed around. Mirrors the per-player slice of
 /// vanilla's `ChunkMap`/`PlayerChunkSender` bookkeeping: the streaming system
@@ -127,11 +160,28 @@ pub struct NextEntityId(pub i32);
 #[derive(Resource, Default)]
 pub struct PlayerIndex(pub HashMap<Uuid, Entity>);
 
-/// Set when the ingress channel closes (server shutting down); the run loop
-/// checks it and stops.
+/// Drives the run loop's exit. `stop` is set from within the simulation thread
+/// (the ingress channel closed — all connections gone). `signal` is a shared
+/// flag the network half sets from *another* thread to request a graceful
+/// shutdown (Ctrl+C) without waiting for connections to drain; the `/stop`
+/// command sets it too. The run loop stops when either is raised, then saves.
 #[derive(Resource, Default)]
 pub struct Control {
     pub stop: bool,
+    pub signal: Arc<AtomicBool>,
+}
+
+impl Control {
+    /// True when either the ingress channel closed or an external shutdown was
+    /// requested (Ctrl+C / `/stop`).
+    pub fn should_stop(&self) -> bool {
+        self.stop || self.signal.load(Ordering::Relaxed)
+    }
+
+    /// Request a graceful shutdown from this thread (used by `/stop`).
+    pub fn request_shutdown(&self) {
+        self.signal.store(true, Ordering::Relaxed);
+    }
 }
 
 /// The loaded server configuration, shared with the network half. Held so the

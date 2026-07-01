@@ -36,7 +36,10 @@ pub fn boot(world: &mut World) {
         .properties
         .level_name()
         .to_string();
-    storage::init(&level_name);
+    // Root the world under the runtime dir (CWD for a shipped binary, the
+    // `target/…` exe dir under `cargo run`) so a dev run keeps the generated
+    // `world/` inside `target/` instead of next to `src/world`.
+    storage::init(crate::runtime::dir().join(&level_name));
     if !storage::is_enabled() {
         info!("world persistence disabled (could not open save directory)");
         return;
@@ -85,6 +88,7 @@ pub fn autosave(world: &mut World) {
     let game_time = world.resource::<WorldTime>().game_time;
     crate::world::save_dirty_chunks(game_time);
     save_level_dat(world);
+    super::player_lifecycle::save_all_players(world);
     info!(game_time, "autosaved world");
 }
 
@@ -96,6 +100,7 @@ pub fn shutdown(world: &mut World) {
     let game_time = world.resource::<WorldTime>().game_time;
     crate::world::save_dirty_chunks(game_time);
     save_level_dat(world);
+    super::player_lifecycle::save_all_players(world);
     info!("world saved on shutdown");
 }
 
@@ -108,7 +113,9 @@ fn apply(world: &mut World, data: &LevelData) {
         time.game_time = data.game_time;
         time.day_time = data.day_time;
     }
-    world.resource_mut::<GameRules>().apply_saved(&data.game_rules);
+    world
+        .resource_mut::<GameRules>()
+        .apply_saved(&data.game_rules);
 }
 
 /// Write `level.dat` from the current clock, game rules, and the origin spawn.

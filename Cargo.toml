@@ -5,7 +5,7 @@ edition = "2021"
 description = "Vela — a clean-room Minecraft server (protocol 776 / MC 26.2) written in Rust"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 # Core ECS only — default features drag in bevy_reflect/glam/wgpu/web-sys, none
 # of which a server needs. `std` keeps the standard executor and collections.
 bevy_ecs = { version = "0.18", default-features = false, features = ["std"] }

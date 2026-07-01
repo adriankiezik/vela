@@ -191,6 +191,18 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
                         z,
                         packets::block_update(x, y, z, crate::world::AIR_STATE),
                     );
+                    // Spawn the block's drops as item entities, mirroring
+                    // `Block.playerDestroy` → `dropResources` → `popResource`.
+                    // Only survival drops: creative destroys without drops, and
+                    // adventure/spectator either can't break or don't drop (we gate
+                    // strictly on Survival for now — see task scope). The pickup
+                    // system will later consume these `ItemDrop` entities.
+                    if player_game_mode(world, entity) == GameMode::Survival {
+                        for stack in crate::world::block_drop::drops_for(prev) {
+                            let pos = drop_position(x, y, z);
+                            super::entity::spawn_item_entity(world, pos, stack);
+                        }
+                    }
                 }
             }
             ack_block_change(world, entity, sequence);
@@ -217,10 +229,17 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
                 // (loosely — air is the one replaceable state we model).
                 if crate::world::block_state_at(px, py, pz) == crate::world::AIR_STATE {
                     crate::world::set_block(px, py, pz, state);
-                    // Simplified placement: the held stack is NOT decremented and
-                    // there is no reach/cursor validation — this is infinite-blocks
-                    // demo placement, not survival inventory logic.
                     broadcast_block_update(world, px, pz, packets::block_update(px, py, pz, state));
+                    // Consume one from the held stack in survival, matching vanilla
+                    // `BlockItem.place` → `ItemStack.shrink(1)` (creative places for
+                    // free). The client predicts this decrement, so we resync the
+                    // authoritative inventory to confirm it — without the consume,
+                    // the client's predicted −1 and the server's untouched stack
+                    // desync, surfacing as a doubled count once a later
+                    // server-driven resync (e.g. breaking the block) lands.
+                    if player_game_mode(world, entity) == GameMode::Survival {
+                        consume_held_item(world, entity);
+                    }
                 }
             }
             ack_block_change(world, entity, sequence);
@@ -236,6 +255,63 @@ fn held_block_state(world: &World, entity: Entity) -> Option<crate::ids::BlockSt
     let slot = crate::inventory::HOTBAR_START + inv.selected as usize;
     let item_id = inv.slots[slot]?.id;
     crate::world::block_state_for_item(item_id)
+}
+
+/// Consume one item from the player's selected hotbar slot after a successful
+/// placement (vanilla `BlockItem.place` → `ItemStack.shrink(1)`), clearing the
+/// slot when it empties, then resync the authoritative inventory to the client so
+/// its predicted decrement is confirmed rather than doubled.
+fn consume_held_item(world: &mut World, entity: Entity) {
+    let content = {
+        let mut inv = inventory_mut(world, entity);
+        let slot = crate::inventory::HOTBAR_START + inv.selected as usize;
+        match &mut inv.slots[slot] {
+            Some(stack) => {
+                stack.shrink(1);
+                if stack.is_empty() {
+                    inv.slots[slot] = None;
+                }
+            }
+            None => return, // nothing held (shouldn't happen — caller checked)
+        }
+        let state_id = inv.next_state_id();
+        crate::inventory::container_set_content(0, state_id, &inv.slots, inv.carried.as_ref())
+    };
+    send_to_self(world, entity, content);
+}
+
+/// The breaking player's game mode, attached lazily (like `Inventory`) so the
+/// join path stays untouched. First use seeds it from the server-default
+/// `gamemode` in `server.properties` (`GameType.byId`); once persisted per-player
+/// modes / `/gamemode` exist, this component is where they live.
+fn player_game_mode(world: &mut World, entity: Entity) -> GameMode {
+    if let Some(gm) = world.get::<GameMode>(entity) {
+        return *gm;
+    }
+    let default = GameMode::from_id(world.resource::<Config>().0.properties.gamemode());
+    world.entity_mut(entity).insert(default);
+    default
+}
+
+/// The spawn position for a dropped item at block `(x, y, z)`, matching
+/// `Block.popResource` (MC 26.2): block center `+0.5` on each axis, jittered by
+/// `Mth.nextDouble(random, -0.25, 0.25)` (= `random.nextDouble() * 0.5 - 0.25`),
+/// with the Y additionally lowered by half the item entity's height (its bbox is
+/// `EntityType.ITEM` = 0.25 tall, so `-0.125`). We reuse the project's `rand`
+/// (the same crate `sim::entity` uses for entity UUIDs); vanilla draws from the
+/// level RNG, which is likewise non-deterministic here. Velocity is not applied:
+/// item physics/motion is not modelled yet (`sim::entity` spawns items at rest),
+/// so the small `(±0.1, 0.2, ±0.1)` `setDeltaMovement` kick is intentionally
+/// dropped — noted for when item ticking lands.
+fn drop_position(x: i32, y: i32, z: i32) -> (f64, f64, f64) {
+    /// Half of `EntityType.ITEM`'s 0.25-block height (`popResource`'s `halfHeight`).
+    const HALF_ITEM_HEIGHT: f64 = 0.125;
+    let jitter = || rand::random::<f64>() * 0.5 - 0.25;
+    (
+        x as f64 + 0.5 + jitter(),
+        y as f64 + 0.5 + jitter() - HALF_ITEM_HEIGHT,
+        z as f64 + 0.5 + jitter(),
+    )
 }
 
 /// The unit step of a `Direction` 3D-data value (`Direction.java`): 0 DOWN,

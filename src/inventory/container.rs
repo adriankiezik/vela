@@ -78,6 +78,109 @@ impl Inventory {
             false
         }
     }
+
+    /// The container slots that `Inventory.add` may store into, in vanilla's
+    /// `Inventory.items` scan order. Vanilla's backing list is 36 entries —
+    /// indices `0..=8` the hotbar, `9..=35` the main inventory — so a plain
+    /// `for i in 0..36` visits the hotbar first, then the main grid. This maps
+    /// that order onto Vela's 46-slot `InventoryMenu` layout, where the hotbar is
+    /// container slots `36..=44` and the main inventory is `9..=35`.
+    fn storage_slots() -> impl Iterator<Item = usize> {
+        (HOTBAR_START..HOTBAR_START + 9).chain(9..HOTBAR_START)
+    }
+
+    /// The offhand container slot (vanilla `Inventory.SLOT_OFFHAND` = index 40,
+    /// which `getSlotWithRemainingSpace` probes second). In Vela's `InventoryMenu`
+    /// mapping that is container slot 45.
+    const OFFHAND_SLOT: usize = 45;
+
+    /// The selected hotbar container slot (`HOTBAR_START + selected`), which
+    /// `getSlotWithRemainingSpace` probes first.
+    fn selected_slot(&self) -> usize {
+        HOTBAR_START + self.selected as usize
+    }
+
+    /// `Inventory.hasRemainingSpaceForItem`: `slot` holds a stackable stack of the
+    /// same item with room to grow.
+    fn has_remaining_space(&self, slot: usize, incoming: &ItemStack) -> bool {
+        match &self.slots[slot] {
+            Some(s) => {
+                ItemStack::same_item_same_components(s, incoming)
+                    && s.is_stackable()
+                    && s.count < s.max_stack_size()
+            }
+            None => false,
+        }
+    }
+
+    /// `Inventory.getSlotWithRemainingSpace`: the selected slot, then the offhand,
+    /// then the first storage slot with room for `incoming`.
+    fn slot_with_remaining_space(&self, incoming: &ItemStack) -> Option<usize> {
+        if self.has_remaining_space(self.selected_slot(), incoming) {
+            return Some(self.selected_slot());
+        }
+        if self.has_remaining_space(Self::OFFHAND_SLOT, incoming) {
+            return Some(Self::OFFHAND_SLOT);
+        }
+        Self::storage_slots().find(|&s| self.has_remaining_space(s, incoming))
+    }
+
+    /// `Inventory.getFreeSlot`: the first empty storage slot.
+    fn first_free_slot(&self) -> Option<usize> {
+        Self::storage_slots().find(|&s| self.slots[s].is_none())
+    }
+
+    /// `Inventory.addResource(slot, stack)`: drop as much of `incoming` into
+    /// `slot` as fits, returning the leftover count that did not fit.
+    fn add_resource_to(&mut self, slot: usize, incoming: &ItemStack) -> i32 {
+        let mut count = incoming.count;
+        let cur = self.slots[slot].map_or(0, |s| s.count);
+        let max_to_add = incoming.max_stack_size() - cur;
+        let to_add = count.min(max_to_add);
+        if to_add <= 0 {
+            return count;
+        }
+        count -= to_add;
+        self.slots[slot] = Some(ItemStack { id: incoming.id, count: cur + to_add });
+        count
+    }
+
+    /// `Inventory.addResource(stack)`: place `incoming` into an existing partial
+    /// stack if one has room, else the first free slot, returning the leftover.
+    fn add_resource(&mut self, incoming: &ItemStack) -> i32 {
+        let slot = self
+            .slot_with_remaining_space(incoming)
+            .or_else(|| self.first_free_slot());
+        match slot {
+            Some(s) => self.add_resource_to(s, incoming),
+            None => incoming.count,
+        }
+    }
+
+    /// Port of vanilla `Inventory.add(-1, itemStack)` for a non-damaged,
+    /// stackable pickup (`net.minecraft.world.entity.player.Inventory.add`). Fills
+    /// existing partial stacks of the same item first (selected → offhand →
+    /// storage order), then the first free slot, repeating until no further
+    /// progress. `stack.count` is decremented in place by the number stored;
+    /// returns the number of items actually added (0 if the inventory was full).
+    ///
+    /// We do not model item damage or infinite-materials (creative) here, so the
+    /// damaged-item and `hasInfiniteMaterials` branches of vanilla are omitted.
+    pub fn add(&mut self, stack: &mut ItemStack) -> i32 {
+        if stack.is_empty() {
+            return 0;
+        }
+        let start = stack.count;
+        loop {
+            let before = stack.count;
+            let leftover = self.add_resource(stack);
+            stack.set_count(leftover);
+            if stack.is_empty() || stack.count >= before {
+                break;
+            }
+        }
+        start - stack.count
+    }
 }
 
 impl Default for Inventory {
@@ -97,5 +200,49 @@ mod tests {
         assert_eq!(inv.slots[36], Some(ItemStack::new(1, 1)));
         assert!(!inv.set_slot(46, Some(ItemStack::new(1, 1)))); // out of range
         assert!(!inv.set_slot(-1, None));
+    }
+
+    #[test]
+    fn add_into_empty_inventory_uses_first_hotbar_slot() {
+        // Empty inventory: the first free storage slot in vanilla scan order is
+        // hotbar slot 0 -> Vela container slot 36.
+        let mut inv = Inventory::new();
+        let mut stack = ItemStack::new(1, 10);
+        assert_eq!(inv.add(&mut stack), 10);
+        assert!(stack.is_empty());
+        assert_eq!(inv.slots[36], Some(ItemStack::new(1, 10)));
+    }
+
+    #[test]
+    fn add_tops_up_existing_partial_stack_first() {
+        // A partial stack of the same item in the main inventory is filled before
+        // a fresh slot is used (getSlotWithRemainingSpace precedes getFreeSlot).
+        let mut inv = Inventory::new();
+        inv.slots[20] = Some(ItemStack::new(1, 60)); // room for 4 (max 64)
+        let mut stack = ItemStack::new(1, 10);
+        assert_eq!(inv.add(&mut stack), 10);
+        assert_eq!(inv.slots[20], Some(ItemStack::new(1, 64))); // topped up
+        // The remaining 6 spilled into the first free slot (hotbar 36).
+        assert_eq!(inv.slots[36], Some(ItemStack::new(1, 6)));
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn add_partial_when_inventory_full_leaves_remainder() {
+        // Every storage slot full of a different item: nothing fits, count intact.
+        let mut inv = Inventory::new();
+        for s in 9..45 {
+            inv.slots[s] = Some(ItemStack::new(2, 64));
+        }
+        let mut stack = ItemStack::new(1, 5);
+        assert_eq!(inv.add(&mut stack), 0);
+        assert_eq!(stack.count, 5); // untouched
+
+        // One partial same-item slot with room for 3: a partial pickup of 3.
+        inv.slots[10] = Some(ItemStack::new(1, 61));
+        let mut stack = ItemStack::new(1, 5);
+        assert_eq!(inv.add(&mut stack), 3);
+        assert_eq!(stack.count, 2);
+        assert_eq!(inv.slots[10], Some(ItemStack::new(1, 64)));
     }
 }

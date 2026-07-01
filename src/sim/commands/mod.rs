@@ -206,7 +206,7 @@ static COMMANDS: &[Spec] = &[
     Spec::pending("fetchprofile", 2, "a profile lookup service"), // fetch a profile
 
     // --- Server administration -----------------------------------------------
-    Spec::pending("stop", 4, "graceful server shutdown"), // stop the server
+    Spec::ready("stop", 4, handlers::cmd_stop), // stop the server
     Spec::pending("transfer", 3, "cross-server transfer"), // transfer players elsewhere
     Spec::pending("op", 3, NEEDS_PERMISSIONS),    // op a player
     Spec::pending("deop", 3, NEEDS_PERMISSIONS),  // de-op a player

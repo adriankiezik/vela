@@ -5,7 +5,8 @@
 //! * [`encoding`] — the per-chunk block-section wire encoding;
 //! * [`heightmap`] — the client-facing `WORLD_SURFACE`/`MOTION_BLOCKING` maps;
 //! * [`bitpack`] — the `SimpleBitStorage` packing primitive underneath both;
-//! * [`block_item`] — the item-id → block-state mapping for placement.
+//! * [`block_item`] — the item-id → block-state mapping for placement;
+//! * [`block_drop`] — the reverse block-state → dropped-item mapping for breaks.
 //!
 //! A chunk column is 24 stacked sections of 16×16×16 cells rising from the
 //! world floor (`MIN_Y` = -64). Each section serializes exactly as vanilla's
@@ -22,6 +23,7 @@
 use crate::ids::BlockState;
 
 mod bitpack;
+pub mod block_drop;
 mod block_item;
 mod chunk_data;
 mod encoding;

@@ -53,12 +53,13 @@ fn storage() -> &'static Mutex<Option<Storage>> {
     STORAGE.get_or_init(|| Mutex::new(None))
 }
 
-/// Enable persistence rooted at `<cwd>/<level_name>`, creating the `region` and
-/// `playerdata` subdirectories. Call once at boot after config load. A failure
-/// to create the directories logs and leaves persistence disabled rather than
-/// aborting startup.
-pub fn init(level_name: &str) {
-    let root = PathBuf::from(level_name);
+/// Enable persistence rooted at `save_dir` (the runtime dir joined with the
+/// configured `level-name`; see [`crate::runtime::dir`]), creating the `region`
+/// and `playerdata` subdirectories. Call once at boot after config load. A
+/// failure to create the directories logs and leaves persistence disabled rather
+/// than aborting startup.
+pub fn init(save_dir: impl AsRef<Path>) {
+    let root = save_dir.as_ref().to_path_buf();
     if let Err(e) = std::fs::create_dir_all(root.join("region")) {
         error!(dir = %root.display(), error = %e, "failed to create region directory; persistence disabled");
         return;

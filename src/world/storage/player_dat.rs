@@ -3,10 +3,11 @@
 //! same framing vanilla `PlayerDataStorage.save` writes.
 //!
 //! Vanilla persists the full player entity (health, inventory, abilities, …).
-//! Vela stores the movement/hotbar subset the simulation currently owns; the
-//! inventory round-trip is deferred (the menu framework holds it live but it is
-//! not yet threaded here). Field names match vanilla so a saved file is
-//! forward-compatible: `Pos`, `Rotation`, `OnGround`, `SelectedItemSlot`.
+//! Vela stores the movement/inventory subset the simulation currently owns, using
+//! vanilla's own keys and formats so a saved file is byte-compatible: `Pos`,
+//! `Rotation`, `OnGround`, `SelectedItemSlot`, the `Inventory` list and the
+//! `equipment` compound (see [`crate::inventory::inventory_to_nbt`]), plus the
+//! `DataVersion` stamp vanilla always writes.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -17,7 +18,13 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use uuid::Uuid;
 
+use crate::inventory::{inventory_from_nbt, inventory_to_nbt, ItemStack, PLAYER_INVENTORY_SLOTS};
 use crate::protocol::nbt::{self, Nbt};
+
+/// The MC 26.2 world save version (`SharedConstants.WORLD_VERSION`), written to
+/// every player file as `DataVersion` so vanilla's `DataFixer` treats the data as
+/// current rather than trying to upgrade it.
+const DATA_VERSION: i32 = 4903;
 
 /// A player's persisted state (the subset Vela currently tracks).
 #[derive(Debug, Clone, PartialEq)]
@@ -30,23 +37,34 @@ pub struct PlayerData {
     pub on_ground: bool,
     /// Selected hotbar slot (0..9), vanilla `Inventory.selected`.
     pub selected_slot: i32,
+    /// The player's inventory in the 46-slot menu-store layout (see
+    /// [`crate::inventory::inventory_to_nbt`] for the vanilla mapping).
+    pub inventory: [Option<ItemStack>; PLAYER_INVENTORY_SLOTS],
 }
 
 impl PlayerData {
     /// Serialize to the player entity NBT compound.
     fn to_nbt(&self) -> Nbt {
-        Nbt::compound([
+        let (inventory, equipment) = inventory_to_nbt(&self.inventory);
+        let mut entries = vec![
+            ("DataVersion".to_string(), Nbt::Int(DATA_VERSION)),
             (
-                "Pos",
+                "Pos".to_string(),
                 Nbt::List(vec![Nbt::Double(self.x), Nbt::Double(self.y), Nbt::Double(self.z)]),
             ),
             (
-                "Rotation",
+                "Rotation".to_string(),
                 Nbt::List(vec![Nbt::Float(self.yaw), Nbt::Float(self.pitch)]),
             ),
-            ("OnGround", Nbt::bool(self.on_ground)),
-            ("SelectedItemSlot", Nbt::Int(self.selected_slot)),
-        ])
+            ("OnGround".to_string(), Nbt::bool(self.on_ground)),
+            ("Inventory".to_string(), Nbt::List(inventory)),
+            ("SelectedItemSlot".to_string(), Nbt::Int(self.selected_slot)),
+        ];
+        // Vanilla omits `equipment` entirely when nothing is worn.
+        if let Some(equipment) = equipment {
+            entries.push(("equipment".to_string(), equipment));
+        }
+        Nbt::Compound(entries)
     }
 
     /// Parse the player entity NBT compound, defaulting missing fields.
@@ -68,6 +86,11 @@ impl PlayerData {
             Some(Nbt::Int(s)) => *s,
             _ => 0,
         };
+        let inventory_list = match tag.get("Inventory") {
+            Some(Nbt::List(list)) => Some(list),
+            _ => None,
+        };
+        let inventory = inventory_from_nbt(inventory_list, tag.get("equipment"));
         Some(Self {
             x,
             y,
@@ -76,6 +99,7 @@ impl PlayerData {
             pitch,
             on_ground,
             selected_slot,
+            inventory,
         })
     }
 
@@ -163,6 +187,10 @@ mod tests {
     }
 
     fn sample() -> PlayerData {
+        let mut inventory = [None; PLAYER_INVENTORY_SLOTS];
+        inventory[36] = Some(ItemStack::new(1, 64)); // hotbar 0 -> vanilla slot 0
+        inventory[9] = Some(ItemStack::new(55, 12)); // main -> vanilla slot 9
+        inventory[6] = Some(ItemStack::new(1, 1)); // chest armor -> equipment
         PlayerData {
             x: 12.5,
             y: 71.0,
@@ -171,6 +199,7 @@ mod tests {
             pitch: -10.0,
             on_ground: true,
             selected_slot: 4,
+            inventory,
         }
     }
 
@@ -178,6 +207,22 @@ mod tests {
     fn nbt_round_trips_in_memory() {
         let data = sample();
         assert_eq!(PlayerData::from_nbt(&data.to_nbt()), Some(data));
+    }
+
+    #[test]
+    fn data_version_is_stamped() {
+        assert!(matches!(sample().to_nbt().get("DataVersion"), Some(Nbt::Int(4903))));
+    }
+
+    #[test]
+    fn inventory_survives_the_gzip_round_trip() {
+        let dir = temp_dir();
+        let uuid = Uuid::from_u128(0xabcd);
+        let data = sample();
+        data.save(&dir, uuid).unwrap();
+        let loaded = PlayerData::load(&dir, uuid).unwrap().unwrap();
+        assert_eq!(loaded.inventory, data.inventory);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
