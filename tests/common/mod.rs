@@ -25,6 +25,18 @@ impl Drop for Server {
 }
 
 pub fn start_server(addr: &str) -> Server {
+    // A small view/simulation distance keeps the per-join chunk burst tiny —
+    // see the comment in `start_server_with_properties`.
+    start_server_with_properties(
+        addr,
+        "network-compression-threshold=-1\nonline-mode=false\nview-distance=2\nsimulation-distance=2\n",
+    )
+}
+
+/// Like [`start_server`] but with caller-supplied `server.properties` contents,
+/// for tests that need a non-default config (e.g. the natural-spawner test needs
+/// a view distance big enough for a non-zero CREATURE mobcap).
+pub fn start_server_with_properties(addr: &str, properties: &str) -> Server {
     // Run each server in its own temp directory so the generated config files
     // (server.properties, ops.json, …) don't litter the checkout, and set the
     // IDE bypass so the EULA gate auto-agrees — mirroring how vanilla's own
@@ -43,11 +55,8 @@ pub fn start_server(addr: &str) -> Server {
     // work each connection does at spawn, so the timing-sensitive broadcast
     // assertions stay reliable even when all the integration binaries run their
     // servers in parallel and contend for the CPU.
-    std::fs::write(
-        workdir.join("server.properties"),
-        "network-compression-threshold=-1\nonline-mode=false\nview-distance=2\nsimulation-distance=2\n",
-    )
-    .expect("write server.properties");
+    std::fs::write(workdir.join("server.properties"), properties)
+        .expect("write server.properties");
     // The server is a child process, so its `tracing` output would otherwise
     // inherit our stdout/stderr and interleave with the test harness. Silence it
     // by default; set VELA_TEST_LOGS=1 to pass the server logs through when
@@ -240,6 +249,21 @@ pub fn handshake(s: &mut TcpStream, addr: &str, intent: i32) {
 /// the spawn teleport acknowledged. Leaves the join-sequence packets (and any
 /// later broadcasts) queued in the socket for the caller to drain.
 pub fn drive_into_play(s: &mut TcpStream, addr: &str, name: &str, uuid: [u8; 16]) {
+    drive_into_play_with_view_distance(s, addr, name, uuid, 0);
+}
+
+/// Like [`drive_into_play`], but declares a client view distance during
+/// configuration (`ClientInformation`) when `view_distance > 0` — like a real
+/// client always does. Without it the server keeps vanilla's not-yet-received
+/// default (`ServerPlayer.requestedViewDistance` = 2), which caps entity
+/// visibility at 32 blocks and hides anything spawning farther out.
+pub fn drive_into_play_with_view_distance(
+    s: &mut TcpStream,
+    addr: &str,
+    name: &str,
+    uuid: [u8; 16],
+    view_distance: u8,
+) {
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     handshake(s, addr, 2); // login
 
@@ -255,6 +279,15 @@ pub fn drive_into_play(s: &mut TcpStream, addr: &str, name: &str, uuid: [u8; 16]
     write_utf(&mut brand, "minecraft:brand");
     write_utf(&mut brand, "vanilla");
     send(s, 2, &brand);
+
+    // ClientInformation (configuration id 0): language + viewDistance byte; the
+    // server reads only these two fields.
+    if view_distance > 0 {
+        let mut info = Vec::new();
+        write_utf(&mut info, "en_us");
+        info.push(view_distance);
+        send(s, 0, &info);
+    }
 
     while recv(s).0 != 14 {} // read until ClientboundSelectKnownPacks
 

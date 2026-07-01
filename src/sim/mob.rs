@@ -2645,6 +2645,43 @@ mod tests {
     }
 
     #[test]
+    fn mob_spawn_populates_real_terrain_end_to_end() {
+        // Production-like conditions: a player on the generated surface with a
+        // radius-8 loaded set (17×17 = 289 chunks → global cap 10). Many passes
+        // on the 400-tick cadence must actually place mobs — this covers the
+        // full `mob_spawn` path (random chunk/Y picks, grass/air/light gates)
+        // on real worldgen, not a hand-built platform.
+        let _lock = crate::world::WORLD_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let (px, pz) = (0, 0);
+        let py = crate::world::surface_height(px, pz) + 1;
+        let loaded: Vec<(i32, i32)> = (-8..=8)
+            .flat_map(|cx| (-8..=8).map(move |cz| (cx, cz)))
+            .collect();
+
+        let mut world = world_with_id();
+        let _rx = spawn_viewer(&mut world, &loaded);
+        // Move the viewer onto the surface.
+        {
+            let mut q = world.query_filtered::<&mut Pos, Without<Mob>>();
+            let mut p = q.iter_mut(&mut world).next().unwrap();
+            p.x = px as f64 + 0.5;
+            p.y = py as f64;
+            p.z = pz as f64 + 0.5;
+        }
+
+        for pass in 1..=50u64 {
+            world.resource_mut::<Tick>().0 = pass * 400;
+            mob_spawn(&mut world);
+        }
+        let count = world.query::<&Mob>().iter(&world).count();
+        assert!(count > 0, "no mobs spawned in 50 end-to-end passes");
+        assert!(count as i32 <= creature_global_cap(289), "global cap respected");
+    }
+
+    #[test]
     fn mob_spawn_respects_cadence_and_global_cap() {
         let mut world = world_with_id();
         // A single loaded column → spawnableChunkCount 1 → global cap 0.
