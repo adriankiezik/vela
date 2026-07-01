@@ -73,7 +73,7 @@ impl ChunkData {
     /// the regenerated terrain baseline becomes an edit, so the in-memory chunk
     /// reproduces the saved blocks exactly. Generation is deterministic, so a
     /// chunk saved by Vela reloads to precisely its original edit set.
-    fn from_grid(heights: [i32; COLUMNS], grid: &[u32]) -> Self {
+    fn from_grid(heights: [i32; COLUMNS], grid: &[BlockState]) -> Self {
         let mut edits = HashMap::new();
         for section in 0..SECTION_COUNT {
             let base_y = MIN_Y + section * 16;

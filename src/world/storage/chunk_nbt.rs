@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 
+use crate::ids::BlockState;
 use crate::protocol::nbt::Nbt;
 use crate::registry::block_state::{describe_state, with_properties};
 
@@ -48,7 +49,7 @@ pub fn to_nbt(
     cx: i32,
     cz: i32,
     heights: &[i32; COLUMNS],
-    edits: &HashMap<u32, u32>,
+    edits: &HashMap<u32, BlockState>,
     game_time: i64,
 ) -> Nbt {
     let mut sections: Vec<Nbt> = Vec::with_capacity(SECTION_COUNT as usize);
@@ -93,7 +94,7 @@ pub fn to_nbt(
 /// buildable range) read as all-air. This is the paletted-container read path:
 /// each section's `block_states` `{palette, data}` is decoded independently of
 /// the width vanilla chose.
-pub fn from_nbt(nbt: &Nbt) -> Option<Vec<u32>> {
+pub fn from_nbt(nbt: &Nbt) -> Option<Vec<BlockState>> {
     // A chunk with no status was never generated; reject it like vanilla `parse`.
     if nbt.get("Status").and_then(Nbt::as_str)?.is_empty() {
         return None;
@@ -129,7 +130,7 @@ fn section_nbt(
     y_byte: i8,
     base_y: i32,
     heights: &[i32; COLUMNS],
-    edits: &HashMap<u32, u32>,
+    edits: &HashMap<u32, BlockState>,
 ) -> Nbt {
     let mut cells = [states::AIR; CELLS];
     for ly in 0..16i32 {
@@ -153,17 +154,17 @@ fn section_nbt(
 /// container. A uniform section stores just its one-entry palette (no `data`);
 /// otherwise the indices are packed at the width vanilla derives from the palette
 /// size (`max(4, ceil(log2(size)))`).
-fn encode_block_states(cells: &[u32; CELLS]) -> Nbt {
+fn encode_block_states(cells: &[BlockState; CELLS]) -> Nbt {
     // First-seen distinct states (sections are near-uniform, so a linear scan
     // beats a hashed set here, as in the network encoder).
-    let mut palette: Vec<u32> = Vec::new();
+    let mut palette: Vec<BlockState> = Vec::new();
     for &c in cells.iter() {
         if !palette.contains(&c) {
             palette.push(c);
         }
     }
 
-    let palette_tags: Vec<Nbt> = palette.iter().map(|&s| block_palette_entry(s)).collect();
+    let palette_tags: Vec<Nbt> = palette.iter().map(|&s| block_palette_entry(s.get())).collect();
 
     if palette.len() == 1 {
         // Single value: palette only, no storage array (ZeroBitStorage).
@@ -183,12 +184,15 @@ fn encode_block_states(cells: &[u32; CELLS]) -> Nbt {
 }
 
 /// Decode an NBT `block_states` container back into 4096 global state ids.
-fn decode_block_states(container: &Nbt) -> Option<[u32; CELLS]> {
+fn decode_block_states(container: &Nbt) -> Option<[BlockState; CELLS]> {
     let palette = match container.get("palette") {
         Some(Nbt::List(entries)) => entries,
         _ => return None,
     };
-    let states: Vec<u32> = palette.iter().map(parse_block_palette_entry).collect::<Option<_>>()?;
+    let states: Vec<BlockState> = palette
+        .iter()
+        .map(|e| parse_block_palette_entry(e).map(BlockState::from))
+        .collect::<Option<_>>()?;
     if states.is_empty() {
         return None;
     }
@@ -278,7 +282,7 @@ mod tests {
 
     /// Rebuild the dense grid straight from heights+edits, in the same section /
     /// cell order [`from_nbt`] returns — the expected value for a round-trip.
-    fn expected_grid(heights: &[i32; COLUMNS], edits: &HashMap<u32, u32>) -> Vec<u32> {
+    fn expected_grid(heights: &[i32; COLUMNS], edits: &HashMap<u32, BlockState>) -> Vec<BlockState> {
         let mut grid = vec![states::AIR; (SECTION_COUNT as usize) * CELLS];
         for section in 0..SECTION_COUNT {
             let base_y = MIN_Y + section * 16;
@@ -326,10 +330,10 @@ mod tests {
         let key = |lx: i32, y: i32, lz: i32| {
             ((y - MIN_Y) as u32) * COLUMNS as u32 + (lz as u32) * 16 + lx as u32
         };
-        edits.insert(key(1, 100, 1), 1); // stone
-        edits.insert(key(2, 100, 1), 10); // dirt
-        edits.insert(key(3, 100, 1), 85); // bedrock
-        edits.insert(key(1, 101, 1), 14); // cobblestone
+        edits.insert(key(1, 100, 1), BlockState(1)); // stone
+        edits.insert(key(2, 100, 1), BlockState(10)); // dirt
+        edits.insert(key(3, 100, 1), BlockState(85)); // bedrock
+        edits.insert(key(1, 101, 1), BlockState(14)); // cobblestone
 
         let tag = chunk_nbt::to_nbt(0, 0, &heights, &edits, 0);
         let grid = chunk_nbt::from_nbt(&tag).expect("decode");
@@ -339,7 +343,7 @@ mod tests {
         let section = ((100 - MIN_Y) / 16) as usize;
         let ly = (100 - MIN_Y) % 16;
         let idx = section * CELLS + ((ly << 8) | (1 << 4) | 1) as usize;
-        assert_eq!(grid[idx], 1);
+        assert_eq!(grid[idx], BlockState(1));
     }
 
     #[test]

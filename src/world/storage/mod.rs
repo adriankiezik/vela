@@ -32,6 +32,8 @@ use tracing::{warn, error};
 
 use region::RegionFile;
 
+use crate::ids::BlockState;
+
 pub use level_dat::LevelData;
 pub use player_dat::PlayerData;
 
@@ -91,7 +93,7 @@ pub fn player_data_dir() -> Option<PathBuf> {
 /// grid (`section * CELLS + cell`) if a payload exists and decodes. `None` when
 /// persistence is off, the chunk is absent, or the payload is unreadable (an
 /// unreadable chunk is logged and regenerated rather than failing the load).
-pub fn load_chunk(cx: i32, cz: i32) -> Option<Vec<u32>> {
+pub fn load_chunk(cx: i32, cz: i32) -> Option<Vec<BlockState>> {
     let mut guard = storage().lock().expect("storage mutex poisoned");
     let storage = guard.as_mut()?;
     let region = storage.region(cx, cz)?;
@@ -113,7 +115,7 @@ pub fn save_chunk(
     cx: i32,
     cz: i32,
     heights: &[i32; super::COLUMNS],
-    edits: &HashMap<u32, u32>,
+    edits: &HashMap<u32, BlockState>,
     game_time: i64,
 ) {
     let mut guard = storage().lock().expect("storage mutex poisoned");
@@ -177,7 +179,7 @@ fn local(cx: i32, cz: i32) -> (usize, usize) {
 /// Decompress-then-decode already happened in the region layer; here we parse the
 /// NBT bytes and turn them into the dense grid. A parse failure is logged and
 /// treated as "regenerate".
-fn decode_chunk(cx: i32, cz: i32, bytes: &[u8]) -> Option<Vec<u32>> {
+fn decode_chunk(cx: i32, cz: i32, bytes: &[u8]) -> Option<Vec<BlockState>> {
     let mut slice = bytes::Bytes::copy_from_slice(bytes);
     let (_, tag) = match crate::protocol::nbt::read_named(&mut slice) {
         Ok(v) => v,
@@ -229,8 +231,8 @@ mod tests {
                 + (lz as u32) * 16
                 + lx as u32
         };
-        edits.insert(key(2, 120, 3), 1); // stone
-        edits.insert(key(2, 121, 3), 10); // dirt
+        edits.insert(key(2, 120, 3), BlockState(1)); // stone
+        edits.insert(key(2, 121, 3), BlockState(10)); // dirt
         save_chunk(cx, cz, &heights, &edits, 7);
 
         // Drop the region cache so the reload opens the file fresh from disk.
