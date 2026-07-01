@@ -19,10 +19,30 @@ use std::path::{Path, PathBuf};
 
 /// The directory the server reads and writes its runtime files under.
 ///
-/// Returns the executable's directory when the process was started by
-/// `cargo run`, otherwise the current working directory (vanilla behavior).
+/// Resolution order:
+///   * the executable's directory when started by `cargo run` (keeps generated
+///     data inside `target/` — see the module docs);
+///   * the executable's directory on a double-click launch, where the current
+///     working directory is arbitrary (often unwritable) and the user expects
+///     the world / `eula.txt` to appear next to the exe they ran;
+///   * otherwise the current working directory (vanilla behavior — a terminal or
+///     hosting-panel launch that deliberately picks the CWD).
 pub fn dir() -> PathBuf {
-    cargo_run_exe_dir().unwrap_or_else(|| PathBuf::from("."))
+    if let Some(dir) = cargo_run_exe_dir() {
+        return dir;
+    }
+    if crate::platform::owns_console() {
+        if let Some(dir) = current_exe_dir() {
+            return dir;
+        }
+    }
+    PathBuf::from(".")
+}
+
+/// The directory containing the running executable, if it can be determined.
+fn current_exe_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.to_path_buf())
 }
 
 /// The executable's directory when — and only when — the process was launched by

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::warn;
 
 /// The full canonical key set with vanilla defaults, in the order we write them.
 /// Every key the 26.2 server persists appears here (legacy/removed keys such as
@@ -130,10 +130,9 @@ impl ServerProperties {
         let path = path.as_ref();
         let mut props = match std::fs::read_to_string(path) {
             Ok(text) => Self::parse(&text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                info!(file = %path.display(), "no server.properties; writing defaults");
-                Self::default()
-            }
+            // First run: the file simply doesn't exist yet. We create it below, so
+            // this is the normal path, not something worth logging.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
                 warn!(file = %path.display(), error = %e, "failed to read server.properties; using defaults");
                 Self::default()

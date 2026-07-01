@@ -30,13 +30,17 @@ pub fn check(path: impl AsRef<Path>) -> bool {
     running_in_ide() || read_file(path.as_ref())
 }
 
-/// Vanilla `Eula.readFile`: parse the `eula` key; on any read failure (including
-/// first-run file-absent) warn, write the default file, and report not-agreed.
+/// Vanilla `Eula.readFile`: parse the `eula` key; on a read failure write the
+/// default file and report not-agreed. A missing file is the normal first-run
+/// case (we're about to create it), so unlike vanilla we don't warn on it — only
+/// a genuine read error (permissions, etc.) is worth surfacing.
 fn read_file(path: &Path) -> bool {
     match std::fs::read_to_string(path) {
         Ok(text) => parse_eula(&text),
-        Err(_) => {
-            warn!(file = %path.display(), "Failed to load {}", path.display());
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(file = %path.display(), error = %e, "Failed to load {}", path.display());
+            }
             save_defaults(path);
             false
         }

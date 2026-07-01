@@ -10,6 +10,7 @@ mod config;
 mod ids;
 mod inventory;
 mod net;
+mod platform;
 mod protocol;
 mod registry;
 mod runtime;
@@ -32,12 +33,34 @@ use config::ServerConfig;
 const INGRESS_CAP: usize = 1024;
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
+async fn main() {
     // Honors RUST_LOG (e.g. RUST_LOG=debug); defaults to info.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
+    // Probe this once up front: on a double-click launch (Explorer) the console
+    // is ours and will close the instant we exit. We use it both to root runtime
+    // files next to the exe (see `runtime::dir`) and to pause on the way out so
+    // the user can read the startup log — notably the EULA notice.
+    let owns_console = platform::owns_console();
+
+    if let Err(e) = run().await {
+        error!(error = %e, "server exited with error");
+    }
+
+    // Any exit path funnels here: for a double-click launch, hold the window open
+    // until the user acknowledges. Terminal / panel launches (which don't own the
+    // console) fall through and exit immediately, as before.
+    if owns_console {
+        platform::pause_before_exit();
+    }
+}
+
+/// The server proper. Split out of `main` so every exit — the EULA gate, a bind
+/// failure, `/stop`, Ctrl+C — passes back through `main`'s single pause-on-exit
+/// point rather than closing the process (and a double-click console) directly.
+async fn run() -> std::io::Result<()> {
     print_banner();
 
     // Load server.properties / eula.txt / player lists / server-icon.png from the
