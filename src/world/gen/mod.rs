@@ -16,6 +16,7 @@ mod biome;
 mod blocks;
 mod feature;
 mod noise;
+pub mod random;
 mod rng;
 mod surface;
 
