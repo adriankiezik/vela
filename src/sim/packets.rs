@@ -223,7 +223,11 @@ pub fn system_chat_component(component: &Nbt) -> Bytes {
     frame(CB_PLAY_SYSTEM_CHAT, &p.buf)
 }
 
-/// Convenience for a plain-text system message: `{text:"…"}`.
+/// Convenience for a plain-text system message: `{text:"…"}`. Player chat now
+/// flows through `sim::chat` (`PlayerChat`/`DisguisedChat`) and command replies
+/// through [`system_chat_component`]; this plain-text form is kept for ad-hoc
+/// server notices.
+#[allow(dead_code)]
 pub fn system_chat(text: &str) -> Bytes {
     system_chat_component(&super::text::text(text))
 }

@@ -119,6 +119,14 @@ impl PacketReader {
         self.ensure(len)?;
         Ok(self.buf.copy_to_bytes(len).to_vec())
     }
+
+    /// Exactly `n` raw bytes with no length prefix (`FriendlyByteBuf.readBytes` /
+    /// `ByteBuf.readBytes(byte[])`) — used for fixed-width blobs like the 256-byte
+    /// message signature, which are written unprefixed.
+    pub fn read_bytes(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
+        self.ensure(n)?;
+        Ok(self.buf.copy_to_bytes(n).to_vec())
+    }
 }
 
 /// Accumulates a packet body. The caller frames it (id + length) on send.

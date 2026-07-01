@@ -11,6 +11,12 @@ const SB_PLAY_ACCEPT_TELEPORTATION: i32 = 0;
 const SB_PLAY_CHAT_COMMAND: i32 = 7;
 const SB_PLAY_CHAT_COMMAND_SIGNED: i32 = 8;
 const SB_PLAY_CHAT: i32 = 9;
+// ChatSessionUpdate follows Chat in SERVERBOUND_TEMPLATE (line 71 → 10); it
+// publishes the client's chat session (session id + profile public key).
+const SB_PLAY_CHAT_SESSION_UPDATE: i32 = 10;
+// CommandSuggestion (tab-completion request) is index 15 in SERVERBOUND_TEMPLATE
+// (ACCEPT_TELEPORTATION..COMMAND_SUGGESTION, with CLIENT_INFORMATION at 14).
+const SB_PLAY_COMMAND_SUGGESTION: i32 = 15;
 const SB_PLAY_KEEP_ALIVE: i32 = 28;
 const SB_PLAY_MOVE_PLAYER_POS: i32 = 30;
 const SB_PLAY_MOVE_PLAYER_POS_ROT: i32 = 31;
@@ -60,9 +66,52 @@ pub(super) fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbo
         SB_PLAY_MOVE_PLAYER_POS_ROT => decode_move(reader, true, true),
         SB_PLAY_MOVE_PLAYER_ROT => decode_move(reader, false, true),
         SB_PLAY_MOVE_PLAYER_STATUS_ONLY => decode_move(reader, false, false),
-        // ServerboundChatPacket: the message leads, then timestamp/salt/
-        // signature/last-seen fields we ignore.
-        SB_PLAY_CHAT => Some(Serverbound::Chat(reader.read_utf(256).ok()?)),
+        // ServerboundChatPacket: message, timestamp (Instant → epoch-millis
+        // long), salt, nullable 256-byte signature, then the `LastSeenMessages`
+        // acknowledgement window (offset VarInt, fixed 20-bit BitSet = 3 bytes,
+        // checksum byte) which we decode and drop. The signing fields feed the
+        // message-signing chain in `sim::chat`.
+        SB_PLAY_CHAT => {
+            let message = reader.read_utf(256).ok()?;
+            let timestamp = reader.read_i64().ok()?;
+            let salt = reader.read_i64().ok()?;
+            let signature = if reader.read_bool().ok()? {
+                Some(reader.read_bytes(256).ok()?)
+            } else {
+                None
+            };
+            // LastSeenMessages.Update: offset, fixed BitSet(20) = 3 bytes, checksum.
+            let _offset = reader.read_varint().ok()?;
+            let _acknowledged = reader.read_bytes(3).ok()?;
+            let _checksum = reader.read_u8().ok()?;
+            Some(Serverbound::Chat {
+                message,
+                timestamp,
+                salt,
+                signature,
+            })
+        }
+        // ServerboundChatSessionUpdatePacket → RemoteChatSession.Data: a session
+        // UUID then ProfilePublicKey.Data (expiry epoch-millis long, X.509 public
+        // key byte-array, Mojang key-signature byte-array).
+        SB_PLAY_CHAT_SESSION_UPDATE => {
+            let session_id = reader.read_uuid().ok()?;
+            let expires_at = reader.read_i64().ok()?;
+            let public_key = reader.read_byte_array(512).ok()?;
+            let key_signature = reader.read_byte_array(4096).ok()?;
+            Some(Serverbound::ChatSessionUpdate {
+                session_id,
+                expires_at,
+                public_key,
+                key_signature,
+            })
+        }
+        // ServerboundCommandSuggestionPacket: transaction id (VarInt) + the full
+        // partial command line being completed (String, incl. the leading `/`).
+        SB_PLAY_COMMAND_SUGGESTION => Some(Serverbound::CommandSuggestion {
+            id: reader.read_varint().ok()?,
+            command: reader.read_utf(32500).ok()?,
+        }),
         // ServerboundChatCommand{,Signed}: the command string (no leading `/`)
         // leads both. The signed variant trails timestamp/salt/argument
         // signatures/last-seen, which we ignore — each frame is its own buffer,
