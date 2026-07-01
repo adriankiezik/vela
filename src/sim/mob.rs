@@ -20,9 +20,24 @@
 //!   no goal selector priority, no panic/breed/tempt/follow-parent goals, and no
 //!   water avoidance. Horizontal velocity is driven straight at the target rather
 //!   than solved by `PathNavigation`.
-//! * **Physics** reuses the item-entity's single vertical ground probe against
-//!   [`crate::world::block_state_at`] (no full AABB sweep, no per-block friction,
-//!   no fluids). Horizontal collision is not modelled.
+//! * **Physics** models collision at *block granularity* against
+//!   [`crate::world::block_state_at`] (the world is effectively full cubes, so
+//!   "solid" = "not air" is the only shape test): the `Entity.move`/`collide`
+//!   axis-separated clip is ported — Y first, then the larger horizontal axis
+//!   (`Direction.axisStepOrder`) — sweeping each box face against the block cells it
+//!   would enter, zeroing the collided velocity component (vanilla's restitution-0
+//!   `restituteMovementAfterCollisions`). There is still no per-block friction and no
+//!   fluids. **Step-up** (`maxUpStep` 0.6) is *moot* here: with full cubes and no
+//!   slabs a 0.6 step can never climb a 1.0 block, so a bumped ledge is cleared by a
+//!   jump, never a step.
+//! * **Jumping** ports both vanilla triggers (`LivingEntity.aiStep` jump block →
+//!   `jumpFromGround`, `vy = max(JUMP_STRENGTH·0.42, vy)`, `noJumpDelay = 10`): the
+//!   `MoveControl.tick` "wantedY is a step above" trigger (`yd > maxUpStep && dx²+dz²
+//!   < max(1, bbWidth)`, with the stroll target's Y as `wantedY`), and a
+//!   navigator-stand-in trigger that fires when the mob bumped a wall last tick
+//!   (`horizontalCollision`), is on the ground, and the blocking cell is a 1-high
+//!   ledge (air directly above it). The latter replaces the ground `PathNavigation`
+//!   producing a node one block up that `MoveControl` would jump toward.
 //! * **Speed** is derived from the vanilla `MOVEMENT_SPEED` attribute default per
 //!   kind fed through the `MoveControl` + `LivingEntity.travelInAir` pipeline
 //!   (acceleration + `blockFriction·0.91` drag), matching the vanilla steady-state
@@ -55,6 +70,21 @@ use crate::registry::builtin::{ENTITY_TYPE, SOUND_EVENT};
 // --- Movement / AI constants (mirroring the animal goals) --------------------
 /// `Entity.getDefaultGravity` for a `LivingEntity` — 0.08 blocks/tick² down.
 const LIVING_GRAVITY: f64 = 0.08;
+/// The tolerance used when turning a box's max face into a block-cell index: a face
+/// resting exactly on an integer boundary (`maxY == 65.0`) must not count the block
+/// it merely touches (`Shapes.collide` treats flush contact as non-overlapping).
+const COLLISION_EPS: f64 = 1.0e-7;
+/// `Attributes.STEP_HEIGHT` default (0.6) -> `Entity.maxUpStep()`. Only read for the
+/// `MoveControl.tick` jump trigger's `yd > maxUpStep` gate; no step-up is performed
+/// (moot with full cubes -- see the module header).
+const MAX_UP_STEP: f64 = 0.6;
+/// `Attributes.JUMP_STRENGTH` default (0.42) -> `LivingEntity.getJumpPower` on normal
+/// blocks with no jump-boost (`0.42 * 1.0 * blockJumpFactor(1.0) + 0`). These mobs
+/// never sprint, so the sprint-boost term of `jumpFromGround` never applies.
+const JUMP_POWER: f64 = 0.42;
+/// `LivingEntity.aiStep`: `noJumpDelay = 10` after a jump, decremented each tick; a
+/// new jump is gated on `noJumpDelay == 0`.
+const NO_JUMP_DELAY: i32 = 10;
 /// `LivingEntity.travelInAir` vertical friction (`computeModifiedFriction(0.98F, 1)`)
 /// applied to the post-move `deltaMovement.y` after gravity is subtracted.
 const VERTICAL_AIR_DRAG: f64 = 0.98;
@@ -211,6 +241,26 @@ impl MobKind {
         }
     }
 
+    /// `EntityType.Builder.sized(width, height)` from each kind's `EntityTypes`
+    /// registration: Pig 0.9×0.9, Cow 0.9×1.4, Sheep 0.9×1.3, Chicken 0.4×0.7. The
+    /// bounding box is horizontally centred on the position (`AABB` half-width
+    /// `width/2`) and spans `[y, y + height]` vertically.
+    fn bb_width(self) -> f64 {
+        match self {
+            MobKind::Pig | MobKind::Cow | MobKind::Sheep => 0.9,
+            MobKind::Chicken => 0.4,
+        }
+    }
+
+    fn bb_height(self) -> f64 {
+        match self {
+            MobKind::Pig => 0.9,
+            MobKind::Cow => 1.4,
+            MobKind::Sheep => 1.3,
+            MobKind::Chicken => 0.7,
+        }
+    }
+
     /// Whether this kind flutters (slow-falls) rather than dropping at full
     /// gravity — chickens only.
     fn flutters(self) -> bool {
@@ -325,6 +375,15 @@ pub struct MobState {
     /// when a player deals damage and decremented each tick. Loot/XP at death gate
     /// on this being `> 0` (`dropAllDeathLoot`/`dropExperience`).
     last_hurt_by_player_time: i32,
+    /// `Entity.horizontalCollision` from the *previous* tick's `move` — the
+    /// navigator-stand-in jump trigger reads it (a mob that bumped a wall last tick
+    /// jumps this tick, mirroring the path node one block up that would fire
+    /// `MoveControl`'s jump the following tick).
+    horizontal_collision: bool,
+    /// `LivingEntity.noJumpDelay` — set to 10 on a jump, decremented each tick; a new
+    /// jump only fires at 0. Reset to 0 on any tick the mob is not requesting a jump
+    /// (vanilla's `else { this.noJumpDelay = 0; }`).
+    no_jump_delay: i32,
 }
 
 impl MobState {
@@ -354,6 +413,8 @@ impl MobState {
             dead: false,
             death_time: 0,
             last_hurt_by_player_time: 0,
+            horizontal_collision: false,
+            no_jump_delay: 0,
         }
     }
 }
@@ -362,6 +423,130 @@ impl MobState {
 /// per-block collision shapes, so "solid" is "not air" (as in `item_tick`).
 fn is_solid(x: i32, y: i32, z: i32) -> bool {
     crate::world::block_state_at(x, y, z) != crate::world::AIR_STATE
+}
+
+/// The inclusive block-index range a `[lo, hi]` box interval overlaps. The trailing
+/// face is nudged in by [`COLLISION_EPS`] so a box whose max face lands exactly on an
+/// integer (`hi == 65.0`) does not count the block it merely touches — matching
+/// `Shapes.collide`, which treats flush contact as non-overlapping.
+fn cell_span(lo: f64, hi: f64) -> std::ops::RangeInclusive<i32> {
+    (lo.floor() as i32)..=((hi - COLLISION_EPS).floor() as i32)
+}
+
+/// `Shapes.collide(axis, box, shapes, d)` for a full-cube world: clip the scalar
+/// movement `d` of a box face so the box comes to rest flush against the nearest
+/// solid block layer it would otherwise enter. `min`/`max` are the box's extent on
+/// the moving axis; `solid(i)` reports whether block layer `i` (spanning `[i, i+1)`
+/// on the moving axis) is solid anywhere across the box's footprint on the other two
+/// axes. Returns the (possibly shortened) movement, preserving sign.
+fn collide_axis(min: f64, max: f64, d: f64, solid: impl Fn(i32) -> bool) -> f64 {
+    if d == 0.0 {
+        return 0.0;
+    }
+    if d > 0.0 {
+        // Leading face `max` sweeps toward `max + d`. The first block layer it can
+        // enter is the one whose near (min) face is at the next integer >= max.
+        let target = max + d;
+        let mut c = (max - COLLISION_EPS).ceil() as i32;
+        while (c as f64) < target {
+            if solid(c) {
+                // Rest flush: `max + d == c`.
+                return c as f64 - max;
+            }
+            c += 1;
+        }
+        d
+    } else {
+        // Leading face `min` sweeps toward `min + d`. The first block layer it can
+        // enter is the one whose far (max) face is at the next integer <= min.
+        let target = min + d;
+        let mut f = (min + COLLISION_EPS).floor() as i32;
+        while (f as f64) > target {
+            // Block layer `[f - 1, f)` has its far face at `f`.
+            if solid(f - 1) {
+                // Rest flush: `min + d == f`.
+                return f as f64 - min;
+            }
+            f -= 1;
+        }
+        d
+    }
+}
+
+/// The result of `Entity.move`'s collision resolution for a full-cube world: the
+/// clipped per-axis movement plus the collision flags vanilla derives from it.
+struct MoveResult {
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    horizontal_collision: bool,
+    /// `verticalCollisionBelow` — a downward clip → `onGround`.
+    on_ground: bool,
+    /// An upward clip (head hit a ceiling) → the jump arc's `vy` is zeroed.
+    ceiling: bool,
+}
+
+/// Port of `Entity.move` → `collide` → `collideBoundingBox` → `collideWithShapes` at
+/// block granularity. `(x, y, z)` are the box's feet-centre (position); `hw` the
+/// half-width, `h` the height. Axes resolve in vanilla's `Direction.axisStepOrder`:
+/// Y first, then the larger-magnitude horizontal axis (X before Z unless
+/// `|dz| > |dx|`), each against a box translated by the axes resolved so far.
+fn move_and_collide(x: f64, y: f64, z: f64, hw: f64, h: f64, dx: f64, dy: f64, dz: f64) -> MoveResult {
+    // Static box extents on each axis (untranslated).
+    let (min_x, max_x) = (x - hw, x + hw);
+    let (min_y, max_y) = (y, y + h);
+    let (min_z, max_z) = (z - hw, z + hw);
+
+    let (mut rx, mut rz) = (0.0_f64, 0.0_f64);
+
+    // `Direction.axisStepOrder`: Y always first; then X,Z unless |dx| < |dz|.
+    let horizontal_x_first = dx.abs() >= dz.abs();
+
+    // Y axis, box translated by (rx, rz) resolved so far (both still 0 here, but
+    // written generally to mirror `boundingBox.move(resolved)`).
+    let resolve_y = |rx: f64, rz: f64| {
+        let (xa, xb) = (min_x + rx, max_x + rx);
+        let (za, zb) = (min_z + rz, max_z + rz);
+        collide_axis(min_y, max_y, dy, |iy| {
+            cell_span(xa, xb).any(|ix| cell_span(za, zb).any(|iz| is_solid(ix, iy, iz)))
+        })
+    };
+    let resolve_x = |ry: f64, rz: f64| {
+        let (ya, yb) = (min_y + ry, max_y + ry);
+        let (za, zb) = (min_z + rz, max_z + rz);
+        collide_axis(min_x, max_x, dx, |ix| {
+            cell_span(ya, yb).any(|iy| cell_span(za, zb).any(|iz| is_solid(ix, iy, iz)))
+        })
+    };
+    let resolve_z = |rx: f64, ry: f64| {
+        let (xa, xb) = (min_x + rx, max_x + rx);
+        let (ya, yb) = (min_y + ry, max_y + ry);
+        collide_axis(min_z, max_z, dz, |iz| {
+            cell_span(xa, xb).any(|ix| cell_span(ya, yb).any(|iy| is_solid(ix, iy, iz)))
+        })
+    };
+
+    let ry = resolve_y(rx, rz);
+    if horizontal_x_first {
+        rx = resolve_x(ry, rz);
+        rz = resolve_z(rx, ry);
+    } else {
+        rz = resolve_z(rx, ry);
+        rx = resolve_x(ry, rz);
+    }
+
+    // `Entity.move`: `xCollision = !equal(dx, movement.x)`, etc.
+    let x_collision = rx != dx;
+    let z_collision = rz != dz;
+    let vertical_collision = ry != dy;
+    MoveResult {
+        dx: rx,
+        dy: ry,
+        dz: rz,
+        horizontal_collision: x_collision || z_collision,
+        on_ground: vertical_collision && dy < 0.0,
+        ceiling: vertical_collision && dy > 0.0,
+    }
 }
 
 /// Build a freshly-spawned mob's [`EntityData`]: the shared-flags byte (0), the
@@ -603,6 +788,7 @@ fn step_mob(kind: MobKind, st: &mut MobState, pos: &mut Pos, players: &[(f64, f6
     // `speed` is the attribute value; `zza`/the forward input equal it (Mob.setSpeed
     // → setZza), so the local forward acceleration below is `zza * fricSpeed`.
     let mut forward_input = 0.0_f64;
+    let mut jump_requested = false;
     if let Some((tx, ty, tz)) = st.target {
         let dx = tx - pos.x;
         let dy = ty - pos.y;
@@ -619,11 +805,60 @@ fn step_mob(kind: MobKind, st: &mut MobState, pos: &mut Pos, players: &[(f64, f6
                 let target_yaw = dz.atan2(dx).to_degrees() as f32 - 90.0;
                 pos.yaw = rotlerp(pos.yaw, target_yaw, MAX_TURN);
                 forward_input = kind.movement_speed(); // zza == speedModifier·speed
+                // `MoveControl.tick` jump trigger (a): the wanted point is more than a
+                // step above and horizontally within `max(1, bbWidth)` blocks (== 1
+                // for these mobs — all narrower than a block) → `getJumpControl().jump()`.
+                if dy > MAX_UP_STEP && dx * dx + dz * dz < 1.0_f64.max(kind.bb_width()) {
+                    jump_requested = true;
+                }
             }
         }
     }
 
+    // Navigator stand-in for `MoveControl`'s wall-climb (trigger b): with no
+    // `PathNavigation`, the mob never gets a path node one block up to steer toward.
+    // Instead, when it bumped a wall on the previous tick (`horizontalCollision`), is
+    // on the ground, and is facing a 1-high ledge (solid ahead with air directly
+    // above), request a jump — reproducing the observable "walking mob hops a
+    // 1-block ledge" behaviour.
+    if st.horizontal_collision && pos.on_ground && facing_one_high_ledge(kind, pos) {
+        jump_requested = true;
+    }
+
+    // `LivingEntity.aiStep` jump block, run *before* `travel`: decrement the cooldown,
+    // then — if a jump was requested and the mob is grounded with the cooldown
+    // elapsed — `jumpFromGround` (`vy = max(getJumpPower(), vy)`) and re-arm the
+    // 10-tick `noJumpDelay`. A tick with no jump requested resets the delay to 0
+    // (vanilla's `else { this.noJumpDelay = 0; }`).
+    if st.no_jump_delay > 0 {
+        st.no_jump_delay -= 1;
+    }
+    if jump_requested {
+        if pos.on_ground && st.no_jump_delay == 0 {
+            st.vy = JUMP_POWER.max(st.vy);
+            st.no_jump_delay = NO_JUMP_DELAY;
+        }
+    } else {
+        st.no_jump_delay = 0;
+    }
+
     travel_and_integrate(kind, st, pos, forward_input);
+}
+
+/// The navigator-stand-in ledge probe: is the block the mob is facing — just beyond
+/// its bounding box at foot level — a solid 1-high ledge (solid with air directly
+/// above)? Uses the body yaw as the facing direction, since `MoveControl` steers the
+/// body toward the target and thus into the wall it bumped.
+fn facing_one_high_ledge(kind: MobKind, pos: &Pos) -> bool {
+    let hw = kind.bb_width() / 2.0;
+    let yaw_rad = (pos.yaw as f64).to_radians();
+    // Minecraft yaw forward vector: (-sin(yaw), cos(yaw)) on (x, z).
+    let (dirx, dirz) = (-yaw_rad.sin(), yaw_rad.cos());
+    // Probe 0.1 blocks past the leading face, into the neighbouring column.
+    let fx = (pos.x + dirx * (hw + 0.1)).floor() as i32;
+    let fz = (pos.z + dirz * (hw + 0.1)).floor() as i32;
+    let fy = pos.y.floor() as i32;
+    is_solid(fx, fy, fz) && !is_solid(fx, fy + 1, fz)
 }
 
 /// The `LivingEntity.travelInAir` → `move` → gravity/friction pipeline, split out
@@ -653,28 +888,38 @@ fn travel_and_integrate(kind: MobKind, st: &mut MobState, pos: &mut Pos, forward
         st.vz += accel_fwd * yaw_rad.cos();
     }
 
-    // `move(deltaMovement)`: integrate using the velocity that already includes this
-    // tick's horizontal acceleration and *last* tick's vertical velocity, resolving a
-    // downward collision against the single-block ground probe.
-    let nx = pos.x + st.vx;
-    let mut ny = pos.y + st.vy;
-    let nz = pos.z + st.vz;
-
-    let mut on_ground = false;
-    if st.vy < 0.0 {
-        let (bx, bz) = (nx.floor() as i32, nz.floor() as i32);
-        let by = ny.floor() as i32;
-        if is_solid(bx, by, bz) {
-            ny = (by + 1) as f64; // land on the block's top face
-            on_ground = true;
-            st.vy = 0.0;
-        }
-    }
-
-    pos.x = nx;
-    pos.y = ny;
-    pos.z = nz;
+    // `move(deltaMovement)`: integrate the velocity (this tick's horizontal
+    // acceleration + this tick's vertical velocity, including any jump just applied)
+    // through the block-granularity axis-separated collision clip.
+    let mv = move_and_collide(
+        pos.x,
+        pos.y,
+        pos.z,
+        kind.bb_width() / 2.0,
+        kind.bb_height(),
+        st.vx,
+        st.vy,
+        st.vz,
+    );
+    let on_ground = mv.on_ground;
+    pos.x += mv.dx;
+    pos.y += mv.dy;
+    pos.z += mv.dz;
     pos.on_ground = on_ground;
+    st.horizontal_collision = mv.horizontal_collision;
+
+    // `restituteMovementAfterCollisions` with restitution 0: a collided axis zeroes
+    // its velocity component. A clipped horizontal face rests flush; a vertical clip —
+    // landing (below) or a head hitting a ceiling (above) — zeroes `vy`.
+    if mv.dx != st.vx {
+        st.vx = 0.0;
+    }
+    if mv.dz != st.vz {
+        st.vz = 0.0;
+    }
+    if mv.on_ground || mv.ceiling {
+        st.vy = 0.0;
+    }
 
     // Post-move: `movementY -= gravity; setDeltaMovement(x*friction, y*vFric, z*friction)`.
     st.vy = (st.vy - LIVING_GRAVITY) * VERTICAL_AIR_DRAG;
@@ -1851,6 +2096,191 @@ mod tests {
         assert!(grounded, "mob should land on the surface");
         // The fall produced at least one movement packet for the viewer.
         assert!(!drain(&mut rx).is_empty(), "landing should broadcast movement");
+    }
+
+    /// Drive one wander/physics step in isolation (no broadcast), with a pinned
+    /// player so `noActionTime` never blocks and an odd `tick_count` so no fresh
+    /// stroll target is rolled mid-test.
+    fn step(kind: MobKind, st: &mut MobState, pos: &mut Pos) {
+        let players = [(pos.x, pos.y, pos.z)];
+        let mut rng = rand::thread_rng();
+        step_mob(kind, st, pos, &players, &mut rng);
+    }
+
+    #[test]
+    fn mob_walks_into_two_high_wall_and_stops() {
+        // A pig (0.9 wide) walking +x into a 2-high wall is clipped flush against it,
+        // never clipping through, with its x-velocity zeroed.
+        let _lock = crate::world::WORLD_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let solid = grass_block_state();
+        let (bx, bz) = (600_000, 0);
+        // Floor at y=99 (feet stand at y=100) across the walk, wall 2-high at x=bx+3.
+        for x in 0..7 {
+            for z in -2..=2 {
+                crate::world::set_block(bx + x, 99, bz + z, solid);
+            }
+        }
+        for z in -2..=2 {
+            crate::world::set_block(bx + 3, 100, bz + z, solid);
+            crate::world::set_block(bx + 3, 101, bz + z, solid);
+        }
+
+        let mut pos = Pos { x: bx as f64 + 0.5, y: 100.0, z: bz as f64 + 0.5, yaw: 0.0, pitch: 0.0, on_ground: true };
+        let mut st = MobState::new(pos.x, pos.y, pos.z, 0.0);
+        st.tick_count = 1;
+        // A target straight through the wall, at the same height (no genuine step-up).
+        st.target = Some((bx as f64 + 6.5, 100.0, bz as f64 + 0.5));
+        st.pursue_ticks = STROLL_MAX_TICKS;
+
+        for _ in 0..80 {
+            step(MobKind::Pig, &mut st, &mut pos);
+            // The box's leading face (x + 0.45) must never enter the wall column (x=3).
+            assert!(pos.x + 0.45 <= (bx + 3) as f64 + 1e-6, "pig clipped into/through the wall at x={}", pos.x);
+        }
+        // It has come to rest flush against the wall with no residual x-velocity.
+        assert!(pos.x + 0.45 > (bx + 3) as f64 - 0.05, "pig should be pressed against the wall, x={}", pos.x);
+        assert!(st.vx.abs() < 1e-9, "x-velocity zeroed on collision, vx={}", st.vx);
+        assert!(st.horizontal_collision, "horizontal collision flagged");
+    }
+
+    #[test]
+    fn mob_jumps_a_one_high_ledge_and_lands_on_top() {
+        // A pig bumping a 1-high ledge (solid ahead, air above) jumps and ends up
+        // standing on top within a bounded number of ticks.
+        let _lock = crate::world::WORLD_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let solid = grass_block_state();
+        let (bx, bz) = (601_000, 0);
+        // Low floor at y=99 (top y=100) for x in 0..2, raised floor (extra block at
+        // y=100, top y=101) for x in 3..8 — a 1-block ledge whose face is at x=3.
+        for x in 0..9 {
+            for z in -2..=2 {
+                crate::world::set_block(bx + x, 99, bz + z, solid);
+            }
+        }
+        for x in 3..9 {
+            for z in -2..=2 {
+                crate::world::set_block(bx + x, 100, bz + z, solid);
+            }
+        }
+
+        let mut pos = Pos { x: bx as f64 + 0.5, y: 100.0, z: bz as f64 + 0.5, yaw: 0.0, pitch: 0.0, on_ground: true };
+        let mut st = MobState::new(pos.x, pos.y, pos.z, 0.0);
+        st.tick_count = 1;
+        // Target on top of the ledge, beyond the face.
+        st.target = Some((bx as f64 + 6.5, 101.0, bz as f64 + 0.5));
+        st.pursue_ticks = 300;
+
+        let mut on_ledge = false;
+        for _ in 0..200 {
+            // Keep pursuing (this test only exercises movement, not the stroll roll).
+            if st.target.is_none() {
+                st.target = Some((bx as f64 + 6.5, 101.0, bz as f64 + 0.5));
+                st.pursue_ticks = 300;
+            }
+            step(MobKind::Pig, &mut st, &mut pos);
+            if pos.on_ground && (pos.y - 101.0).abs() < 0.05 && pos.x > (bx + 3) as f64 {
+                on_ledge = true;
+                break;
+            }
+        }
+        assert!(on_ledge, "pig should jump the ledge and stand on top, ended at ({}, {})", pos.x, pos.y);
+    }
+
+    #[test]
+    fn jump_cooldown_allows_one_jump_per_ten_ticks() {
+        // With a jump requested every tick and the mob pinned grounded, `noJumpDelay`
+        // gates jumping to once per 10 ticks (no jump spam). A jump fired this tick is
+        // detectable as `no_jump_delay` having just been (re)armed to 10.
+        let _lock = crate::world::WORLD_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let solid = grass_block_state();
+        let (bx, bz) = (602_000, 0);
+        for z in -2..=2 {
+            for x in -2..=2 {
+                crate::world::set_block(bx + x, 99, bz + z, solid);
+            }
+        }
+        let x0 = bx as f64 + 0.5;
+        let z0 = bz as f64 + 0.5;
+        let mut st = MobState::new(x0, 100.0, z0, 0.0);
+        st.tick_count = 1;
+        let mut pos = Pos { x: x0, y: 100.0, z: z0, yaw: 0.0, pitch: 0.0, on_ground: true };
+
+        let mut jumps = 0;
+        for _ in 0..30 {
+            // Re-pin to a grounded, fixed state and re-request a jump via trigger (a):
+            // a target 2 up and 0.8 away horizontally (dist_h ≥ ARRIVE_DIST, dist² < 1).
+            pos.x = x0;
+            pos.z = z0;
+            pos.y = 100.0;
+            pos.on_ground = true;
+            st.vy = 0.0;
+            st.target = Some((x0 + 0.8, 102.0, z0));
+            st.pursue_ticks = STROLL_MAX_TICKS;
+            step(MobKind::Pig, &mut st, &mut pos);
+            if st.no_jump_delay == NO_JUMP_DELAY {
+                jumps += 1;
+            }
+        }
+        assert_eq!(jumps, 3, "expected one jump per 10 ticks over 30 ticks, got {jumps}");
+    }
+
+    #[test]
+    fn ceiling_clip_zeroes_upward_velocity() {
+        // A pig with upward velocity under a low ceiling is clipped: it does not pass
+        // through, and its upward velocity is zeroed (then gravity turns it negative).
+        let _lock = crate::world::WORLD_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let solid = grass_block_state();
+        let (bx, bz) = (603_000, 0);
+        for z in -1..=1 {
+            for x in -1..=1 {
+                crate::world::set_block(bx + x, 99, bz + z, solid); // floor (top y=100)
+                crate::world::set_block(bx + x, 101, bz + z, solid); // ceiling (bottom y=101)
+            }
+        }
+        // Direct collision check: box [100, 100.9] moving up 0.42 clips at the ceiling.
+        let mv = move_and_collide(bx as f64 + 0.5, 100.0, bz as f64 + 0.5, 0.45, 0.9, 0.0, 0.42, 0.0);
+        assert!(mv.ceiling, "upward clip flagged");
+        assert!((mv.dy - 0.1).abs() < 1e-9, "clipped to the 0.1 gap under the ceiling, dy={}", mv.dy);
+
+        // Through a full step, the upward velocity is zeroed then made negative by
+        // gravity, and the pig never rises past the ceiling gap.
+        let mut pos = Pos { x: bx as f64 + 0.5, y: 100.0, z: bz as f64 + 0.5, yaw: 0.0, pitch: 0.0, on_ground: true };
+        let mut st = MobState::new(pos.x, pos.y, pos.z, 0.0);
+        st.tick_count = 1;
+        st.vy = 0.42; // as if it had just jumped
+        step(MobKind::Pig, &mut st, &mut pos);
+        assert!(pos.y <= 100.1 + 1e-9, "pig rose past the ceiling gap, y={}", pos.y);
+        assert!(st.vy < 0.0, "upward vy zeroed then pulled down by gravity, vy={}", st.vy);
+    }
+
+    #[test]
+    fn cow_footprint_stays_supported_over_a_block_edge() {
+        // A cow (0.9 wide) whose centre column is air but whose box overlaps a
+        // neighbouring solid column stays supported — vanilla stands on any block
+        // under the box, not just the one under its centre.
+        let _lock = crate::world::WORLD_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let solid = grass_block_state();
+        let (bx, bz) = (604_000, 0);
+        // Support block only under column x=bx+2; the centre column (x=bx+3) is air.
+        crate::world::set_block(bx + 2, 99, bz, solid);
+        // Cow centred at x=bx+3.05 → box x ∈ [bx+2.6, bx+3.5], overlapping columns 2 and 3.
+        let cx = bx as f64 + 3.05;
+        assert_eq!(cx.floor() as i32, bx + 3, "centre column is the air column");
+        assert_eq!(crate::world::block_state_at(bx + 3, 99, bz), crate::world::AIR_STATE);
+
+        let mv = move_and_collide(cx, 100.0, bz as f64 + 0.5, 0.45, 1.4, 0.0, -0.1, 0.0);
+        assert!(mv.on_ground, "cow is supported by the neighbouring column under its box");
+        assert!((mv.dy - 0.0).abs() < 1e-9, "downward move clipped to rest on the block top, dy={}", mv.dy);
     }
 
     #[test]
