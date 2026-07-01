@@ -44,6 +44,7 @@ use std::collections::VecDeque;
 use crate::ids::BlockState;
 
 use super::chunk_data::cell_state;
+use super::gen::GenChunk;
 use super::{states, COLUMNS, MAX_Y_EXCL, MIN_Y, SECTION_COUNT};
 
 /// The lowest light section sits one section *below* the world floor, and the
@@ -77,15 +78,12 @@ pub struct ChunkLight {
 }
 
 /// Light this block state dampens, as `getOpacity` sees it *before* the `max(1,
-/// …)` floor: 0 for air (fully transparent), 15 for every block Vela can place or
-/// generate (all fully opaque). Extend this when translucent blocks (water,
-/// leaves, glass, slabs) are modelled — they dampen by 1 or by a shape.
+/// …)` floor: 0 for fully transparent cells (air, plants, thin snow), 1 for
+/// translucent blocks (water, ice, leaves) that let light through attenuating by
+/// one, 15 for opaque solids. Delegates to the generator's block classification
+/// so surface/decoration blocks light correctly.
 fn light_dampening(state: BlockState) -> u8 {
-    if state == states::AIR {
-        0
-    } else {
-        MAX_LEVEL
-    }
+    super::gen::light_dampening(state)
 }
 
 /// The light level a block state emits (`getLightEmission`). No block Vela can
@@ -116,7 +114,7 @@ fn idx(lx: i32, gy: i32, lz: i32) -> usize {
 /// and solid (bedrock-like) below the floor — matching vanilla's `getState`,
 /// which returns bedrock for a missing/out-of-range position.
 fn state_for_light(
-    heights: &[i32; COLUMNS],
+    gen: &GenChunk,
     edits: &HashMap<u32, BlockState>,
     lx: i32,
     gy: i32,
@@ -127,7 +125,7 @@ fn state_for_light(
     } else if gy < MIN_Y {
         states::BEDROCK
     } else {
-        cell_state(heights, edits, lx, gy, lz)
+        cell_state(gen, edits, lx, gy, lz)
     }
 }
 
@@ -143,15 +141,15 @@ const NEIGHBORS: [(i32, i32, i32); 6] = [
 
 /// Compute both light layers for a chunk from its column heights and edits.
 pub(super) fn compute_light(
-    heights: &[i32; COLUMNS],
+    gen: &GenChunk,
     edits: &HashMap<u32, BlockState>,
 ) -> ChunkLight {
     // One state lookup per cell: the whole flood reads dampening from here
     // (`opacity = max(1, dampening)`) and sky seeding keys off `dampening == 0`.
-    let dampening = dampening_grid(heights, edits);
+    let dampening = dampening_grid(gen, edits);
     ChunkLight {
         sky: pack_layers(&compute_sky(&dampening)),
-        block: pack_layers(&compute_block(heights, edits, &dampening)),
+        block: pack_layers(&compute_block(gen, edits, &dampening)),
     }
 }
 
@@ -159,12 +157,12 @@ pub(super) fn compute_light(
 /// volume in a single pass. Opacity is `max(1, dampening)` and sky seeding needs
 /// the transparent (`dampening == 0`) columns, so both derive from this one grid
 /// rather than re-fetching each cell's block state.
-fn dampening_grid(heights: &[i32; COLUMNS], edits: &HashMap<u32, BlockState>) -> Vec<u8> {
+fn dampening_grid(gen: &GenChunk, edits: &HashMap<u32, BlockState>) -> Vec<u8> {
     let mut grid = vec![0u8; VOLUME];
     for lz in 0..16 {
         for lx in 0..16 {
             for gy in LIGHT_Y_MIN..LIGHT_Y_MAX {
-                grid[idx(lx, gy, lz)] = light_dampening(state_for_light(heights, edits, lx, gy, lz));
+                grid[idx(lx, gy, lz)] = light_dampening(state_for_light(gen, edits, lx, gy, lz));
             }
         }
     }
@@ -215,7 +213,7 @@ fn compute_sky(dampening: &[u8]) -> Vec<u8> {
 /// Block light: seed each emitting block with its emission level, then flood.
 /// With no emitters modelled this produces an all-zero grid (all sections empty).
 fn compute_block(
-    heights: &[i32; COLUMNS],
+    gen: &GenChunk,
     edits: &HashMap<u32, BlockState>,
     dampening: &[u8],
 ) -> Vec<u8> {
@@ -224,7 +222,7 @@ fn compute_block(
     for lz in 0..16 {
         for lx in 0..16 {
             for gy in LIGHT_Y_MIN..LIGHT_Y_MAX {
-                let emission = light_emission(state_for_light(heights, edits, lx, gy, lz));
+                let emission = light_emission(state_for_light(gen, edits, lx, gy, lz));
                 if emission > 0 {
                     let i = idx(lx, gy, lz);
                     light[i] = emission;
@@ -326,7 +324,7 @@ fn pack_layers(light: &[u8]) -> Vec<Option<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::chunk_data::chunk_heights;
+    use crate::world::gen::GenChunk;
 
     /// Read a nibble back out of a packed `DataLayer` at cell `(lx, ly, lz)`.
     fn nibble(bytes: &[u8], lx: i32, ly: i32, lz: i32) -> u8 {
@@ -350,11 +348,11 @@ mod tests {
 
     #[test]
     fn open_column_is_fully_sky_lit_above_surface_and_dark_below() {
-        let heights = chunk_heights(0, 0);
+        let gen = GenChunk::flat(63);
         let edits = HashMap::new();
-        let sky = compute_sky(&dampening_grid(&heights, &edits));
+        let sky = compute_sky(&dampening_grid(&gen, &edits));
         let (lx, lz) = (0, 0);
-        let surface = heights[0]; // highest opaque block (grass) in this column
+        let surface = 63; // flat plains: grass at y=63
         // Air directly above the surface sees the sky: full 15.
         assert_eq!(sky[idx(lx, surface + 1, lz)], 15);
         assert_eq!(sky[idx(lx, 200, lz)], 15);
@@ -368,12 +366,12 @@ mod tests {
         // Float a single opaque block high above an open column: the cell right
         // under it loses direct sky and is lit only by horizontal bleed from its
         // four open (15) neighbours, so it reads one step down at 14.
-        let heights = chunk_heights(100, 100);
+        let gen = GenChunk::flat(63);
         let mut edits = HashMap::new();
         let roof_y = 150;
         edits.insert(edit_key_for(8, roof_y, 8), states::STONE);
 
-        let sky = compute_sky(&dampening_grid(&heights, &edits));
+        let sky = compute_sky(&dampening_grid(&gen, &edits));
         // Directly beneath the block: shadowed, one step in from open sky → 14.
         assert_eq!(sky[idx(8, roof_y - 1, 8)], 14);
         // Its neighbours (and open air elsewhere) still see full sky.
@@ -383,17 +381,17 @@ mod tests {
 
     #[test]
     fn no_emitters_means_block_light_is_all_empty() {
-        let heights = chunk_heights(1, 1);
+        let gen = GenChunk::flat(63);
         let edits = HashMap::new();
-        let light = compute_light(&heights, &edits);
+        let light = compute_light(&gen, &edits);
         assert!(light.block.iter().all(|s| s.is_none()));
     }
 
     #[test]
     fn top_pad_section_is_full_bright_and_floor_is_empty() {
-        let heights = chunk_heights(2, 2);
+        let gen = GenChunk::flat(63);
         let edits = HashMap::new();
-        let light = compute_light(&heights, &edits);
+        let light = compute_light(&gen, &edits);
         // Topmost section (all air, open sky) is a filled 0xFF DataLayer.
         let top = &light.sky[LIGHT_SECTION_COUNT - 1];
         assert!(top.as_ref().is_some_and(|b| b.iter().all(|&x| x == 0xFF)));
@@ -403,10 +401,10 @@ mod tests {
 
     #[test]
     fn packing_round_trips_a_known_section() {
-        let heights = chunk_heights(3, 3);
+        let gen = GenChunk::flat(63);
         let edits = HashMap::new();
-        let light = compute_light(&heights, &edits);
-        let surface = heights[0];
+        let light = compute_light(&gen, &edits);
+        let surface = 63;
         let section = section_of(surface + 1);
         let bytes = light.sky[section].as_ref().expect("lit section present");
         // The air cell above the surface in column (0,0) reads back as 15.

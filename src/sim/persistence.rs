@@ -59,10 +59,15 @@ pub fn boot(world: &mut World) {
                 game_time = data.game_time,
                 "loaded level.dat"
             );
+            // Thread the persisted seed into generation so the world regenerates
+            // reproducibly (must happen before any chunk is touched).
+            crate::world::set_seed(data.seed);
             apply(world, &data);
         }
         None => {
             info!(level = %level_name, "no level.dat; creating a new world");
+            // A fresh world keeps the default generator seed; persist it.
+            crate::world::set_seed(crate::world::DEFAULT_SEED as i64);
             save_level_dat(world);
         }
     }
@@ -104,9 +109,9 @@ pub fn shutdown(world: &mut World) {
     info!("world saved on shutdown");
 }
 
-/// Apply a loaded `level.dat` to the live world clock and game rules. Seed and
-/// spawn are persisted but not fed back (generation stays on the fixed terrain
-/// seed and the spawn is the origin column — see the module notes).
+/// Apply a loaded `level.dat` to the live world clock and game rules. The seed is
+/// fed back into generation by the caller (`boot`); spawn is re-derived from the
+/// generator each join.
 fn apply(world: &mut World, data: &LevelData) {
     {
         let mut time = world.resource_mut::<WorldTime>();
@@ -132,9 +137,13 @@ fn save_level_dat(world: &World) {
     let time = world.resource::<WorldTime>();
     let rules = world.resource::<GameRules>();
 
-    // Spawn is the top of the origin column, matching the join sequence.
-    let spawn_y = crate::world::surface_height(0, 0) + 1;
-    let mut data = LevelData::new(level_name, crate::world::SEED as i64, spawn_y);
+    // Spawn is the top of a solid, dry column near origin, matching the join
+    // sequence's spawn selection.
+    let (sx, sz) = crate::world::spawn_column();
+    let spawn_y = crate::world::surface_height(sx, sz) + 1;
+    let mut data = LevelData::new(level_name, crate::world::seed() as i64, spawn_y);
+    data.spawn_x = sx;
+    data.spawn_z = sz;
     data.game_time = time.game_time;
     data.day_time = time.day_time;
     data.game_rules = rules.to_saved();

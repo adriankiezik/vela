@@ -117,7 +117,7 @@ pub fn load_chunk(cx: i32, cz: i32) -> Option<Vec<BlockState>> {
 pub fn save_chunk(
     cx: i32,
     cz: i32,
-    heights: &[i32; super::COLUMNS],
+    gen: &super::gen::GenChunk,
     edits: &HashMap<u32, BlockState>,
     game_time: i64,
 ) -> io::Result<()> {
@@ -125,7 +125,7 @@ pub fn save_chunk(
     let Some(storage) = guard.as_mut() else {
         return Ok(());
     };
-    let tag = chunk_nbt::to_nbt(cx, cz, heights, edits, game_time);
+    let tag = chunk_nbt::to_nbt(cx, cz, gen, edits, game_time);
     let mut body = bytes::BytesMut::new();
     crate::protocol::nbt::write_named(&mut body, "", &tag);
     let (lx, lz) = local(cx, cz);
@@ -260,7 +260,7 @@ mod tests {
 
         // Save a chunk with a couple of edits at a far-away coord.
         let (cx, cz) = (40, -70);
-        let heights = super::super::chunk_data::chunk_heights(cx, cz);
+        let gen = super::super::gen::GenChunk::generate(cx, cz);
         let mut edits = HashMap::new();
         let key = |lx: i32, y: i32, lz: i32| {
             ((y - super::super::MIN_Y) as u32) * super::super::COLUMNS as u32
@@ -269,7 +269,7 @@ mod tests {
         };
         edits.insert(key(2, 120, 3), BlockState(1)); // stone
         edits.insert(key(2, 121, 3), BlockState(10)); // dirt
-        save_chunk(cx, cz, &heights, &edits, 7).expect("save");
+        save_chunk(cx, cz, &gen, &edits, 7).expect("save");
 
         // Drop the region cache so the reload opens the file fresh from disk.
         {
@@ -280,8 +280,8 @@ mod tests {
         }
 
         let grid = load_chunk(cx, cz).expect("reload");
-        // Rebuild the expected grid from heights+edits and compare.
-        let expected = chunk_nbt::from_nbt(&chunk_nbt::to_nbt(cx, cz, &heights, &edits, 7)).unwrap();
+        // Rebuild the expected grid from the baseline+edits and compare.
+        let expected = chunk_nbt::from_nbt(&chunk_nbt::to_nbt(cx, cz, &gen, &edits, 7)).unwrap();
         assert_eq!(grid, expected);
 
         // Tear down: clear the global handle and remove the temp dir.

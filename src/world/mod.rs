@@ -1,6 +1,6 @@
 //! World data representation, split into focused modules:
 //!
-//! * [`terrain`] — the noise-based heightmap generator (`surface_height`);
+//! * [`gen`] — world generation: noise heights, biomes, surface rules, features;
 //! * [`chunk_data`] — chunk storage/lifecycle and the public block read/write API;
 //! * [`encoding`] — the per-chunk block-section wire encoding;
 //! * [`heightmap`] — the client-facing `WORLD_SURFACE`/`MOTION_BLOCKING` maps;
@@ -27,15 +27,15 @@ pub mod block_drop;
 mod block_item;
 mod chunk_data;
 mod encoding;
+pub mod gen;
 mod heightmap;
 mod light;
 pub mod storage;
-mod terrain;
 
 pub use block_item::block_state_for_item;
 pub use chunk_data::{block_state_at, chunk_columns, save_dirty_chunks, set_block};
+pub use gen::{seed, set_seed, spawn_column, surface_height, DEFAULT_SEED};
 pub use light::ChunkLight;
-pub use terrain::{surface_height, SEED};
 
 // The wire-columns type is reached through `chunk_columns`' return value rather
 // than named directly, but stays part of the public API surface.
@@ -65,18 +65,12 @@ pub const AIR_STATE: BlockState = BlockState(0);
 const WORLD_HEIGHT: i32 = SECTION_COUNT * 16;
 const MAX_Y_EXCL: i32 = MIN_Y + WORLD_HEIGHT;
 
-/// The biome a section's biome `PalettedContainer` reports, as a *network*
-/// registry index into the biome registry we sync in `crate::registry`. Index
-/// 39 is `minecraft:plains` in that list — a sensible match for green grassy
-/// terrain (index 0 would be `badlands`, which tints grass orange). The whole
-/// world reports this single biome for now.
-const PLAINS_BIOME: u32 = 39;
-
 /// Global block-state palette ids — the default state of each block, taken from
 /// the server's block registration order in `Blocks.java` (AIR registered first
 /// → state 0, STONE second → state 1) and the generated `reports/blocks.json`
 /// for 26.2.
 mod states {
+    #![allow(dead_code)] // AIR/BEDROCK are hot; STONE/GRASS_BLOCK/DIRT back the tests.
     use crate::ids::BlockState;
     pub const AIR: BlockState = BlockState(0);
     /// STONE is the second block registered (single state) → state id 1.

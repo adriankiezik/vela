@@ -6,27 +6,29 @@ use crate::protocol::buffer::PacketWriter;
 
 use super::bitpack::pack_bits;
 use super::chunk_data::cell_state;
-use super::{states, CELLS, COLUMNS, MIN_Y, PLAINS_BIOME, SECTION_COUNT};
+use super::gen::{biome_registry_size, GenChunk};
+use super::{states, CELLS, MIN_Y, SECTION_COUNT};
 
-/// Encode the 24-section block blob for a chunk from its heights and edits.
+/// Encode the 24-section block blob for a chunk from its generated baseline and
+/// edits.
 pub(super) fn encode_blob(
-    heights: &[i32; COLUMNS],
+    gen: &GenChunk,
     edits: &std::collections::HashMap<u32, BlockState>,
 ) -> Vec<u8> {
     let mut out = PacketWriter::new();
     for section in 0..SECTION_COUNT {
         let base_y = MIN_Y + section * 16;
-        encode_section(base_y, heights, edits, &mut out);
+        encode_section(base_y, gen, edits, &mut out);
     }
     out.buf.to_vec()
 }
 
-/// Serialize one section: counts, then the block-state and biome containers.
-/// `heights` are the 256 per-column surface heights for this chunk, indexed
-/// `lz * 16 + lx`; `edits` overrides individual cells.
+/// Serialize one section: counts, then the block-state and biome containers. The
+/// baseline `gen` supplies the terrain/feature blocks and per-column biomes;
+/// `edits` overrides individual cells.
 fn encode_section(
     base_y: i32,
-    heights: &[i32; COLUMNS],
+    gen: &GenChunk,
     edits: &std::collections::HashMap<u32, BlockState>,
     out: &mut PacketWriter,
 ) {
@@ -37,7 +39,7 @@ fn encode_section(
         let world_y = base_y + ly;
         for lz in 0..16i32 {
             for lx in 0..16i32 {
-                let state = cell_state(heights, edits, lx, world_y, lz);
+                let state = cell_state(gen, edits, lx, world_y, lz);
                 if state != states::AIR {
                     non_air += 1;
                 }
@@ -50,7 +52,82 @@ fn encode_section(
     out.write_i16(non_air as i16); // non-empty block count
     out.write_i16(0); // fluid count
     write_block_palette(&cells, out); // block-state container
-    write_single_value(PLAINS_BIOME, out); // biome container (single value)
+    write_biome_palette(gen, out); // biome container (4×4×4 cells)
+}
+
+/// Write the section's biome `PalettedContainer`. Biomes here are horizontal-only
+/// (one per column), so a section samples 16 columns across its 4×4×4 grid. Uses
+/// vanilla's biome `Strategy` (`createForBiomes`): single value, 1–3 bit linear
+/// palette, else the global palette at `ceillog2(biomeCount)` bits.
+fn write_biome_palette(gen: &GenChunk, out: &mut PacketWriter) {
+    // 64 biome cells, indexed `(y << 2 | z) << 2 | x`; y is ignored (no vertical
+    // biome variation), so each cell takes its column biome at local (x*4, z*4).
+    let mut cells = [0u32; 64];
+    for by in 0..4i32 {
+        for bz in 0..4i32 {
+            for bx in 0..4i32 {
+                let idx = ((by << 2 | bz) << 2 | bx) as usize;
+                cells[idx] = gen.biome_id(bx * 4, bz * 4);
+            }
+        }
+    }
+
+    // Distinct biome ids, first-seen (a handful at most).
+    let mut palette: Vec<u32> = Vec::new();
+    for &c in cells.iter() {
+        if !palette.contains(&c) {
+            palette.push(c);
+        }
+    }
+
+    if palette.len() == 1 {
+        write_single_value(palette[0], out);
+        return;
+    }
+
+    let bits = bits_for_palette_generic(palette.len());
+    if bits <= 3 {
+        // Linear indirect palette (biome strategy caps the indirect path at 3 bits).
+        out.write_u8(bits as u8);
+        out.write_varint(palette.len() as i32);
+        for &id in &palette {
+            out.write_varint(id as i32);
+        }
+        let indices: Vec<u64> = cells
+            .iter()
+            .map(|c| palette.iter().position(|p| p == c).unwrap() as u64)
+            .collect();
+        for long in pack_bits(&indices, bits) {
+            out.write_i64(long as i64);
+        }
+        return;
+    }
+
+    // Global palette: raw biome ids at `ceillog2(biomeCount)` bits, no palette list.
+    let global_bits = bits_for_global_count(biome_registry_size());
+    out.write_u8(global_bits as u8);
+    let indices: Vec<u64> = cells.iter().map(|&c| c as u64).collect();
+    for long in pack_bits(&indices, global_bits) {
+        out.write_i64(long as i64);
+    }
+}
+
+/// Bits to index `len` distinct entries (`ceillog2`), with no minimum floor.
+fn bits_for_palette_generic(len: usize) -> u32 {
+    if len <= 1 {
+        0
+    } else {
+        usize::BITS - (len - 1).leading_zeros()
+    }
+}
+
+/// Bits for a global palette over `count` registry entries (`ceillog2(count)`).
+fn bits_for_global_count(count: usize) -> u32 {
+    if count <= 1 {
+        1
+    } else {
+        usize::BITS - (count - 1).leading_zeros()
+    }
 }
 
 /// Write a block-state `PalettedContainer`, mirroring vanilla
@@ -140,8 +217,6 @@ fn write_single_value(value: u32, out: &mut PacketWriter) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::chunk_data::chunk_heights;
-    use super::super::terrain::state_at;
 
     #[test]
     fn bits_for_palette_widths() {
@@ -183,26 +258,37 @@ mod tests {
     }
 
     #[test]
-    fn surface_column_palette_is_within_4_bits() {
-        // For every section, confirm the distinct-state count stays within the
-        // 16-entry (4-bit) linear-palette ceiling.
-        let heights = chunk_heights(0, 0);
+    fn generated_section_palette_stays_indirect() {
+        // Generation draws from a small block set, so every section should stay
+        // well inside the 256-entry indirect-palette range (never forced global).
+        let gen = GenChunk::generate(0, 0);
         for section in 0..SECTION_COUNT {
             let base_y = MIN_Y + section * 16;
             let mut distinct: Vec<BlockState> = Vec::new();
             for ly in 0..16i32 {
-                for &h in heights.iter() {
-                    let s = state_at(base_y + ly, h);
-                    if !distinct.contains(&s) {
-                        distinct.push(s);
+                for lz in 0..16i32 {
+                    for lx in 0..16i32 {
+                        let s = gen.base_state(lx, base_y + ly, lz);
+                        if !distinct.contains(&s) {
+                            distinct.push(s);
+                        }
                     }
                 }
             }
             assert!(
-                distinct.len() <= 16,
-                "section {section} has {} states",
+                distinct.len() <= 256,
+                "section {section} has {} states (would force the global palette)",
                 distinct.len()
             );
         }
+    }
+
+    #[test]
+    fn biome_container_is_written_per_section() {
+        // The block blob must be non-trivial and encode a biome container after
+        // each section's block container (single-value or small linear palette).
+        let gen = GenChunk::generate(0, 0);
+        let blob = encode_blob(&gen, &std::collections::HashMap::new());
+        assert!(blob.len() > (SECTION_COUNT as usize) * 8);
     }
 }

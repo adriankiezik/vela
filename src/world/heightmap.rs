@@ -7,6 +7,7 @@ use crate::ids::BlockState;
 
 use super::bitpack::pack_bits;
 use super::chunk_data::cell_state;
+use super::gen::{is_motion_blocking, GenChunk};
 use super::{states, COLUMNS, MAX_Y_EXCL, MIN_Y, WORLD_HEIGHT};
 
 /// The two client-facing heightmaps (`WORLD_SURFACE` = id 1, `MOTION_BLOCKING`
@@ -19,7 +20,7 @@ use super::{states, COLUMNS, MAX_Y_EXCL, MIN_Y, WORLD_HEIGHT};
 /// edited column is scanned from the top so a placed block raises the map and a
 /// broken surface lowers it.
 pub(super) fn compute_heightmaps(
-    heights: &[i32; COLUMNS],
+    gen: &GenChunk,
     edits: &HashMap<u32, BlockState>,
 ) -> Vec<(i32, Vec<i64>)> {
     // Bits = ceil(log2(worldHeight + 1)); a 384-tall column -> 9.
@@ -32,37 +33,42 @@ pub(super) fn compute_heightmaps(
     for &k in edits.keys() {
         edited_cols.insert(k % COLUMNS as u32);
     }
-    let mut values = [0u64; COLUMNS];
+    // WORLD_SURFACE (any non-air block) and MOTION_BLOCKING (motion-blocking or
+    // fluid) can differ where plants sit over the surface, so they are computed
+    // with their own predicates.
+    let mut ws = [0u64; COLUMNS];
+    let mut mb = [0u64; COLUMNS];
     for lz in 0..16i32 {
         for lx in 0..16i32 {
             let col = (lz * 16 + lx) as usize;
-            values[col] =
-                (column_first_empty(heights, edits, &edited_cols, lx, lz) - MIN_Y) as u64;
+            if edited_cols.contains(&((lz as u32) * 16 + lx as u32)) {
+                ws[col] = (scan_top(gen, edits, lx, lz, |s| s != states::AIR) - MIN_Y) as u64;
+                mb[col] = (scan_top(gen, edits, lx, lz, is_motion_blocking) - MIN_Y) as u64;
+            } else {
+                // Unedited: use the baseline's precomputed tops.
+                ws[col] = (gen.world_surface_top(col) - MIN_Y) as u64;
+                mb[col] = (gen.motion_blocking_top(col) - MIN_Y) as u64;
+            }
         }
     }
-    let packed: Vec<i64> = pack_bits(&values, bits)
-        .into_iter()
-        .map(|l| l as i64)
-        .collect();
-    vec![(1, packed.clone()), (4, packed)]
+    let ws_packed: Vec<i64> = pack_bits(&ws, bits).into_iter().map(|l| l as i64).collect();
+    let mb_packed: Vec<i64> = pack_bits(&mb, bits).into_iter().map(|l| l as i64).collect();
+    vec![(1, ws_packed), (4, mb_packed)]
 }
 
-/// The first empty (air) y above the highest non-air block of column
-/// `(lx, lz)`. Unedited columns return `height + 1` directly; columns with edits
-/// are scanned downward from the world top. A fully-air column returns `MIN_Y`.
-fn column_first_empty(
-    heights: &[i32; COLUMNS],
+/// The first empty y above the highest cell of column `(lx, lz)` satisfying
+/// `pred`, scanned downward from the world top. A column with no such cell returns
+/// `MIN_Y` (stored as 0). Used only for edited columns; unedited columns take the
+/// baseline's precomputed tops.
+fn scan_top(
+    gen: &GenChunk,
     edits: &HashMap<u32, BlockState>,
-    edited_cols: &HashSet<u32>,
     lx: i32,
     lz: i32,
+    pred: impl Fn(BlockState) -> bool,
 ) -> i32 {
-    let height = heights[(lz * 16 + lx) as usize];
-    if !edited_cols.contains(&((lz as u32) * 16 + lx as u32)) {
-        return height + 1;
-    }
     for y in (MIN_Y..MAX_Y_EXCL).rev() {
-        if cell_state(heights, edits, lx, y, lz) != states::AIR {
+        if pred(cell_state(gen, edits, lx, y, lz)) {
             return y + 1;
         }
     }
@@ -98,10 +104,6 @@ mod tests {
         ((y - MIN_Y) as u32) * COLUMNS as u32 + (lz as u32) * 16 + lx as u32
     }
 
-    fn flat_heights(h: i32) -> [i32; COLUMNS] {
-        [h; COLUMNS]
-    }
-
     #[test]
     fn bit_width_is_nine_for_384_tall_world() {
         assert_eq!(WORLD_HEIGHT, SECTION_COUNT * 16);
@@ -112,8 +114,8 @@ mod tests {
     #[test]
     fn unedited_flat_surface_stores_height_plus_one_minus_floor() {
         // With no cover, firstAvailable = height + 1, stored relative to minY.
-        let heights = flat_heights(63);
-        let maps = compute_heightmaps(&heights, &HashMap::new());
+        let gen = GenChunk::flat(63);
+        let maps = compute_heightmaps(&gen, &HashMap::new());
 
         // Two maps: WORLD_SURFACE (1) and MOTION_BLOCKING (4), identical data.
         assert_eq!(maps.len(), 2);
@@ -132,11 +134,11 @@ mod tests {
     fn placing_a_block_above_the_surface_raises_the_column() {
         // A stone placed at y=70 over a surface-63 column makes it the top
         // non-air block -> firstAvailable = 71.
-        let heights = flat_heights(63);
+        let gen = GenChunk::flat(63);
         let mut edits = HashMap::new();
         edits.insert(key(0, 70, 0), states::STONE);
 
-        let maps = compute_heightmaps(&heights, &edits);
+        let maps = compute_heightmaps(&gen, &edits);
 
         assert_eq!(stored(&maps[0].1, 0, 0), (71 - MIN_Y) as u64); // raised
         assert_eq!(stored(&maps[0].1, 1, 0), (64 - MIN_Y) as u64); // neighbour unchanged
@@ -146,11 +148,11 @@ mod tests {
     fn breaking_the_surface_block_lowers_the_column() {
         // Removing the grass at y=63 exposes the dirt at y=62 (state_at: dirt
         // within height-3) -> firstAvailable = 63, one lower than the baseline.
-        let heights = flat_heights(63);
+        let gen = GenChunk::flat(63);
         let mut edits = HashMap::new();
         edits.insert(key(0, 63, 0), states::AIR);
 
-        let maps = compute_heightmaps(&heights, &edits);
+        let maps = compute_heightmaps(&gen, &edits);
 
         assert_eq!(stored(&maps[0].1, 0, 0), (63 - MIN_Y) as u64); // lowered by 1
         assert_eq!(stored(&maps[0].1, 1, 0), (64 - MIN_Y) as u64); // neighbour unchanged
@@ -161,13 +163,13 @@ mod tests {
         // A column whose surface is below the floor generates only the y=minY
         // bedrock cell; dig that out too and the whole column is air, so
         // firstAvailable == minY -> stored 0. Exercises the `MIN_Y` return path.
-        let mut heights = flat_heights(63);
-        let col = 0usize; // column (x=0, z=0): index x * 16 + z
-        heights[col] = MIN_Y - 1; // surface below the world floor
+        let mut gen = GenChunk::flat(63);
+        let col = 0usize; // column (x=0, z=0): index z * 16 + x
+        gen.heights_mut()[col] = MIN_Y - 1; // surface below the world floor
         let mut edits = HashMap::new();
         edits.insert(key(0, MIN_Y, 0), states::AIR); // remove the bedrock cell
 
-        let maps = compute_heightmaps(&heights, &edits);
+        let maps = compute_heightmaps(&gen, &edits);
 
         assert_eq!(stored(&maps[0].1, 0, 0), 0);
     }
