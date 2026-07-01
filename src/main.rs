@@ -7,6 +7,7 @@
 //! The network layer owns sockets; the simulation owns game state.
 
 mod config;
+mod ids;
 mod inventory;
 mod net;
 mod protocol;

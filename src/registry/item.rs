@@ -9,6 +9,8 @@
 
 use std::borrow::Cow;
 
+use crate::ids::ItemId;
+
 /// Item registry names indexed by numeric id: `ITEMS[id]` is the `namespace:path`
 /// of the item whose `BuiltInRegistries.ITEM.getId(..)` is `id`.
 #[rustfmt::skip]
@@ -571,12 +573,12 @@ static ITEMS: &[&str] = &[
 /// `minecraft:air` — the empty/sentinel item id. An `ItemStack` with this id (or
 /// a count of zero) is treated as empty by the network codec.
 #[allow(dead_code)] // the empty/sentinel id, for callers building stacks.
-pub const AIR: i32 = 0;
+pub const AIR: ItemId = ItemId(0);
 
 /// Look up an item's numeric id by `namespace:path`. A bare `path` (no `:`) is
 /// assumed to be in the `minecraft` namespace, matching `Identifier` parsing.
 #[allow(dead_code)] // a lookup API for callers that build stacks by name.
-pub fn id_of(name: &str) -> Option<i32> {
+pub fn id_of(name: &str) -> Option<ItemId> {
     // `Cow` names the "borrow when already namespaced, allocate only otherwise"
     // intent directly, replacing the deferred-init `&owned` local.
     let full: Cow<str> = if name.contains(':') {
@@ -584,13 +586,13 @@ pub fn id_of(name: &str) -> Option<i32> {
     } else {
         Cow::Owned(format!("minecraft:{name}"))
     };
-    ITEMS.iter().position(|n| **n == *full).map(|i| i as i32)
+    ITEMS.iter().position(|n| **n == *full).map(|i| ItemId(i as i32))
 }
 
 /// Reverse lookup: numeric id → `namespace:path`, if in range.
 #[allow(dead_code)] // paired reverse lookup for debugging/printing.
-pub fn name_of(id: i32) -> Option<&'static str> {
-    usize::try_from(id).ok().and_then(|i| ITEMS.get(i).copied())
+pub fn name_of(id: ItemId) -> Option<&'static str> {
+    usize::try_from(id.get()).ok().and_then(|i| ITEMS.get(i).copied())
 }
 
 /// Items overriding the default 64-item stack size, as `(id, max_stack_size)`
@@ -641,9 +643,9 @@ static MAX_STACK_OVERRIDES: &[(i32, i32)] = &[
 /// The maximum stack size for an item id — the `DataComponents.MAX_STACK_SIZE`
 /// value (default 64), with the per-item overrides above. Drives slot/cursor
 /// merge limits in the menu click resolver.
-pub fn max_stack_size(id: i32) -> i32 {
+pub fn max_stack_size(id: ItemId) -> i32 {
     MAX_STACK_OVERRIDES
-        .binary_search_by_key(&id, |(i, _)| *i)
+        .binary_search_by_key(&id.get(), |(i, _)| *i)
         .map(|idx| MAX_STACK_OVERRIDES[idx].1)
         .unwrap_or(64)
 }
@@ -654,21 +656,21 @@ mod tests {
 
     #[test]
     fn registry_lookups() {
-        assert_eq!(id_of("minecraft:air"), Some(0));
-        assert_eq!(id_of("stone"), Some(1)); // bare path defaults to minecraft:
-        assert_eq!(id_of("minecraft:diamond_sword"), Some(964));
+        assert_eq!(id_of("minecraft:air"), Some(ItemId(0)));
+        assert_eq!(id_of("stone"), Some(ItemId(1))); // bare path defaults to minecraft:
+        assert_eq!(id_of("minecraft:diamond_sword"), Some(ItemId(964)));
         assert_eq!(id_of("minecraft:not_a_real_item"), None);
-        assert_eq!(name_of(0), Some("minecraft:air"));
-        assert_eq!(name_of(926), Some("minecraft:diamond"));
-        assert_eq!(name_of(-1), None);
-        assert_eq!(name_of(10_000), None);
+        assert_eq!(name_of(ItemId(0)), Some("minecraft:air"));
+        assert_eq!(name_of(ItemId(926)), Some("minecraft:diamond"));
+        assert_eq!(name_of(ItemId(-1)), None);
+        assert_eq!(name_of(ItemId(10_000)), None);
     }
 
     #[test]
     fn contiguous_ids_round_trip() {
         for (i, name) in ITEMS.iter().enumerate() {
-            assert_eq!(id_of(name), Some(i as i32));
-            assert_eq!(name_of(i as i32), Some(*name));
+            assert_eq!(id_of(name), Some(ItemId(i as i32)));
+            assert_eq!(name_of(ItemId(i as i32)), Some(*name));
         }
     }
 

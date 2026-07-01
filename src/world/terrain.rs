@@ -5,6 +5,8 @@
 //! This is intentionally *not* a port of vanilla's `NoiseRouter`/`DensityFunction`
 //! stack — just enough rolling terrain to stand on.
 
+use crate::ids::BlockState;
+
 use super::{states, MIN_Y, SURFACE_Y};
 
 /// Fixed world seed. We do not thread the server.properties seed through here —
@@ -103,7 +105,7 @@ pub fn surface_height(world_x: i32, world_z: i32) -> i32 {
 /// block on top, air above. Bedrock is matched first so the floor is correct
 /// regardless of the surface height (it does not rely on `height` staying well
 /// above `MIN_Y`).
-pub(super) fn state_at(world_y: i32, height: i32) -> u32 {
+pub(super) fn state_at(world_y: i32, height: i32) -> BlockState {
     if world_y == MIN_Y {
         states::BEDROCK
     } else if world_y > height {

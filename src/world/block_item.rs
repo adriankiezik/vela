@@ -19,10 +19,13 @@
 //! than risk emitting an invalid block-state id. Extend the table as more
 //! block-state ids are verified for 26.2.
 
-/// The default block-state id placed by `item_id`, or `None` if the item is not
-/// a block we can place yet. Item ids match `crate::inventory`'s `ITEMS` table.
-pub fn block_state_for_item(item_id: i32) -> Option<u32> {
-    let state = match item_id {
+use crate::ids::{BlockState, ItemId};
+
+/// The default block-state id placed by `item`, or `None` if the item is not a
+/// block we can place yet. This is the one real bridge between the two id spaces
+/// (`ItemId` → `BlockState`), so both ends are typed.
+pub fn block_state_for_item(item: ItemId) -> Option<BlockState> {
+    let state = match item.get() {
         1 => 1,   // stone        → stone
         2 => 2,   // granite      → granite
         4 => 4,   // diorite      → diorite
@@ -34,7 +37,7 @@ pub fn block_state_for_item(item_id: i32) -> Option<u32> {
         85 => 85, // bedrock      → bedrock
         _ => return None,
     };
-    Some(state)
+    Some(BlockState(state))
 }
 
 #[cfg(test)]
@@ -43,16 +46,16 @@ mod tests {
 
     #[test]
     fn known_items_map_to_expected_states() {
-        assert_eq!(block_state_for_item(1), Some(1)); // stone
-        assert_eq!(block_state_for_item(54), Some(9)); // grass_block
-        assert_eq!(block_state_for_item(55), Some(10)); // dirt
-        assert_eq!(block_state_for_item(85), Some(85)); // bedrock
+        assert_eq!(block_state_for_item(ItemId(1)), Some(BlockState(1))); // stone
+        assert_eq!(block_state_for_item(ItemId(54)), Some(BlockState(9))); // grass_block
+        assert_eq!(block_state_for_item(ItemId(55)), Some(BlockState(10))); // dirt
+        assert_eq!(block_state_for_item(ItemId(85)), Some(BlockState(85))); // bedrock
     }
 
     #[test]
     fn air_and_non_blocks_are_not_placeable() {
-        assert_eq!(block_state_for_item(0), None); // air
-        assert_eq!(block_state_for_item(724), None); // diamond_sword
-        assert_eq!(block_state_for_item(686), None); // diamond
+        assert_eq!(block_state_for_item(ItemId(0)), None); // air
+        assert_eq!(block_state_for_item(ItemId(724)), None); // diamond_sword
+        assert_eq!(block_state_for_item(ItemId(686)), None); // diamond
     }
 }

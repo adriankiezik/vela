@@ -14,6 +14,7 @@
 use bytes::Bytes;
 use uuid::Uuid;
 
+use crate::ids::BlockState;
 use crate::protocol::buffer::PacketWriter;
 use crate::protocol::framing::frame;
 use crate::protocol::nbt::{write_network, Nbt};
@@ -514,10 +515,10 @@ pub fn forget_chunk(cx: i32, cz: i32) -> Bytes {
 /// `ClientboundBlockUpdatePacket` — a single block changed to `state_id`. Layout
 /// (`StreamCodec.composite`): the `BlockPos` (packed long) then the block-state
 /// id as a VarInt (`ByteBufCodecs.idMapper(Block.BLOCK_STATE_REGISTRY)`).
-pub fn block_update(x: i32, y: i32, z: i32, state_id: u32) -> Bytes {
+pub fn block_update(x: i32, y: i32, z: i32, state: BlockState) -> Bytes {
     let mut p = PacketWriter::new();
     p.write_block_pos(x, y, z);
-    p.write_varint(state_id as i32);
+    p.write_varint(state.get() as i32);
     frame(CB_PLAY_BLOCK_UPDATE, &p.buf)
 }
 
@@ -546,13 +547,13 @@ fn section_pos_as_long(sx: i32, sy: i32, sz: i32) -> i64 {
 /// `SectionPos.sectionRelativePos`). `changes` are `(localX, localY, localZ,
 /// state_id)` with each local coordinate in `0..16`.
 #[allow(dead_code)] // builder for batched edits; single-block edits use block_update today.
-pub fn section_blocks_update(sx: i32, sy: i32, sz: i32, changes: &[(u8, u8, u8, u32)]) -> Bytes {
+pub fn section_blocks_update(sx: i32, sy: i32, sz: i32, changes: &[(u8, u8, u8, BlockState)]) -> Bytes {
     let mut p = PacketWriter::new();
     p.write_i64(section_pos_as_long(sx, sy, sz));
     p.write_varint(changes.len() as i32);
     for &(lx, ly, lz, state) in changes {
         let local = ((lx as i64) << 8) | ((lz as i64) << 4) | (ly as i64);
-        p.write_varlong(((state as i64) << 12) | local);
+        p.write_varlong(((state.get() as i64) << 12) | local);
     }
     frame(CB_PLAY_SECTION_BLOCKS_UPDATE, &p.buf)
 }
@@ -689,7 +690,7 @@ mod tests {
 
     #[test]
     fn block_update_layout() {
-        let (id, mut r) = unframe(block_update(1, 64, -3, 9));
+        let (id, mut r) = unframe(block_update(1, 64, -3, BlockState(9)));
         assert_eq!(id, CB_PLAY_BLOCK_UPDATE);
         assert_eq!(r.read_block_pos().unwrap(), (1, 64, -3));
         assert_eq!(r.read_varint().unwrap(), 9); // grass_block default state
@@ -705,7 +706,7 @@ mod tests {
     #[test]
     fn section_blocks_update_layout() {
         // Two changes in section (1, 4, -1).
-        let changes = [(2u8, 3u8, 5u8, 1u32), (15u8, 0u8, 0u8, 9u32)];
+        let changes = [(2u8, 3u8, 5u8, BlockState(1)), (15u8, 0u8, 0u8, BlockState(9))];
         let (id, mut r) = unframe(section_blocks_update(1, 4, -1, &changes));
         assert_eq!(id, CB_PLAY_SECTION_BLOCKS_UPDATE);
         assert_eq!(r.read_i64().unwrap(), section_pos_as_long(1, 4, -1));

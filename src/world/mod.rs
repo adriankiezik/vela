@@ -19,6 +19,8 @@
 //! own block registration order (`Blocks.java`) / `--reports` block dump
 //! (observable output), not copied source.
 
+use crate::ids::BlockState;
+
 mod bitpack;
 mod block_item;
 mod chunk_data;
@@ -52,7 +54,7 @@ pub const SURFACE_Y: i32 = 63;
 /// The air block-state id (palette 0) — the "empty" cell and the result of a
 /// break. Public so the simulation can place/clear blocks without reaching into
 /// the private `states` table.
-pub const AIR_STATE: u32 = 0;
+pub const AIR_STATE: BlockState = BlockState(0);
 
 /// Total world height in blocks (`SECTION_COUNT * 16`), and the exclusive top y.
 const WORLD_HEIGHT: i32 = SECTION_COUNT * 16;
@@ -70,10 +72,11 @@ const PLAINS_BIOME: u32 = 39;
 /// → state 0, STONE second → state 1) and the generated `reports/blocks.json`
 /// for 26.2.
 mod states {
-    pub const AIR: u32 = 0;
+    use crate::ids::BlockState;
+    pub const AIR: BlockState = BlockState(0);
     /// STONE is the second block registered (single state) → state id 1.
-    pub const STONE: u32 = 1;
-    pub const GRASS_BLOCK: u32 = 9;
-    pub const DIRT: u32 = 10;
-    pub const BEDROCK: u32 = 85;
+    pub const STONE: BlockState = BlockState(1);
+    pub const GRASS_BLOCK: BlockState = BlockState(9);
+    pub const DIRT: BlockState = BlockState(10);
+    pub const BEDROCK: BlockState = BlockState(85);
 }

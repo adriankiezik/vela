@@ -4,6 +4,7 @@
 //! per-method citations. Nothing here copies Mojang code; the layouts are
 //! transcribed from the `StreamCodec` definitions.
 
+use crate::ids::ItemId;
 use crate::protocol::buffer::{PacketReader, PacketWriter};
 
 /// A stack of items. Data components are not modelled yet — on the wire we always
@@ -13,21 +14,24 @@ use crate::protocol::buffer::{PacketReader, PacketWriter};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ItemStack {
     /// Numeric item id (`BuiltInRegistries.ITEM` index).
-    pub id: i32,
+    pub id: ItemId,
     /// Stack size (`>= 1` for a present stack).
     pub count: i32,
 }
 
 impl ItemStack {
+    /// Convenience constructor taking the raw numeric id — the ergonomic form for
+    /// tests and callers that build stacks from a literal id; the field itself is
+    /// typed [`ItemId`] so id-carrying *logic* stays un-swappable.
     #[allow(dead_code)] // convenience constructor for tests/callers building stacks by id.
     pub fn new(id: i32, count: i32) -> Self {
-        Self { id, count }
+        Self { id: ItemId(id), count }
     }
 
     /// The empty stack sentinel (`ItemStack.EMPTY`). Modelled as a zero-count air
     /// stack so the click-resolution port can pass items by value the way vanilla
     /// passes `ItemStack.EMPTY`; slot storage still uses `Option<ItemStack>`/`None`.
-    pub const EMPTY: ItemStack = ItemStack { id: 0, count: 0 };
+    pub const EMPTY: ItemStack = ItemStack { id: ItemId(0), count: 0 };
 
     /// Whether this stack is empty (`ItemStack.isEmpty`): air or a non-positive
     /// count.
@@ -127,7 +131,7 @@ pub fn write_item_stack(p: &mut PacketWriter, stack: Option<&ItemStack>) {
     match stack {
         Some(s) if s.count > 0 => {
             p.write_varint(s.count);
-            p.write_varint(s.id);
+            p.write_varint(s.id.get());
             // Empty DataComponentPatch: zero added, zero removed.
             p.write_varint(0);
             p.write_varint(0);
@@ -159,7 +163,7 @@ pub fn read_item_stack(r: &mut PacketReader) -> std::io::Result<Option<ItemStack
             "item stack carries data components (unsupported)",
         ));
     }
-    Ok(Some(ItemStack { id, count }))
+    Ok(Some(ItemStack { id: ItemId(id), count }))
 }
 
 #[cfg(test)]
