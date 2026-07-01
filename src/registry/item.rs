@@ -7,6 +7,8 @@
 //! plain VarInt. Ids are contiguous `0..=1536`, so an item's id is its index in the
 //! table below (`minecraft:air` = 0).
 
+use std::borrow::Cow;
+
 /// Item registry names indexed by numeric id: `ITEMS[id]` is the `namespace:path`
 /// of the item whose `BuiltInRegistries.ITEM.getId(..)` is `id`.
 #[rustfmt::skip]
@@ -575,14 +577,14 @@ pub const AIR: i32 = 0;
 /// assumed to be in the `minecraft` namespace, matching `Identifier` parsing.
 #[allow(dead_code)] // a lookup API for callers that build stacks by name.
 pub fn id_of(name: &str) -> Option<i32> {
-    let owned;
-    let full = if name.contains(':') {
-        name
+    // `Cow` names the "borrow when already namespaced, allocate only otherwise"
+    // intent directly, replacing the deferred-init `&owned` local.
+    let full: Cow<str> = if name.contains(':') {
+        Cow::Borrowed(name)
     } else {
-        owned = format!("minecraft:{name}");
-        &owned
+        Cow::Owned(format!("minecraft:{name}"))
     };
-    ITEMS.iter().position(|n| *n == full).map(|i| i as i32)
+    ITEMS.iter().position(|n| **n == *full).map(|i| i as i32)
 }
 
 /// Reverse lookup: numeric id → `namespace:path`, if in range.
