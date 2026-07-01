@@ -493,3 +493,96 @@ fn on_command(world: &mut World, sender: Entity, line: &str) {
         let _ = conn.outbox.try_send(Outbound::Packet(bytes));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn face_step_matches_direction_normals() {
+        // Direction 3D-data value -> unit normal (`Direction.java`, MC 26.2):
+        // 0 DOWN, 1 UP, 2 NORTH(-z), 3 SOUTH(+z), 4 WEST(-x), 5 EAST(+x).
+        assert_eq!(face_step(0), (0, -1, 0));
+        assert_eq!(face_step(1), (0, 1, 0));
+        assert_eq!(face_step(2), (0, 0, -1));
+        assert_eq!(face_step(3), (0, 0, 1));
+        assert_eq!(face_step(4), (-1, 0, 0));
+        assert_eq!(face_step(5), (1, 0, 0));
+        // Out-of-range values don't move the placement target.
+        assert_eq!(face_step(6), (0, 0, 0));
+        assert_eq!(face_step(-1), (0, 0, 0));
+    }
+
+    /// A minimal world with one registered player carrying `Meta`, plus the
+    /// `PlayerIndex` `on_packet` resolves the sender through.
+    fn one_player() -> (World, Uuid, Entity) {
+        let mut world = World::new();
+        let uuid = Uuid::from_u128(0x42);
+        let entity = world
+            .spawn((
+                PlayerId(uuid),
+                Profile { name: "tester".into(), entity_id: 1 },
+                Meta::default(),
+            ))
+            .id();
+        let mut index = PlayerIndex::default();
+        index.0.insert(uuid, entity);
+        world.insert_resource(index);
+        (world, uuid, entity)
+    }
+
+    #[test]
+    fn player_command_sprint_ordinals_toggle_meta() {
+        // 26.2 `ServerboundPlayerCommandPacket.Action`: 1 START_SPRINTING,
+        // 2 STOP_SPRINTING. Other ordinals leave sprinting untouched.
+        let (mut world, uuid, entity) = one_player();
+
+        on_packet(&mut world, uuid, Serverbound::PlayerCommand { action: 1 });
+        assert!(world.get::<Meta>(entity).unwrap().sprinting);
+
+        on_packet(&mut world, uuid, Serverbound::PlayerCommand { action: 2 });
+        assert!(!world.get::<Meta>(entity).unwrap().sprinting);
+
+        // Re-arm sprinting, then an unrelated action must not clear it.
+        on_packet(&mut world, uuid, Serverbound::PlayerCommand { action: 1 });
+        on_packet(&mut world, uuid, Serverbound::PlayerCommand { action: 5 }); // OPEN_INVENTORY
+        assert!(world.get::<Meta>(entity).unwrap().sprinting);
+    }
+
+    #[test]
+    fn player_abilities_records_only_the_flying_bit() {
+        // Only bit 0x02 (flying) is meaningful serverbound; other bits are noise.
+        let (mut world, uuid, entity) = one_player();
+
+        on_packet(&mut world, uuid, Serverbound::PlayerAbilities { flags: 0x02 });
+        assert!(world.get::<Meta>(entity).unwrap().flying);
+
+        on_packet(&mut world, uuid, Serverbound::PlayerAbilities { flags: 0x00 });
+        assert!(!world.get::<Meta>(entity).unwrap().flying);
+
+        // 0x04 (an unrelated ability bit) set but 0x02 clear -> not flying.
+        on_packet(&mut world, uuid, Serverbound::PlayerAbilities { flags: 0x04 });
+        assert!(!world.get::<Meta>(entity).unwrap().flying);
+    }
+
+    #[test]
+    fn set_carried_item_validates_hotbar_range() {
+        // The selected hotbar slot is 0..9; out-of-range values are ignored
+        // (the wire field is a signed short, so negatives are possible).
+        let (mut world, uuid, entity) = one_player();
+
+        on_packet(&mut world, uuid, Serverbound::SetCarriedItem { slot: 3 });
+        assert_eq!(
+            world.get::<crate::inventory::Inventory>(entity).unwrap().selected,
+            3
+        );
+
+        // Out of range: the previously-set slot is preserved.
+        on_packet(&mut world, uuid, Serverbound::SetCarriedItem { slot: 9 });
+        on_packet(&mut world, uuid, Serverbound::SetCarriedItem { slot: -1 });
+        assert_eq!(
+            world.get::<crate::inventory::Inventory>(entity).unwrap().selected,
+            3
+        );
+    }
+}

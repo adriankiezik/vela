@@ -537,3 +537,53 @@ pub const SYNCED: &[(&str, &[&str])] = &[
     ("minecraft:test_environment", &["minecraft:default"]),
     ("minecraft:test_instance", &["minecraft:always_pass"]),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::SYNCED;
+
+    /// The client builds each registry in the order sent and other packets index
+    /// into it, so ordering and uniqueness are wire-critical. Vanilla's
+    /// `RegistryDataLoader` emits datapack registries with entries ordered by
+    /// their (sorted) `ResourceLocation` key; every list here must match that.
+    #[test]
+    fn every_synced_registry_is_sorted_deduped_and_namespaced() {
+        for (reg, entries) in SYNCED {
+            assert!(!entries.is_empty(), "{reg} has no entries");
+            for e in *entries {
+                assert!(e.contains(':'), "{reg} entry `{e}` is not namespaced");
+            }
+
+            // Sorted ascending — mirrors the vanilla synchronized send order.
+            let mut sorted = entries.to_vec();
+            sorted.sort_unstable();
+            assert_eq!(&sorted, entries, "{reg} entries are not in sorted order");
+
+            // No duplicates: a repeat would shift every later entry's index and
+            // desync every packet that references this registry by id.
+            let mut seen = std::collections::HashSet::new();
+            for e in *entries {
+                assert!(seen.insert(*e), "{reg} has duplicate entry `{e}`");
+            }
+        }
+    }
+
+    #[test]
+    fn no_duplicate_registry_ids() {
+        let mut seen = std::collections::HashSet::new();
+        for (reg, _) in SYNCED {
+            assert!(seen.insert(*reg), "duplicate synced registry `{reg}`");
+        }
+    }
+
+    #[test]
+    fn dimension_type_leads_with_overworld() {
+        // The spawn `dimension_type` holder references index 0, so overworld must
+        // lead its registry (doc: "why minecraft:overworld … lead their lists").
+        let (_, dims) = SYNCED
+            .iter()
+            .find(|(reg, _)| *reg == "minecraft:dimension_type")
+            .expect("dimension_type is synced");
+        assert_eq!(dims[0], "minecraft:overworld");
+    }
+}
