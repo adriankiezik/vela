@@ -45,7 +45,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("allow-flight", "false"),
     ("spawn-protection", "16"),
     ("max-players", "20"),
-    ("view-distance", "10"),
+    ("view-distance", "32"),
     ("simulation-distance", "10"),
     ("entity-broadcast-range-percentage", "100"),
     ("player-idle-timeout", "0"),
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(parsed.server_port(), 25565);
         assert_eq!(parsed.max_players(), 20);
         assert_eq!(parsed.motd(), "A Minecraft Server");
-        assert_eq!(parsed.view_distance(), 10);
+        assert_eq!(parsed.view_distance(), 32);
         assert!(parsed.enable_status());
         assert!(parsed.online_mode());
         assert_eq!(parsed.gamemode(), 0);
