@@ -16,9 +16,14 @@
 //! which is why `minecraft:overworld` and `minecraft:badlands` lead their lists.
 //!
 //! The block/item tag bindings sent alongside these registries live in [`tags`],
-//! and the numeric item-id table (a subset of `BuiltInRegistries.ITEM`) lives in
-//! [`item`].
+//! and the numeric item-id table (`BuiltInRegistries.ITEM`) lives in [`item`].
+//!
+//! The remaining code-defined `BuiltInRegistries` — the flat name↔id tables the
+//! play protocol writes as VarInts (`entity_type`, `menu`, `block`, `sound_event`,
+//! …) — live in [`builtin`], and the full block-state palette in [`block_state`].
 
+pub mod block_state;
+pub mod builtin;
 pub mod item;
 pub mod tags;
 
