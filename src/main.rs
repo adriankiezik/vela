@@ -38,6 +38,8 @@ async fn main() -> std::io::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
+    print_banner();
+
     // Load server.properties / eula.txt / player lists / server-icon.png from the
     // runtime directory (CWD for a shipped binary, the `target/…` exe dir under
     // `cargo run` — see `runtime::dir`), creating files as vanilla does. A return
@@ -127,4 +129,69 @@ async fn main() -> std::io::Result<()> {
     }
     info!("world saved; shutdown complete");
     Ok(())
+}
+
+/// Clears the terminal and prints the startup banner: the "Vela" wordmark
+/// rendered as FIGlet ASCII art (Slant font), a short tagline, a development-
+/// build notice, and a couple of metadata rows (version / protocol). Everything
+/// is horizontally centered against the current terminal width. Written straight
+/// to stdout (not through `tracing`) so the art stays unadorned by log
+/// formatting, with ANSI styling applied for a bit of polish.
+fn print_banner() {
+    use figlet_rs::FIGfont;
+    use terminal_size::{terminal_size, Width};
+
+    // ANSI: bold cyan for the wordmark, dim for supporting text, yellow for the
+    // dev-build notice, reset after each piece.
+    const WORDMARK: &str = "\x1b[1;36m";
+    const DIM: &str = "\x1b[2m";
+    const DEV: &str = "\x1b[1;33m";
+    // Underlined cyan for the repository URL so terminals surface it as a link.
+    const LINK: &str = "\x1b[4;36m";
+    const RESET: &str = "\x1b[0m";
+
+    // The Slant font, embedded at build time — no runtime file lookup.
+    const SLANT_FONT: &str = include_str!("../assets/fonts/slant.flf");
+
+    // Terminal width for centering; assume 80 columns when it can't be probed
+    // (e.g. output redirected to a file or pipe).
+    let width = terminal_size().map_or(80, |(Width(w), _)| w as usize);
+
+    // Center a single (already-styled) line whose *visible* width is `visible`
+    // by padding the left with spaces. ANSI codes have zero visible width, so
+    // the pad is computed from the plain text, then applied to the styled line.
+    let center = |visible: usize, styled: &str| {
+        let pad = width.saturating_sub(visible) / 2;
+        format!("{}{}", " ".repeat(pad), styled)
+    };
+
+    // Clear the screen and move the cursor home — the ANSI sequence works on any
+    // VT100-compatible terminal (Linux, macOS, and Windows 10+ consoles).
+    print!("\x1b[2J\x1b[H");
+
+    println!();
+    if let Ok(font) = FIGfont::from_content(SLANT_FONT).or_else(|_| FIGfont::standard()) {
+        if let Some(art) = font.convert("Vela") {
+            for line in art.to_string().lines() {
+                println!("{}", center(line.len(), &format!("{WORDMARK}{line}{RESET}")));
+            }
+        }
+    }
+
+    let tagline = "A Minecraft server, written in Rust.";
+    let dev = "⚙  development build — not for production use";
+    let meta = format!(
+        "MC {} · protocol {}",
+        protocol::VERSION_NAME,
+        protocol::PROTOCOL_VERSION,
+    );
+    let repo = "https://github.com/adriankiezik/vela";
+
+    println!();
+    println!("{}", center(tagline.len(), &format!("{DIM}{tagline}{RESET}")));
+    // `dev` starts with a multi-byte glyph; count characters, not bytes.
+    println!("{}", center(dev.chars().count(), &format!("{DEV}{dev}{RESET}")));
+    println!("{}", center(meta.len(), &format!("{DIM}{meta}{RESET}")));
+    println!("{}", center(repo.len(), &format!("{LINK}{repo}{RESET}")));
+    println!();
 }

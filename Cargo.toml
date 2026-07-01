@@ -28,6 +28,11 @@ rand = "0.8"
 ureq = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# FIGlet renderer for the startup wordmark. The Slant font is embedded at build
+# time from assets/fonts/ (see print_banner), so no runtime asset lookup.
+figlet-rs = "0.1"
+# Query the terminal width so the startup banner can be centered on any OS.
+terminal_size = "0.4"
 # Derive `Display`/`Error` for typed error enums (e.g. `net::crypto::AuthError`)
 # so they satisfy `std::error::Error` without hand-rolled boilerplate.
 thiserror = "2"
