@@ -82,6 +82,12 @@ pub async fn handle(
     // awaiting a `ServerboundKey` for, plus the verify token we challenged with.
     let mut requested_name = String::new();
     let mut verify_token: Option<[u8; 4]> = None;
+    // The client's requested render distance, captured from the Configuration-
+    // phase `ClientInformation` and carried into Play via `ToSim::Joined` (vanilla
+    // builds the `ServerPlayer` with it). Seeded to the server view distance so a
+    // client that never sends the packet keeps today's radius; the sim clamps the
+    // value to `[2, serverViewDistance]`.
+    let mut client_view_distance = config.properties.view_distance();
 
     loop {
         let (packet_id, mut reader) = match read_frame(&mut stream, compression).await? {
@@ -260,7 +266,13 @@ pub async fn handle(
             }
 
             (State::Configuration, SB_CFG_CLIENT_INFORMATION) => {
-                debug!(%peer, "client information received");
+                // ClientInformation: language (String<=16) then the viewDistance
+                // byte; the remaining options (chat/skin/hand/…) are unread. We
+                // keep only the view distance so Play can build the player with
+                // the client's render distance (vanilla `updateOptions`).
+                let _language = reader.read_utf(16)?;
+                client_view_distance = reader.read_u8()? as i32;
+                debug!(%peer, view_distance = client_view_distance, "client information received");
             }
 
             (State::Configuration, SB_CFG_KEEP_ALIVE) => {}
@@ -269,7 +281,17 @@ pub async fn handle(
             (State::Configuration, SB_CFG_FINISH) => {
                 info!(%peer, name = %profile_name, "entering play");
                 let (rd, wr) = stream.into_split();
-                return play(rd, wr, peer, profile_uuid, profile_name, to_sim, compression).await;
+                return play(
+                    rd,
+                    wr,
+                    peer,
+                    profile_uuid,
+                    profile_name,
+                    to_sim,
+                    compression,
+                    client_view_distance,
+                )
+                .await;
             }
 
             // Other configuration packets (custom-payload "brand", cookies,

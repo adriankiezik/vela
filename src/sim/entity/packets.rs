@@ -20,6 +20,8 @@ use super::syncher::EntityData;
 const CB_PLAY_ADD_ENTITY: i32 = 1;
 /// `ClientboundSetEntityDataPacket` — index 99 in the clientbound PLAY flow.
 const CB_PLAY_SET_ENTITY_DATA: i32 = 99;
+/// `ClientboundHurtAnimationPacket` — index 42 in the clientbound PLAY flow.
+const CB_PLAY_HURT_ANIMATION: i32 = 42;
 
 /// `ClientboundAddEntityPacket` for an arbitrary entity type — the generic spawn
 /// path (the player builder in `sim::packets` is a fixed-type specialization).
@@ -71,6 +73,18 @@ pub fn set_entity_data(entity_id: i32, data: &EntityData) -> Bytes {
     frame(CB_PLAY_SET_ENTITY_DATA, &p.buf)
 }
 
+/// `ClientboundHurtAnimationPacket` — plays the red damage flash (and a small
+/// directional lean) on `entity_id` for tracking clients. Layout: entity id
+/// (VarInt) then the hurt-direction yaw (f32). We pass yaw 0.0 — the attacker-
+/// relative lean needs the knockback/direction model Vela lacks, but the flash,
+/// the part players read as "it got hit", plays regardless.
+pub fn hurt_animation(entity_id: i32, yaw: f32) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(entity_id);
+    p.write_f32(yaw);
+    frame(CB_PLAY_HURT_ANIMATION, &p.buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +117,14 @@ mod tests {
         assert_eq!(r.read_u8().unwrap(), 0); // yRot
         assert_eq!(r.read_u8().unwrap(), 0); // yHeadRot
         assert_eq!(r.read_varint().unwrap(), 0); // data
+    }
+
+    #[test]
+    fn hurt_animation_layout() {
+        let (id, mut r) = unframe(hurt_animation(9, 0.0));
+        assert_eq!(id, CB_PLAY_HURT_ANIMATION);
+        assert_eq!(r.read_varint().unwrap(), 9); // entity id
+        assert_eq!(r.read_f32().unwrap(), 0.0); // hurt-direction yaw
     }
 
     #[test]

@@ -34,7 +34,7 @@ use bevy_ecs::prelude::*;
 use bytes::Bytes;
 
 use super::bridge::{Outbound, OutboxTx};
-use super::components::{Conn, LoadedChunks, Pos, Profile};
+use super::components::{Conn, Pos, Profile};
 use super::entity::syncher::DataValue;
 use super::entity::{remove_entity, EntityMeta, ItemDrop, NetEntity};
 use crate::ids::ItemId;
@@ -136,12 +136,6 @@ pub fn take_item_entity(item_id: i32, player_id: i32, amount: i32) -> Bytes {
     frame(CB_PLAY_TAKE_ITEM_ENTITY, &p.buf)
 }
 
-/// The chunk column `(cx, cz)` a world position sits in — the per-viewer culling
-/// key, matching [`super::entity`]'s private helper.
-fn chunk_of(x: f64, z: f64) -> (i32, i32) {
-    ((x.floor() as i32) >> 4, (z.floor() as i32) >> 4)
-}
-
 /// Whether the world block at `(x, y, z)` is a movement obstacle. Vela has no
 /// per-block collision shapes yet, so "solid" is simply "not air".
 fn is_solid(x: i32, y: i32, z: i32) -> bool {
@@ -230,7 +224,6 @@ struct ItemRecord {
     x: f64,
     y: f64,
     z: f64,
-    chunk: (i32, i32),
     item_id: ItemId,
     count: i32,
     max: i32,
@@ -268,8 +261,9 @@ pub fn item_tick(world: &mut World) {
         world.entity_mut(e).insert(ItemPhysics::new(x, y, z));
     }
 
-    // Packets queued for per-chunk viewer fan-out at the end of the tick.
-    let mut emissions: Vec<((i32, i32), Bytes)> = Vec::new();
+    // Packets queued for per-entity tracked-viewer fan-out at the end of the tick,
+    // keyed by the source item's ECS entity (routed through `Tracked::seen_by`).
+    let mut emissions: Vec<(Entity, Bytes)> = Vec::new();
     let mut records: Vec<ItemRecord> = Vec::new();
     let mut removed: HashSet<Entity> = HashSet::new();
 
@@ -324,7 +318,6 @@ pub fn item_tick(world: &mut World) {
             let dx = super::packets::enc(pos.x) - super::packets::enc(phys.base_x);
             let dy = super::packets::enc(pos.y) - super::packets::enc(phys.base_y);
             let dz = super::packets::enc(pos.z) - super::packets::enc(phys.base_z);
-            let chunk = chunk_of(pos.x, pos.z);
             if dx != 0 || dy != 0 || dz != 0 {
                 let fits = (-32768..=32767).contains(&dx)
                     && (-32768..=32767).contains(&dy)
@@ -342,7 +335,7 @@ pub fn item_tick(world: &mut World) {
                         net.id, pos.x, pos.y, pos.z, pos.yaw, pos.pitch, pos.on_ground,
                     )
                 };
-                emissions.push((chunk, pkt));
+                emissions.push((entity, pkt));
                 phys.base_x = pos.x;
                 phys.base_y = pos.y;
                 phys.base_z = pos.z;
@@ -354,7 +347,6 @@ pub fn item_tick(world: &mut World) {
                 x: pos.x,
                 y: pos.y,
                 z: pos.z,
-                chunk,
                 item_id: stack.id,
                 count: stack.count,
                 max: stack.max_stack_size(),
@@ -383,23 +375,11 @@ pub fn item_tick(world: &mut World) {
         }
     }
 
-    // Flush queued movement / metadata / take packets to their chunk viewers.
-    // (Removals were already broadcast by `remove_entity`.)
-    if !emissions.is_empty() {
-        let conns: Vec<(HashSet<(i32, i32)>, OutboxTx)> = {
-            let mut q = world.query::<(&LoadedChunks, &Conn)>();
-            q.iter(world)
-                .map(|(l, c)| (l.loaded.clone(), c.outbox.clone()))
-                .collect()
-        };
-        for (chunk, pkt) in &emissions {
-            for (loaded, outbox) in &conns {
-                if loaded.contains(chunk) {
-                    let _ = outbox.try_send(Outbound::Packet(pkt.clone()));
-                }
-            }
-        }
-    }
+    // Flush queued movement / metadata / take packets to each item's tracking set
+    // (the same predicate that governs the spawn pairing — see
+    // `super::entity::fan_to_seen`). Removals were already broadcast by
+    // `remove_entity`.
+    super::entity::fan_to_seen(world, &emissions);
 }
 
 /// `ItemEntity.mergeWithNeighbours` / `tryToMerge`: fold same-item stacks that sit
@@ -409,7 +389,7 @@ fn merge_pass(
     world: &mut World,
     records: &mut [ItemRecord],
     removed: &mut HashSet<Entity>,
-    emissions: &mut Vec<((i32, i32), Bytes)>,
+    emissions: &mut Vec<(Entity, Bytes)>,
 ) {
     let n = records.len();
     for i in 0..n {
@@ -450,6 +430,22 @@ fn merge_pass(
                 (records[to].max.min(64) - records[to].count).min(records[from].count);
             records[to].count += delta;
             records[from].count -= delta;
+            // Propagate lifecycle state onto the survivor (vanilla static
+            // `merge(ItemEntity, ItemStack, ItemEntity, ItemStack)`): the
+            // survivor takes `Math.max` of the pickup delays and `Math.min` of
+            // the ages. Both operations preserve the sentinels unchanged:
+            // INFINITE_PICKUP_DELAY (32767) is the largest possible pickup
+            // delay, so `max` keeps an infinite delay infinite; INFINITE_LIFETIME
+            // (-32768) is the smallest possible age, so `min` keeps a
+            // never-despawn item never-despawning.
+            let merged_pickup_delay = records[to].pickup_delay.max(records[from].pickup_delay);
+            let merged_age = records[to].age.min(records[from].age);
+            records[to].pickup_delay = merged_pickup_delay;
+            records[to].age = merged_age;
+            if let Some(mut phys) = world.get_mut::<ItemPhysics>(records[to].entity) {
+                phys.pickup_delay = merged_pickup_delay;
+                phys.age = merged_age;
+            }
             commit_count(world, records, to, removed, emissions);
             commit_count(world, records, from, removed, emissions);
         }
@@ -475,7 +471,7 @@ fn commit_count(
     records: &mut [ItemRecord],
     idx: usize,
     removed: &mut HashSet<Entity>,
-    emissions: &mut Vec<((i32, i32), Bytes)>,
+    emissions: &mut Vec<(Entity, Bytes)>,
 ) {
     let entity = records[idx].entity;
     if records[idx].count <= 0 {
@@ -495,7 +491,7 @@ fn commit_count(
         let meta = world.get::<EntityMeta>(entity).expect("item has EntityMeta");
         super::entity::packets::set_entity_data(records[idx].net_id, &meta.0)
     };
-    emissions.push((records[idx].chunk, data));
+    emissions.push((records[idx].entity, data));
 }
 
 /// `ItemEntity.playerTouch` driven by `Player.aiStep`'s pickup sweep: for each
@@ -506,7 +502,7 @@ fn pickup_pass(
     world: &mut World,
     records: &mut [ItemRecord],
     removed: &mut HashSet<Entity>,
-    emissions: &mut Vec<((i32, i32), Bytes)>,
+    emissions: &mut Vec<(Entity, Bytes)>,
 ) {
     // Note: we deliberately do NOT filter on `&Inventory` here. That component is
     // attached lazily (see `packet_handlers::inventory_mut`) on a player's first
@@ -550,9 +546,17 @@ fn pickup_pass(
                 continue; // inventory full for this item — leave it on the ground.
             }
 
-            // Broadcast the pickup animation to everyone tracking the item. Vanilla
-            // reports the original (pre-pickup) count in the take packet.
-            emissions.push((rec.chunk, take_item_entity(rec.net_id, *p_eid, org_count)));
+            // Broadcast the pickup animation to everyone tracking the item, right
+            // now (vanilla `ItemEntity.playerTouch` broadcasts *then* discards):
+            // fanning it immediately — before the possible `remove_entity` below —
+            // is required because the batched end-of-tick fan resolves each
+            // packet's recipients from the source entity's `Tracked::seen_by`,
+            // which is gone once the entity is despawned. Vanilla reports the
+            // original (pre-pickup) count in the take packet.
+            super::entity::fan_to_seen(
+                world,
+                &[(rec.entity, take_item_entity(rec.net_id, *p_eid, org_count))],
+            );
 
             if stack.is_empty() {
                 remove_entity(world, rec.entity);
@@ -695,7 +699,6 @@ mod tests {
             x,
             y: 64.0,
             z,
-            chunk: (0, 0),
             item_id: ItemId(1),
             count: 1,
             max: 64,

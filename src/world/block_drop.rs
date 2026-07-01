@@ -1,104 +1,1220 @@
-//! Block-state → dropped-item mapping (the reverse of [`super::block_item`]).
+//! Block-state -> dropped-item mapping (the reverse of [`super::block_item`]).
 //!
 //! When a block is destroyed, vanilla resolves its drops through a *data-driven
-//! loot table* (`Block.getDrops` → `state.getDrops(LootParams)` →
-//! `LootTable.getRandomItems`), where the table JSON lives in the data pack, not
-//! in `.java` source. `Block.playerDestroy` → `Block.dropResources` →
-//! `Block.popResource` then spawns an `ItemEntity` per resulting stack. We can't
-//! read the loot-table JSON here, so this is a hand-written Rust table that
-//! reproduces the *observed* vanilla drops for exactly the block-states Vela can
-//! currently have in the world (the terrain generator's states plus everything
-//! `block_state_for_item` can place).
+//! loot table* (`Block.getDrops` -> `state.getDrops(LootParams)` ->
+//! `LootTable.getRandomItems`), whose JSON lives in the data pack. `Block.
+//! playerDestroy` -> `Block.dropResources` -> `Block.popResource` then spawns an
+//! `ItemEntity` per resulting stack.
 //!
-//! **Simplification (documented on purpose).** These are the empty-hand,
-//! no-enchant drops only. Silk Touch, Fortune and tool-requirement gating (e.g.
-//! stone dropping nothing when mined by hand in strict "correct tool" servers)
-//! are NOT modelled — `Block.getDrops` takes the tool/enchantments via
-//! `LootContextParams.TOOL`, which we ignore. This matches vanilla's default
-//! `block_drops` game-rule-on, hand-mined behavior for these blocks and is enough
-//! for the current gameplay slice. Extend the table (and revisit tool gating)
-//! as more block-states become reachable.
+//! [`DROPS`] below is that loot-table set flattened for every block in the game.
+//! It is **generated** from the vanilla loot tables (`data/minecraft/loot_table/
+//! blocks/*.json`, MC 26.2) by reducing each table to its empty-hand, no-enchant
+//! result: for each pool we take the entry guaranteed to a bare hand -- skipping
+//! Silk-Touch / tool / random-chance branches -- and its `set_count` (a constant,
+//! or a `uniform`/`limit_count` range we roll here). A block absent from the
+//! table (air, water, fire, wall signs, ...) or reduced to nothing (leaves, tall
+//! grass, ice, glass) drops nothing.
+//!
+//! **Documented simplifications** (`LootContextParams` we don't thread):
+//! * **Silk Touch / Fortune** -- ignored (`TOOL`/enchantment predicates dropped);
+//!   ores yield their raw item, stone yields cobblestone, etc.
+//! * **Correct-tool gating** -- not modelled; the player is treated as always
+//!   holding the right tool, so stone/ores drop as if mined with a pickaxe. This
+//!   matches the existing gameplay slice (survival, `block_drops` game-rule on).
+//! * **Random *secondary* drops** -- leaf saplings/sticks/apples, gravel->flint,
+//!   grass->wheat seeds and similar chance drops are gated on `random_chance`, so
+//!   the empty-hand *guaranteed* result (usually nothing, or the block itself for
+//!   gravel) is what we emit.
+//! * **State-conditional counts** -- a few blocks vary their count by block-state
+//!   property (double slabs drop 2, multi-candle stacks, full composters give
+//!   bone meal). We emit the default-state count; the property gate is treated as
+//!   satisfied only for *which item* a state yields (so both halves of a door
+//!   still yield one door), never to multiply counts.
 //!
 //! Reference: `net.minecraft.world.level.block.Block#getDrops` / `#dropResources`
-//! / `#playerDestroy` (MC 26.2), and the vanilla loot tables for each block
-//! (`data/minecraft/loot_table/blocks/*.json`).
+//! / `#playerDestroy` (MC 26.2) and the per-block vanilla loot tables.
 
 use crate::ids::BlockState;
 use crate::inventory::ItemStack;
+use rand::Rng;
 
-// Item registry ids (`BuiltInRegistries.ITEM`, see `registry::item`) used as drop
-// results. Kept as named constants so the mapping reads as block → item.
-const ITEM_GRANITE: i32 = 2;
-const ITEM_DIORITE: i32 = 4;
-const ITEM_ANDESITE: i32 = 6;
-const ITEM_DIRT: i32 = 55;
-const ITEM_COBBLESTONE: i32 = 62;
-const ITEM_OAK_PLANKS: i32 = 63;
+/// One item line of a block's loot: an item (registry path, `minecraft:` implied)
+/// and an inclusive drop-count range. `min == max` is a fixed count; a wider
+/// range is rolled uniformly per break, mirroring the loot table's `set_count`
+/// `uniform` generator (with `limit_count`'s floor already folded into `min`).
+struct Drop {
+    item: &'static str,
+    min: u8,
+    max: u8,
+}
+
+/// Terse constructor so the generated table reads as `block -> item x count`.
+const fn d(item: &'static str, min: u8, max: u8) -> Drop {
+    Drop { item, min, max }
+}
+
+/// Every block's empty-hand loot, keyed by block registry path (`minecraft:`
+/// stripped) and sorted for binary search. Generated from the vanilla loot
+/// tables -- see the module docs. Blocks not present here drop nothing.
+#[rustfmt::skip]
+static DROPS: &[(&str, &[Drop])] = &[
+    ("acacia_button", &[d("acacia_button",1,1)]),
+    ("acacia_door", &[d("acacia_door",1,1)]),
+    ("acacia_fence", &[d("acacia_fence",1,1)]),
+    ("acacia_fence_gate", &[d("acacia_fence_gate",1,1)]),
+    ("acacia_hanging_sign", &[d("acacia_hanging_sign",1,1)]),
+    ("acacia_log", &[d("acacia_log",1,1)]),
+    ("acacia_planks", &[d("acacia_planks",1,1)]),
+    ("acacia_pressure_plate", &[d("acacia_pressure_plate",1,1)]),
+    ("acacia_sapling", &[d("acacia_sapling",1,1)]),
+    ("acacia_shelf", &[d("acacia_shelf",1,1)]),
+    ("acacia_sign", &[d("acacia_sign",1,1)]),
+    ("acacia_slab", &[d("acacia_slab",1,1)]),
+    ("acacia_stairs", &[d("acacia_stairs",1,1)]),
+    ("acacia_trapdoor", &[d("acacia_trapdoor",1,1)]),
+    ("acacia_wood", &[d("acacia_wood",1,1)]),
+    ("activator_rail", &[d("activator_rail",1,1)]),
+    ("allium", &[d("allium",1,1)]),
+    ("amethyst_block", &[d("amethyst_block",1,1)]),
+    ("amethyst_cluster", &[d("amethyst_shard",2,2)]),
+    ("ancient_debris", &[d("ancient_debris",1,1)]),
+    ("andesite", &[d("andesite",1,1)]),
+    ("andesite_slab", &[d("andesite_slab",1,1)]),
+    ("andesite_stairs", &[d("andesite_stairs",1,1)]),
+    ("andesite_wall", &[d("andesite_wall",1,1)]),
+    ("anvil", &[d("anvil",1,1)]),
+    ("attached_melon_stem", &[d("melon_seeds",0,3)]),
+    ("attached_pumpkin_stem", &[d("pumpkin_seeds",0,3)]),
+    ("azalea", &[d("azalea",1,1)]),
+    ("azure_bluet", &[d("azure_bluet",1,1)]),
+    ("bamboo", &[d("bamboo",1,1)]),
+    ("bamboo_block", &[d("bamboo_block",1,1)]),
+    ("bamboo_button", &[d("bamboo_button",1,1)]),
+    ("bamboo_door", &[d("bamboo_door",1,1)]),
+    ("bamboo_fence", &[d("bamboo_fence",1,1)]),
+    ("bamboo_fence_gate", &[d("bamboo_fence_gate",1,1)]),
+    ("bamboo_hanging_sign", &[d("bamboo_hanging_sign",1,1)]),
+    ("bamboo_mosaic", &[d("bamboo_mosaic",1,1)]),
+    ("bamboo_mosaic_slab", &[d("bamboo_mosaic_slab",1,1)]),
+    ("bamboo_mosaic_stairs", &[d("bamboo_mosaic_stairs",1,1)]),
+    ("bamboo_planks", &[d("bamboo_planks",1,1)]),
+    ("bamboo_pressure_plate", &[d("bamboo_pressure_plate",1,1)]),
+    ("bamboo_sapling", &[d("bamboo",1,1)]),
+    ("bamboo_shelf", &[d("bamboo_shelf",1,1)]),
+    ("bamboo_sign", &[d("bamboo_sign",1,1)]),
+    ("bamboo_slab", &[d("bamboo_slab",1,1)]),
+    ("bamboo_stairs", &[d("bamboo_stairs",1,1)]),
+    ("bamboo_trapdoor", &[d("bamboo_trapdoor",1,1)]),
+    ("barrel", &[d("barrel",1,1)]),
+    ("basalt", &[d("basalt",1,1)]),
+    ("beacon", &[d("beacon",1,1)]),
+    ("beehive", &[d("beehive",1,1)]),
+    ("beetroots", &[d("beetroot",1,1), d("beetroot_seeds",1,1)]),
+    ("bell", &[d("bell",1,1)]),
+    ("big_dripleaf", &[d("big_dripleaf",1,1)]),
+    ("big_dripleaf_stem", &[d("big_dripleaf",1,1)]),
+    ("birch_button", &[d("birch_button",1,1)]),
+    ("birch_door", &[d("birch_door",1,1)]),
+    ("birch_fence", &[d("birch_fence",1,1)]),
+    ("birch_fence_gate", &[d("birch_fence_gate",1,1)]),
+    ("birch_hanging_sign", &[d("birch_hanging_sign",1,1)]),
+    ("birch_log", &[d("birch_log",1,1)]),
+    ("birch_planks", &[d("birch_planks",1,1)]),
+    ("birch_pressure_plate", &[d("birch_pressure_plate",1,1)]),
+    ("birch_sapling", &[d("birch_sapling",1,1)]),
+    ("birch_shelf", &[d("birch_shelf",1,1)]),
+    ("birch_sign", &[d("birch_sign",1,1)]),
+    ("birch_slab", &[d("birch_slab",1,1)]),
+    ("birch_stairs", &[d("birch_stairs",1,1)]),
+    ("birch_trapdoor", &[d("birch_trapdoor",1,1)]),
+    ("birch_wood", &[d("birch_wood",1,1)]),
+    ("black_banner", &[d("black_banner",1,1)]),
+    ("black_bed", &[d("black_bed",1,1)]),
+    ("black_candle", &[d("black_candle",1,1)]),
+    ("black_candle_cake", &[d("black_candle",1,1)]),
+    ("black_carpet", &[d("black_carpet",1,1)]),
+    ("black_concrete", &[d("black_concrete",1,1)]),
+    ("black_concrete_powder", &[d("black_concrete_powder",1,1)]),
+    ("black_glazed_terracotta", &[d("black_glazed_terracotta",1,1)]),
+    ("black_shulker_box", &[d("black_shulker_box",1,1)]),
+    ("black_terracotta", &[d("black_terracotta",1,1)]),
+    ("black_wool", &[d("black_wool",1,1)]),
+    ("blackstone", &[d("blackstone",1,1)]),
+    ("blackstone_slab", &[d("blackstone_slab",1,1)]),
+    ("blackstone_stairs", &[d("blackstone_stairs",1,1)]),
+    ("blackstone_wall", &[d("blackstone_wall",1,1)]),
+    ("blast_furnace", &[d("blast_furnace",1,1)]),
+    ("blue_banner", &[d("blue_banner",1,1)]),
+    ("blue_bed", &[d("blue_bed",1,1)]),
+    ("blue_candle", &[d("blue_candle",1,1)]),
+    ("blue_candle_cake", &[d("blue_candle",1,1)]),
+    ("blue_carpet", &[d("blue_carpet",1,1)]),
+    ("blue_concrete", &[d("blue_concrete",1,1)]),
+    ("blue_concrete_powder", &[d("blue_concrete_powder",1,1)]),
+    ("blue_glazed_terracotta", &[d("blue_glazed_terracotta",1,1)]),
+    ("blue_orchid", &[d("blue_orchid",1,1)]),
+    ("blue_shulker_box", &[d("blue_shulker_box",1,1)]),
+    ("blue_terracotta", &[d("blue_terracotta",1,1)]),
+    ("blue_wool", &[d("blue_wool",1,1)]),
+    ("bone_block", &[d("bone_block",1,1)]),
+    ("bookshelf", &[d("book",3,3)]),
+    ("brain_coral_block", &[d("dead_brain_coral_block",1,1)]),
+    ("brewing_stand", &[d("brewing_stand",1,1)]),
+    ("brick_slab", &[d("brick_slab",1,1)]),
+    ("brick_stairs", &[d("brick_stairs",1,1)]),
+    ("brick_wall", &[d("brick_wall",1,1)]),
+    ("bricks", &[d("bricks",1,1)]),
+    ("brown_banner", &[d("brown_banner",1,1)]),
+    ("brown_bed", &[d("brown_bed",1,1)]),
+    ("brown_candle", &[d("brown_candle",1,1)]),
+    ("brown_candle_cake", &[d("brown_candle",1,1)]),
+    ("brown_carpet", &[d("brown_carpet",1,1)]),
+    ("brown_concrete", &[d("brown_concrete",1,1)]),
+    ("brown_concrete_powder", &[d("brown_concrete_powder",1,1)]),
+    ("brown_glazed_terracotta", &[d("brown_glazed_terracotta",1,1)]),
+    ("brown_mushroom", &[d("brown_mushroom",1,1)]),
+    ("brown_mushroom_block", &[d("brown_mushroom",0,2)]),
+    ("brown_shulker_box", &[d("brown_shulker_box",1,1)]),
+    ("brown_terracotta", &[d("brown_terracotta",1,1)]),
+    ("brown_wool", &[d("brown_wool",1,1)]),
+    ("bubble_coral_block", &[d("dead_bubble_coral_block",1,1)]),
+    ("cactus", &[d("cactus",1,1)]),
+    ("cactus_flower", &[d("cactus_flower",1,1)]),
+    ("calcite", &[d("calcite",1,1)]),
+    ("campfire", &[d("charcoal",2,2)]),
+    ("candle", &[d("candle",1,1)]),
+    ("candle_cake", &[d("candle",1,1)]),
+    ("carrots", &[d("carrot",1,1), d("carrot",1,1)]),
+    ("cartography_table", &[d("cartography_table",1,1)]),
+    ("carved_pumpkin", &[d("carved_pumpkin",1,1)]),
+    ("cauldron", &[d("cauldron",1,1)]),
+    ("cave_vines", &[d("glow_berries",1,1)]),
+    ("cave_vines_plant", &[d("glow_berries",1,1)]),
+    ("cherry_button", &[d("cherry_button",1,1)]),
+    ("cherry_door", &[d("cherry_door",1,1)]),
+    ("cherry_fence", &[d("cherry_fence",1,1)]),
+    ("cherry_fence_gate", &[d("cherry_fence_gate",1,1)]),
+    ("cherry_hanging_sign", &[d("cherry_hanging_sign",1,1)]),
+    ("cherry_log", &[d("cherry_log",1,1)]),
+    ("cherry_planks", &[d("cherry_planks",1,1)]),
+    ("cherry_pressure_plate", &[d("cherry_pressure_plate",1,1)]),
+    ("cherry_sapling", &[d("cherry_sapling",1,1)]),
+    ("cherry_shelf", &[d("cherry_shelf",1,1)]),
+    ("cherry_sign", &[d("cherry_sign",1,1)]),
+    ("cherry_slab", &[d("cherry_slab",1,1)]),
+    ("cherry_stairs", &[d("cherry_stairs",1,1)]),
+    ("cherry_trapdoor", &[d("cherry_trapdoor",1,1)]),
+    ("cherry_wood", &[d("cherry_wood",1,1)]),
+    ("chest", &[d("chest",1,1)]),
+    ("chipped_anvil", &[d("chipped_anvil",1,1)]),
+    ("chiseled_cinnabar", &[d("chiseled_cinnabar",1,1)]),
+    ("chiseled_copper", &[d("chiseled_copper",1,1)]),
+    ("chiseled_deepslate", &[d("chiseled_deepslate",1,1)]),
+    ("chiseled_nether_bricks", &[d("chiseled_nether_bricks",1,1)]),
+    ("chiseled_polished_blackstone", &[d("chiseled_polished_blackstone",1,1)]),
+    ("chiseled_quartz_block", &[d("chiseled_quartz_block",1,1)]),
+    ("chiseled_red_sandstone", &[d("chiseled_red_sandstone",1,1)]),
+    ("chiseled_resin_bricks", &[d("chiseled_resin_bricks",1,1)]),
+    ("chiseled_sandstone", &[d("chiseled_sandstone",1,1)]),
+    ("chiseled_stone_bricks", &[d("chiseled_stone_bricks",1,1)]),
+    ("chiseled_sulfur", &[d("chiseled_sulfur",1,1)]),
+    ("chiseled_tuff", &[d("chiseled_tuff",1,1)]),
+    ("chiseled_tuff_bricks", &[d("chiseled_tuff_bricks",1,1)]),
+    ("chorus_plant", &[d("chorus_fruit",0,1)]),
+    ("cinnabar", &[d("cinnabar",1,1)]),
+    ("cinnabar_brick_slab", &[d("cinnabar_brick_slab",1,1)]),
+    ("cinnabar_brick_stairs", &[d("cinnabar_brick_stairs",1,1)]),
+    ("cinnabar_brick_wall", &[d("cinnabar_brick_wall",1,1)]),
+    ("cinnabar_bricks", &[d("cinnabar_bricks",1,1)]),
+    ("cinnabar_slab", &[d("cinnabar_slab",1,1)]),
+    ("cinnabar_stairs", &[d("cinnabar_stairs",1,1)]),
+    ("cinnabar_wall", &[d("cinnabar_wall",1,1)]),
+    ("clay", &[d("clay_ball",4,4)]),
+    ("closed_eyeblossom", &[d("closed_eyeblossom",1,1)]),
+    ("coal_block", &[d("coal_block",1,1)]),
+    ("coal_ore", &[d("coal",1,1)]),
+    ("coarse_dirt", &[d("coarse_dirt",1,1)]),
+    ("cobbled_deepslate", &[d("cobbled_deepslate",1,1)]),
+    ("cobbled_deepslate_slab", &[d("cobbled_deepslate_slab",1,1)]),
+    ("cobbled_deepslate_stairs", &[d("cobbled_deepslate_stairs",1,1)]),
+    ("cobbled_deepslate_wall", &[d("cobbled_deepslate_wall",1,1)]),
+    ("cobblestone", &[d("cobblestone",1,1)]),
+    ("cobblestone_slab", &[d("cobblestone_slab",1,1)]),
+    ("cobblestone_stairs", &[d("cobblestone_stairs",1,1)]),
+    ("cobblestone_wall", &[d("cobblestone_wall",1,1)]),
+    ("cobweb", &[d("string",1,1)]),
+    ("cocoa", &[d("cocoa_beans",1,1)]),
+    ("comparator", &[d("comparator",1,1)]),
+    ("composter", &[d("composter",1,1), d("bone_meal",1,1)]),
+    ("conduit", &[d("conduit",1,1)]),
+    ("copper_bars", &[d("copper_bars",1,1)]),
+    ("copper_block", &[d("copper_block",1,1)]),
+    ("copper_bulb", &[d("copper_bulb",1,1)]),
+    ("copper_chain", &[d("copper_chain",1,1)]),
+    ("copper_chest", &[d("copper_chest",1,1)]),
+    ("copper_door", &[d("copper_door",1,1)]),
+    ("copper_golem_statue", &[d("copper_golem_statue",1,1)]),
+    ("copper_grate", &[d("copper_grate",1,1)]),
+    ("copper_lantern", &[d("copper_lantern",1,1)]),
+    ("copper_ore", &[d("raw_copper",2,5)]),
+    ("copper_torch", &[d("copper_torch",1,1)]),
+    ("copper_trapdoor", &[d("copper_trapdoor",1,1)]),
+    ("cornflower", &[d("cornflower",1,1)]),
+    ("cracked_deepslate_bricks", &[d("cracked_deepslate_bricks",1,1)]),
+    ("cracked_deepslate_tiles", &[d("cracked_deepslate_tiles",1,1)]),
+    ("cracked_nether_bricks", &[d("cracked_nether_bricks",1,1)]),
+    ("cracked_polished_blackstone_bricks", &[d("cracked_polished_blackstone_bricks",1,1)]),
+    ("cracked_stone_bricks", &[d("cracked_stone_bricks",1,1)]),
+    ("crafter", &[d("crafter",1,1)]),
+    ("crafting_table", &[d("crafting_table",1,1)]),
+    ("creaking_heart", &[d("resin_clump",1,3)]),
+    ("creeper_head", &[d("creeper_head",1,1)]),
+    ("crimson_button", &[d("crimson_button",1,1)]),
+    ("crimson_door", &[d("crimson_door",1,1)]),
+    ("crimson_fence", &[d("crimson_fence",1,1)]),
+    ("crimson_fence_gate", &[d("crimson_fence_gate",1,1)]),
+    ("crimson_fungus", &[d("crimson_fungus",1,1)]),
+    ("crimson_hanging_sign", &[d("crimson_hanging_sign",1,1)]),
+    ("crimson_hyphae", &[d("crimson_hyphae",1,1)]),
+    ("crimson_nylium", &[d("netherrack",1,1)]),
+    ("crimson_planks", &[d("crimson_planks",1,1)]),
+    ("crimson_pressure_plate", &[d("crimson_pressure_plate",1,1)]),
+    ("crimson_roots", &[d("crimson_roots",1,1)]),
+    ("crimson_shelf", &[d("crimson_shelf",1,1)]),
+    ("crimson_sign", &[d("crimson_sign",1,1)]),
+    ("crimson_slab", &[d("crimson_slab",1,1)]),
+    ("crimson_stairs", &[d("crimson_stairs",1,1)]),
+    ("crimson_stem", &[d("crimson_stem",1,1)]),
+    ("crimson_trapdoor", &[d("crimson_trapdoor",1,1)]),
+    ("crying_obsidian", &[d("crying_obsidian",1,1)]),
+    ("cut_copper", &[d("cut_copper",1,1)]),
+    ("cut_copper_slab", &[d("cut_copper_slab",1,1)]),
+    ("cut_copper_stairs", &[d("cut_copper_stairs",1,1)]),
+    ("cut_red_sandstone", &[d("cut_red_sandstone",1,1)]),
+    ("cut_red_sandstone_slab", &[d("cut_red_sandstone_slab",1,1)]),
+    ("cut_sandstone", &[d("cut_sandstone",1,1)]),
+    ("cut_sandstone_slab", &[d("cut_sandstone_slab",1,1)]),
+    ("cyan_banner", &[d("cyan_banner",1,1)]),
+    ("cyan_bed", &[d("cyan_bed",1,1)]),
+    ("cyan_candle", &[d("cyan_candle",1,1)]),
+    ("cyan_candle_cake", &[d("cyan_candle",1,1)]),
+    ("cyan_carpet", &[d("cyan_carpet",1,1)]),
+    ("cyan_concrete", &[d("cyan_concrete",1,1)]),
+    ("cyan_concrete_powder", &[d("cyan_concrete_powder",1,1)]),
+    ("cyan_glazed_terracotta", &[d("cyan_glazed_terracotta",1,1)]),
+    ("cyan_shulker_box", &[d("cyan_shulker_box",1,1)]),
+    ("cyan_terracotta", &[d("cyan_terracotta",1,1)]),
+    ("cyan_wool", &[d("cyan_wool",1,1)]),
+    ("damaged_anvil", &[d("damaged_anvil",1,1)]),
+    ("dandelion", &[d("dandelion",1,1)]),
+    ("dark_oak_button", &[d("dark_oak_button",1,1)]),
+    ("dark_oak_door", &[d("dark_oak_door",1,1)]),
+    ("dark_oak_fence", &[d("dark_oak_fence",1,1)]),
+    ("dark_oak_fence_gate", &[d("dark_oak_fence_gate",1,1)]),
+    ("dark_oak_hanging_sign", &[d("dark_oak_hanging_sign",1,1)]),
+    ("dark_oak_log", &[d("dark_oak_log",1,1)]),
+    ("dark_oak_planks", &[d("dark_oak_planks",1,1)]),
+    ("dark_oak_pressure_plate", &[d("dark_oak_pressure_plate",1,1)]),
+    ("dark_oak_sapling", &[d("dark_oak_sapling",1,1)]),
+    ("dark_oak_shelf", &[d("dark_oak_shelf",1,1)]),
+    ("dark_oak_sign", &[d("dark_oak_sign",1,1)]),
+    ("dark_oak_slab", &[d("dark_oak_slab",1,1)]),
+    ("dark_oak_stairs", &[d("dark_oak_stairs",1,1)]),
+    ("dark_oak_trapdoor", &[d("dark_oak_trapdoor",1,1)]),
+    ("dark_oak_wood", &[d("dark_oak_wood",1,1)]),
+    ("dark_prismarine", &[d("dark_prismarine",1,1)]),
+    ("dark_prismarine_slab", &[d("dark_prismarine_slab",1,1)]),
+    ("dark_prismarine_stairs", &[d("dark_prismarine_stairs",1,1)]),
+    ("daylight_detector", &[d("daylight_detector",1,1)]),
+    ("dead_brain_coral_block", &[d("dead_brain_coral_block",1,1)]),
+    ("dead_bubble_coral_block", &[d("dead_bubble_coral_block",1,1)]),
+    ("dead_bush", &[d("stick",0,2)]),
+    ("dead_fire_coral_block", &[d("dead_fire_coral_block",1,1)]),
+    ("dead_horn_coral_block", &[d("dead_horn_coral_block",1,1)]),
+    ("dead_tube_coral_block", &[d("dead_tube_coral_block",1,1)]),
+    ("decorated_pot", &[d("decorated_pot",1,1)]),
+    ("deepslate", &[d("cobbled_deepslate",1,1)]),
+    ("deepslate_brick_slab", &[d("deepslate_brick_slab",1,1)]),
+    ("deepslate_brick_stairs", &[d("deepslate_brick_stairs",1,1)]),
+    ("deepslate_brick_wall", &[d("deepslate_brick_wall",1,1)]),
+    ("deepslate_bricks", &[d("deepslate_bricks",1,1)]),
+    ("deepslate_coal_ore", &[d("coal",1,1)]),
+    ("deepslate_copper_ore", &[d("raw_copper",2,5)]),
+    ("deepslate_diamond_ore", &[d("diamond",1,1)]),
+    ("deepslate_emerald_ore", &[d("emerald",1,1)]),
+    ("deepslate_gold_ore", &[d("raw_gold",1,1)]),
+    ("deepslate_iron_ore", &[d("raw_iron",1,1)]),
+    ("deepslate_lapis_ore", &[d("lapis_lazuli",4,9)]),
+    ("deepslate_redstone_ore", &[d("redstone",4,5)]),
+    ("deepslate_tile_slab", &[d("deepslate_tile_slab",1,1)]),
+    ("deepslate_tile_stairs", &[d("deepslate_tile_stairs",1,1)]),
+    ("deepslate_tile_wall", &[d("deepslate_tile_wall",1,1)]),
+    ("deepslate_tiles", &[d("deepslate_tiles",1,1)]),
+    ("detector_rail", &[d("detector_rail",1,1)]),
+    ("diamond_block", &[d("diamond_block",1,1)]),
+    ("diamond_ore", &[d("diamond",1,1)]),
+    ("diorite", &[d("diorite",1,1)]),
+    ("diorite_slab", &[d("diorite_slab",1,1)]),
+    ("diorite_stairs", &[d("diorite_stairs",1,1)]),
+    ("diorite_wall", &[d("diorite_wall",1,1)]),
+    ("dirt", &[d("dirt",1,1)]),
+    ("dirt_path", &[d("dirt",1,1)]),
+    ("dispenser", &[d("dispenser",1,1)]),
+    ("dragon_egg", &[d("dragon_egg",1,1)]),
+    ("dragon_head", &[d("dragon_head",1,1)]),
+    ("dried_ghast", &[d("dried_ghast",1,1)]),
+    ("dried_kelp_block", &[d("dried_kelp_block",1,1)]),
+    ("dripstone_block", &[d("dripstone_block",1,1)]),
+    ("dropper", &[d("dropper",1,1)]),
+    ("emerald_block", &[d("emerald_block",1,1)]),
+    ("emerald_ore", &[d("emerald",1,1)]),
+    ("enchanting_table", &[d("enchanting_table",1,1)]),
+    ("end_rod", &[d("end_rod",1,1)]),
+    ("end_stone", &[d("end_stone",1,1)]),
+    ("end_stone_brick_slab", &[d("end_stone_brick_slab",1,1)]),
+    ("end_stone_brick_stairs", &[d("end_stone_brick_stairs",1,1)]),
+    ("end_stone_brick_wall", &[d("end_stone_brick_wall",1,1)]),
+    ("end_stone_bricks", &[d("end_stone_bricks",1,1)]),
+    ("ender_chest", &[d("obsidian",8,8)]),
+    ("exposed_chiseled_copper", &[d("exposed_chiseled_copper",1,1)]),
+    ("exposed_copper", &[d("exposed_copper",1,1)]),
+    ("exposed_copper_bars", &[d("exposed_copper_bars",1,1)]),
+    ("exposed_copper_bulb", &[d("exposed_copper_bulb",1,1)]),
+    ("exposed_copper_chain", &[d("exposed_copper_chain",1,1)]),
+    ("exposed_copper_chest", &[d("exposed_copper_chest",1,1)]),
+    ("exposed_copper_door", &[d("exposed_copper_door",1,1)]),
+    ("exposed_copper_golem_statue", &[d("exposed_copper_golem_statue",1,1)]),
+    ("exposed_copper_grate", &[d("exposed_copper_grate",1,1)]),
+    ("exposed_copper_lantern", &[d("exposed_copper_lantern",1,1)]),
+    ("exposed_copper_trapdoor", &[d("exposed_copper_trapdoor",1,1)]),
+    ("exposed_cut_copper", &[d("exposed_cut_copper",1,1)]),
+    ("exposed_cut_copper_slab", &[d("exposed_cut_copper_slab",1,1)]),
+    ("exposed_cut_copper_stairs", &[d("exposed_cut_copper_stairs",1,1)]),
+    ("exposed_lightning_rod", &[d("exposed_lightning_rod",1,1)]),
+    ("farmland", &[d("dirt",1,1)]),
+    ("fire_coral_block", &[d("dead_fire_coral_block",1,1)]),
+    ("firefly_bush", &[d("firefly_bush",1,1)]),
+    ("fletching_table", &[d("fletching_table",1,1)]),
+    ("flower_pot", &[d("flower_pot",1,1)]),
+    ("flowering_azalea", &[d("flowering_azalea",1,1)]),
+    ("furnace", &[d("furnace",1,1)]),
+    ("gilded_blackstone", &[d("gilded_blackstone",1,1)]),
+    ("glowstone", &[d("glowstone_dust",2,4)]),
+    ("gold_block", &[d("gold_block",1,1)]),
+    ("gold_ore", &[d("raw_gold",1,1)]),
+    ("golden_dandelion", &[d("golden_dandelion",1,1)]),
+    ("granite", &[d("granite",1,1)]),
+    ("granite_slab", &[d("granite_slab",1,1)]),
+    ("granite_stairs", &[d("granite_stairs",1,1)]),
+    ("granite_wall", &[d("granite_wall",1,1)]),
+    ("grass_block", &[d("dirt",1,1)]),
+    ("gravel", &[d("gravel",1,1)]),
+    ("gray_banner", &[d("gray_banner",1,1)]),
+    ("gray_bed", &[d("gray_bed",1,1)]),
+    ("gray_candle", &[d("gray_candle",1,1)]),
+    ("gray_candle_cake", &[d("gray_candle",1,1)]),
+    ("gray_carpet", &[d("gray_carpet",1,1)]),
+    ("gray_concrete", &[d("gray_concrete",1,1)]),
+    ("gray_concrete_powder", &[d("gray_concrete_powder",1,1)]),
+    ("gray_glazed_terracotta", &[d("gray_glazed_terracotta",1,1)]),
+    ("gray_shulker_box", &[d("gray_shulker_box",1,1)]),
+    ("gray_terracotta", &[d("gray_terracotta",1,1)]),
+    ("gray_wool", &[d("gray_wool",1,1)]),
+    ("green_banner", &[d("green_banner",1,1)]),
+    ("green_bed", &[d("green_bed",1,1)]),
+    ("green_candle", &[d("green_candle",1,1)]),
+    ("green_candle_cake", &[d("green_candle",1,1)]),
+    ("green_carpet", &[d("green_carpet",1,1)]),
+    ("green_concrete", &[d("green_concrete",1,1)]),
+    ("green_concrete_powder", &[d("green_concrete_powder",1,1)]),
+    ("green_glazed_terracotta", &[d("green_glazed_terracotta",1,1)]),
+    ("green_shulker_box", &[d("green_shulker_box",1,1)]),
+    ("green_terracotta", &[d("green_terracotta",1,1)]),
+    ("green_wool", &[d("green_wool",1,1)]),
+    ("grindstone", &[d("grindstone",1,1)]),
+    ("hay_block", &[d("hay_block",1,1)]),
+    ("heavy_core", &[d("heavy_core",1,1)]),
+    ("heavy_weighted_pressure_plate", &[d("heavy_weighted_pressure_plate",1,1)]),
+    ("honey_block", &[d("honey_block",1,1)]),
+    ("honeycomb_block", &[d("honeycomb_block",1,1)]),
+    ("hopper", &[d("hopper",1,1)]),
+    ("horn_coral_block", &[d("dead_horn_coral_block",1,1)]),
+    ("iron_bars", &[d("iron_bars",1,1)]),
+    ("iron_block", &[d("iron_block",1,1)]),
+    ("iron_chain", &[d("iron_chain",1,1)]),
+    ("iron_door", &[d("iron_door",1,1)]),
+    ("iron_ore", &[d("raw_iron",1,1)]),
+    ("iron_trapdoor", &[d("iron_trapdoor",1,1)]),
+    ("jack_o_lantern", &[d("jack_o_lantern",1,1)]),
+    ("jukebox", &[d("jukebox",1,1)]),
+    ("jungle_button", &[d("jungle_button",1,1)]),
+    ("jungle_door", &[d("jungle_door",1,1)]),
+    ("jungle_fence", &[d("jungle_fence",1,1)]),
+    ("jungle_fence_gate", &[d("jungle_fence_gate",1,1)]),
+    ("jungle_hanging_sign", &[d("jungle_hanging_sign",1,1)]),
+    ("jungle_log", &[d("jungle_log",1,1)]),
+    ("jungle_planks", &[d("jungle_planks",1,1)]),
+    ("jungle_pressure_plate", &[d("jungle_pressure_plate",1,1)]),
+    ("jungle_sapling", &[d("jungle_sapling",1,1)]),
+    ("jungle_shelf", &[d("jungle_shelf",1,1)]),
+    ("jungle_sign", &[d("jungle_sign",1,1)]),
+    ("jungle_slab", &[d("jungle_slab",1,1)]),
+    ("jungle_stairs", &[d("jungle_stairs",1,1)]),
+    ("jungle_trapdoor", &[d("jungle_trapdoor",1,1)]),
+    ("jungle_wood", &[d("jungle_wood",1,1)]),
+    ("kelp", &[d("kelp",1,1)]),
+    ("kelp_plant", &[d("kelp",1,1)]),
+    ("ladder", &[d("ladder",1,1)]),
+    ("lantern", &[d("lantern",1,1)]),
+    ("lapis_block", &[d("lapis_block",1,1)]),
+    ("lapis_ore", &[d("lapis_lazuli",4,9)]),
+    ("lava_cauldron", &[d("cauldron",1,1)]),
+    ("leaf_litter", &[d("leaf_litter",1,1)]),
+    ("lectern", &[d("lectern",1,1)]),
+    ("lever", &[d("lever",1,1)]),
+    ("light_blue_banner", &[d("light_blue_banner",1,1)]),
+    ("light_blue_bed", &[d("light_blue_bed",1,1)]),
+    ("light_blue_candle", &[d("light_blue_candle",1,1)]),
+    ("light_blue_candle_cake", &[d("light_blue_candle",1,1)]),
+    ("light_blue_carpet", &[d("light_blue_carpet",1,1)]),
+    ("light_blue_concrete", &[d("light_blue_concrete",1,1)]),
+    ("light_blue_concrete_powder", &[d("light_blue_concrete_powder",1,1)]),
+    ("light_blue_glazed_terracotta", &[d("light_blue_glazed_terracotta",1,1)]),
+    ("light_blue_shulker_box", &[d("light_blue_shulker_box",1,1)]),
+    ("light_blue_terracotta", &[d("light_blue_terracotta",1,1)]),
+    ("light_blue_wool", &[d("light_blue_wool",1,1)]),
+    ("light_gray_banner", &[d("light_gray_banner",1,1)]),
+    ("light_gray_bed", &[d("light_gray_bed",1,1)]),
+    ("light_gray_candle", &[d("light_gray_candle",1,1)]),
+    ("light_gray_candle_cake", &[d("light_gray_candle",1,1)]),
+    ("light_gray_carpet", &[d("light_gray_carpet",1,1)]),
+    ("light_gray_concrete", &[d("light_gray_concrete",1,1)]),
+    ("light_gray_concrete_powder", &[d("light_gray_concrete_powder",1,1)]),
+    ("light_gray_glazed_terracotta", &[d("light_gray_glazed_terracotta",1,1)]),
+    ("light_gray_shulker_box", &[d("light_gray_shulker_box",1,1)]),
+    ("light_gray_terracotta", &[d("light_gray_terracotta",1,1)]),
+    ("light_gray_wool", &[d("light_gray_wool",1,1)]),
+    ("light_weighted_pressure_plate", &[d("light_weighted_pressure_plate",1,1)]),
+    ("lightning_rod", &[d("lightning_rod",1,1)]),
+    ("lilac", &[d("lilac",1,1)]),
+    ("lily_of_the_valley", &[d("lily_of_the_valley",1,1)]),
+    ("lily_pad", &[d("lily_pad",1,1)]),
+    ("lime_banner", &[d("lime_banner",1,1)]),
+    ("lime_bed", &[d("lime_bed",1,1)]),
+    ("lime_candle", &[d("lime_candle",1,1)]),
+    ("lime_candle_cake", &[d("lime_candle",1,1)]),
+    ("lime_carpet", &[d("lime_carpet",1,1)]),
+    ("lime_concrete", &[d("lime_concrete",1,1)]),
+    ("lime_concrete_powder", &[d("lime_concrete_powder",1,1)]),
+    ("lime_glazed_terracotta", &[d("lime_glazed_terracotta",1,1)]),
+    ("lime_shulker_box", &[d("lime_shulker_box",1,1)]),
+    ("lime_terracotta", &[d("lime_terracotta",1,1)]),
+    ("lime_wool", &[d("lime_wool",1,1)]),
+    ("lodestone", &[d("lodestone",1,1)]),
+    ("loom", &[d("loom",1,1)]),
+    ("magenta_banner", &[d("magenta_banner",1,1)]),
+    ("magenta_bed", &[d("magenta_bed",1,1)]),
+    ("magenta_candle", &[d("magenta_candle",1,1)]),
+    ("magenta_candle_cake", &[d("magenta_candle",1,1)]),
+    ("magenta_carpet", &[d("magenta_carpet",1,1)]),
+    ("magenta_concrete", &[d("magenta_concrete",1,1)]),
+    ("magenta_concrete_powder", &[d("magenta_concrete_powder",1,1)]),
+    ("magenta_glazed_terracotta", &[d("magenta_glazed_terracotta",1,1)]),
+    ("magenta_shulker_box", &[d("magenta_shulker_box",1,1)]),
+    ("magenta_terracotta", &[d("magenta_terracotta",1,1)]),
+    ("magenta_wool", &[d("magenta_wool",1,1)]),
+    ("magma_block", &[d("magma_block",1,1)]),
+    ("mangrove_button", &[d("mangrove_button",1,1)]),
+    ("mangrove_door", &[d("mangrove_door",1,1)]),
+    ("mangrove_fence", &[d("mangrove_fence",1,1)]),
+    ("mangrove_fence_gate", &[d("mangrove_fence_gate",1,1)]),
+    ("mangrove_hanging_sign", &[d("mangrove_hanging_sign",1,1)]),
+    ("mangrove_log", &[d("mangrove_log",1,1)]),
+    ("mangrove_planks", &[d("mangrove_planks",1,1)]),
+    ("mangrove_pressure_plate", &[d("mangrove_pressure_plate",1,1)]),
+    ("mangrove_propagule", &[d("mangrove_propagule",1,1)]),
+    ("mangrove_roots", &[d("mangrove_roots",1,1)]),
+    ("mangrove_shelf", &[d("mangrove_shelf",1,1)]),
+    ("mangrove_sign", &[d("mangrove_sign",1,1)]),
+    ("mangrove_slab", &[d("mangrove_slab",1,1)]),
+    ("mangrove_stairs", &[d("mangrove_stairs",1,1)]),
+    ("mangrove_trapdoor", &[d("mangrove_trapdoor",1,1)]),
+    ("mangrove_wood", &[d("mangrove_wood",1,1)]),
+    ("melon", &[d("melon_slice",3,7)]),
+    ("melon_stem", &[d("melon_seeds",1,1)]),
+    ("moss_block", &[d("moss_block",1,1)]),
+    ("moss_carpet", &[d("moss_carpet",1,1)]),
+    ("mossy_cobblestone", &[d("mossy_cobblestone",1,1)]),
+    ("mossy_cobblestone_slab", &[d("mossy_cobblestone_slab",1,1)]),
+    ("mossy_cobblestone_stairs", &[d("mossy_cobblestone_stairs",1,1)]),
+    ("mossy_cobblestone_wall", &[d("mossy_cobblestone_wall",1,1)]),
+    ("mossy_stone_brick_slab", &[d("mossy_stone_brick_slab",1,1)]),
+    ("mossy_stone_brick_stairs", &[d("mossy_stone_brick_stairs",1,1)]),
+    ("mossy_stone_brick_wall", &[d("mossy_stone_brick_wall",1,1)]),
+    ("mossy_stone_bricks", &[d("mossy_stone_bricks",1,1)]),
+    ("mud", &[d("mud",1,1)]),
+    ("mud_brick_slab", &[d("mud_brick_slab",1,1)]),
+    ("mud_brick_stairs", &[d("mud_brick_stairs",1,1)]),
+    ("mud_brick_wall", &[d("mud_brick_wall",1,1)]),
+    ("mud_bricks", &[d("mud_bricks",1,1)]),
+    ("muddy_mangrove_roots", &[d("muddy_mangrove_roots",1,1)]),
+    ("mycelium", &[d("dirt",1,1)]),
+    ("nether_brick_fence", &[d("nether_brick_fence",1,1)]),
+    ("nether_brick_slab", &[d("nether_brick_slab",1,1)]),
+    ("nether_brick_stairs", &[d("nether_brick_stairs",1,1)]),
+    ("nether_brick_wall", &[d("nether_brick_wall",1,1)]),
+    ("nether_bricks", &[d("nether_bricks",1,1)]),
+    ("nether_gold_ore", &[d("gold_nugget",2,6)]),
+    ("nether_quartz_ore", &[d("quartz",1,1)]),
+    ("nether_wart", &[d("nether_wart",1,1)]),
+    ("nether_wart_block", &[d("nether_wart_block",1,1)]),
+    ("netherite_block", &[d("netherite_block",1,1)]),
+    ("netherrack", &[d("netherrack",1,1)]),
+    ("note_block", &[d("note_block",1,1)]),
+    ("oak_button", &[d("oak_button",1,1)]),
+    ("oak_door", &[d("oak_door",1,1)]),
+    ("oak_fence", &[d("oak_fence",1,1)]),
+    ("oak_fence_gate", &[d("oak_fence_gate",1,1)]),
+    ("oak_hanging_sign", &[d("oak_hanging_sign",1,1)]),
+    ("oak_log", &[d("oak_log",1,1)]),
+    ("oak_planks", &[d("oak_planks",1,1)]),
+    ("oak_pressure_plate", &[d("oak_pressure_plate",1,1)]),
+    ("oak_sapling", &[d("oak_sapling",1,1)]),
+    ("oak_shelf", &[d("oak_shelf",1,1)]),
+    ("oak_sign", &[d("oak_sign",1,1)]),
+    ("oak_slab", &[d("oak_slab",1,1)]),
+    ("oak_stairs", &[d("oak_stairs",1,1)]),
+    ("oak_trapdoor", &[d("oak_trapdoor",1,1)]),
+    ("oak_wood", &[d("oak_wood",1,1)]),
+    ("observer", &[d("observer",1,1)]),
+    ("obsidian", &[d("obsidian",1,1)]),
+    ("ochre_froglight", &[d("ochre_froglight",1,1)]),
+    ("open_eyeblossom", &[d("open_eyeblossom",1,1)]),
+    ("orange_banner", &[d("orange_banner",1,1)]),
+    ("orange_bed", &[d("orange_bed",1,1)]),
+    ("orange_candle", &[d("orange_candle",1,1)]),
+    ("orange_candle_cake", &[d("orange_candle",1,1)]),
+    ("orange_carpet", &[d("orange_carpet",1,1)]),
+    ("orange_concrete", &[d("orange_concrete",1,1)]),
+    ("orange_concrete_powder", &[d("orange_concrete_powder",1,1)]),
+    ("orange_glazed_terracotta", &[d("orange_glazed_terracotta",1,1)]),
+    ("orange_shulker_box", &[d("orange_shulker_box",1,1)]),
+    ("orange_terracotta", &[d("orange_terracotta",1,1)]),
+    ("orange_tulip", &[d("orange_tulip",1,1)]),
+    ("orange_wool", &[d("orange_wool",1,1)]),
+    ("oxeye_daisy", &[d("oxeye_daisy",1,1)]),
+    ("oxidized_chiseled_copper", &[d("oxidized_chiseled_copper",1,1)]),
+    ("oxidized_copper", &[d("oxidized_copper",1,1)]),
+    ("oxidized_copper_bars", &[d("oxidized_copper_bars",1,1)]),
+    ("oxidized_copper_bulb", &[d("oxidized_copper_bulb",1,1)]),
+    ("oxidized_copper_chain", &[d("oxidized_copper_chain",1,1)]),
+    ("oxidized_copper_chest", &[d("oxidized_copper_chest",1,1)]),
+    ("oxidized_copper_door", &[d("oxidized_copper_door",1,1)]),
+    ("oxidized_copper_golem_statue", &[d("oxidized_copper_golem_statue",1,1)]),
+    ("oxidized_copper_grate", &[d("oxidized_copper_grate",1,1)]),
+    ("oxidized_copper_lantern", &[d("oxidized_copper_lantern",1,1)]),
+    ("oxidized_copper_trapdoor", &[d("oxidized_copper_trapdoor",1,1)]),
+    ("oxidized_cut_copper", &[d("oxidized_cut_copper",1,1)]),
+    ("oxidized_cut_copper_slab", &[d("oxidized_cut_copper_slab",1,1)]),
+    ("oxidized_cut_copper_stairs", &[d("oxidized_cut_copper_stairs",1,1)]),
+    ("oxidized_lightning_rod", &[d("oxidized_lightning_rod",1,1)]),
+    ("packed_mud", &[d("packed_mud",1,1)]),
+    ("pale_moss_block", &[d("pale_moss_block",1,1)]),
+    ("pale_moss_carpet", &[d("pale_moss_carpet",1,1)]),
+    ("pale_oak_button", &[d("pale_oak_button",1,1)]),
+    ("pale_oak_door", &[d("pale_oak_door",1,1)]),
+    ("pale_oak_fence", &[d("pale_oak_fence",1,1)]),
+    ("pale_oak_fence_gate", &[d("pale_oak_fence_gate",1,1)]),
+    ("pale_oak_hanging_sign", &[d("pale_oak_hanging_sign",1,1)]),
+    ("pale_oak_log", &[d("pale_oak_log",1,1)]),
+    ("pale_oak_planks", &[d("pale_oak_planks",1,1)]),
+    ("pale_oak_pressure_plate", &[d("pale_oak_pressure_plate",1,1)]),
+    ("pale_oak_sapling", &[d("pale_oak_sapling",1,1)]),
+    ("pale_oak_shelf", &[d("pale_oak_shelf",1,1)]),
+    ("pale_oak_sign", &[d("pale_oak_sign",1,1)]),
+    ("pale_oak_slab", &[d("pale_oak_slab",1,1)]),
+    ("pale_oak_stairs", &[d("pale_oak_stairs",1,1)]),
+    ("pale_oak_trapdoor", &[d("pale_oak_trapdoor",1,1)]),
+    ("pale_oak_wood", &[d("pale_oak_wood",1,1)]),
+    ("pearlescent_froglight", &[d("pearlescent_froglight",1,1)]),
+    ("peony", &[d("peony",1,1)]),
+    ("petrified_oak_slab", &[d("petrified_oak_slab",1,1)]),
+    ("piglin_head", &[d("piglin_head",1,1)]),
+    ("pink_banner", &[d("pink_banner",1,1)]),
+    ("pink_bed", &[d("pink_bed",1,1)]),
+    ("pink_candle", &[d("pink_candle",1,1)]),
+    ("pink_candle_cake", &[d("pink_candle",1,1)]),
+    ("pink_carpet", &[d("pink_carpet",1,1)]),
+    ("pink_concrete", &[d("pink_concrete",1,1)]),
+    ("pink_concrete_powder", &[d("pink_concrete_powder",1,1)]),
+    ("pink_glazed_terracotta", &[d("pink_glazed_terracotta",1,1)]),
+    ("pink_petals", &[d("pink_petals",1,1)]),
+    ("pink_shulker_box", &[d("pink_shulker_box",1,1)]),
+    ("pink_terracotta", &[d("pink_terracotta",1,1)]),
+    ("pink_tulip", &[d("pink_tulip",1,1)]),
+    ("pink_wool", &[d("pink_wool",1,1)]),
+    ("piston", &[d("piston",1,1)]),
+    ("pitcher_crop", &[d("pitcher_pod",1,1)]),
+    ("pitcher_plant", &[d("pitcher_plant",1,1)]),
+    ("player_head", &[d("player_head",1,1)]),
+    ("podzol", &[d("dirt",1,1)]),
+    ("pointed_dripstone", &[d("pointed_dripstone",1,1)]),
+    ("polished_andesite", &[d("polished_andesite",1,1)]),
+    ("polished_andesite_slab", &[d("polished_andesite_slab",1,1)]),
+    ("polished_andesite_stairs", &[d("polished_andesite_stairs",1,1)]),
+    ("polished_basalt", &[d("polished_basalt",1,1)]),
+    ("polished_blackstone", &[d("polished_blackstone",1,1)]),
+    ("polished_blackstone_brick_slab", &[d("polished_blackstone_brick_slab",1,1)]),
+    ("polished_blackstone_brick_stairs", &[d("polished_blackstone_brick_stairs",1,1)]),
+    ("polished_blackstone_brick_wall", &[d("polished_blackstone_brick_wall",1,1)]),
+    ("polished_blackstone_bricks", &[d("polished_blackstone_bricks",1,1)]),
+    ("polished_blackstone_button", &[d("polished_blackstone_button",1,1)]),
+    ("polished_blackstone_pressure_plate", &[d("polished_blackstone_pressure_plate",1,1)]),
+    ("polished_blackstone_slab", &[d("polished_blackstone_slab",1,1)]),
+    ("polished_blackstone_stairs", &[d("polished_blackstone_stairs",1,1)]),
+    ("polished_blackstone_wall", &[d("polished_blackstone_wall",1,1)]),
+    ("polished_cinnabar", &[d("polished_cinnabar",1,1)]),
+    ("polished_cinnabar_slab", &[d("polished_cinnabar_slab",1,1)]),
+    ("polished_cinnabar_stairs", &[d("polished_cinnabar_stairs",1,1)]),
+    ("polished_cinnabar_wall", &[d("polished_cinnabar_wall",1,1)]),
+    ("polished_deepslate", &[d("polished_deepslate",1,1)]),
+    ("polished_deepslate_slab", &[d("polished_deepslate_slab",1,1)]),
+    ("polished_deepslate_stairs", &[d("polished_deepslate_stairs",1,1)]),
+    ("polished_deepslate_wall", &[d("polished_deepslate_wall",1,1)]),
+    ("polished_diorite", &[d("polished_diorite",1,1)]),
+    ("polished_diorite_slab", &[d("polished_diorite_slab",1,1)]),
+    ("polished_diorite_stairs", &[d("polished_diorite_stairs",1,1)]),
+    ("polished_granite", &[d("polished_granite",1,1)]),
+    ("polished_granite_slab", &[d("polished_granite_slab",1,1)]),
+    ("polished_granite_stairs", &[d("polished_granite_stairs",1,1)]),
+    ("polished_sulfur", &[d("polished_sulfur",1,1)]),
+    ("polished_sulfur_slab", &[d("polished_sulfur_slab",1,1)]),
+    ("polished_sulfur_stairs", &[d("polished_sulfur_stairs",1,1)]),
+    ("polished_sulfur_wall", &[d("polished_sulfur_wall",1,1)]),
+    ("polished_tuff", &[d("polished_tuff",1,1)]),
+    ("polished_tuff_slab", &[d("polished_tuff_slab",1,1)]),
+    ("polished_tuff_stairs", &[d("polished_tuff_stairs",1,1)]),
+    ("polished_tuff_wall", &[d("polished_tuff_wall",1,1)]),
+    ("poppy", &[d("poppy",1,1)]),
+    ("potatoes", &[d("potato",1,1), d("potato",1,1)]),
+    ("potent_sulfur", &[d("potent_sulfur",1,1)]),
+    ("potted_acacia_sapling", &[d("flower_pot",1,1), d("acacia_sapling",1,1)]),
+    ("potted_allium", &[d("flower_pot",1,1), d("allium",1,1)]),
+    ("potted_azalea_bush", &[d("flower_pot",1,1), d("azalea",1,1)]),
+    ("potted_azure_bluet", &[d("flower_pot",1,1), d("azure_bluet",1,1)]),
+    ("potted_bamboo", &[d("flower_pot",1,1), d("bamboo",1,1)]),
+    ("potted_birch_sapling", &[d("flower_pot",1,1), d("birch_sapling",1,1)]),
+    ("potted_blue_orchid", &[d("flower_pot",1,1), d("blue_orchid",1,1)]),
+    ("potted_brown_mushroom", &[d("flower_pot",1,1), d("brown_mushroom",1,1)]),
+    ("potted_cactus", &[d("flower_pot",1,1), d("cactus",1,1)]),
+    ("potted_cherry_sapling", &[d("flower_pot",1,1), d("cherry_sapling",1,1)]),
+    ("potted_closed_eyeblossom", &[d("flower_pot",1,1), d("closed_eyeblossom",1,1)]),
+    ("potted_cornflower", &[d("flower_pot",1,1), d("cornflower",1,1)]),
+    ("potted_crimson_fungus", &[d("flower_pot",1,1), d("crimson_fungus",1,1)]),
+    ("potted_crimson_roots", &[d("flower_pot",1,1), d("crimson_roots",1,1)]),
+    ("potted_dandelion", &[d("flower_pot",1,1), d("dandelion",1,1)]),
+    ("potted_dark_oak_sapling", &[d("flower_pot",1,1), d("dark_oak_sapling",1,1)]),
+    ("potted_dead_bush", &[d("flower_pot",1,1), d("dead_bush",1,1)]),
+    ("potted_fern", &[d("flower_pot",1,1), d("fern",1,1)]),
+    ("potted_flowering_azalea_bush", &[d("flower_pot",1,1), d("flowering_azalea",1,1)]),
+    ("potted_golden_dandelion", &[d("flower_pot",1,1), d("golden_dandelion",1,1)]),
+    ("potted_jungle_sapling", &[d("flower_pot",1,1), d("jungle_sapling",1,1)]),
+    ("potted_lily_of_the_valley", &[d("flower_pot",1,1), d("lily_of_the_valley",1,1)]),
+    ("potted_mangrove_propagule", &[d("flower_pot",1,1), d("mangrove_propagule",1,1)]),
+    ("potted_oak_sapling", &[d("flower_pot",1,1), d("oak_sapling",1,1)]),
+    ("potted_open_eyeblossom", &[d("flower_pot",1,1), d("open_eyeblossom",1,1)]),
+    ("potted_orange_tulip", &[d("flower_pot",1,1), d("orange_tulip",1,1)]),
+    ("potted_oxeye_daisy", &[d("flower_pot",1,1), d("oxeye_daisy",1,1)]),
+    ("potted_pale_oak_sapling", &[d("flower_pot",1,1), d("pale_oak_sapling",1,1)]),
+    ("potted_pink_tulip", &[d("flower_pot",1,1), d("pink_tulip",1,1)]),
+    ("potted_poppy", &[d("flower_pot",1,1), d("poppy",1,1)]),
+    ("potted_red_mushroom", &[d("flower_pot",1,1), d("red_mushroom",1,1)]),
+    ("potted_red_tulip", &[d("flower_pot",1,1), d("red_tulip",1,1)]),
+    ("potted_spruce_sapling", &[d("flower_pot",1,1), d("spruce_sapling",1,1)]),
+    ("potted_torchflower", &[d("flower_pot",1,1), d("torchflower",1,1)]),
+    ("potted_warped_fungus", &[d("flower_pot",1,1), d("warped_fungus",1,1)]),
+    ("potted_warped_roots", &[d("flower_pot",1,1), d("warped_roots",1,1)]),
+    ("potted_white_tulip", &[d("flower_pot",1,1), d("white_tulip",1,1)]),
+    ("potted_wither_rose", &[d("flower_pot",1,1), d("wither_rose",1,1)]),
+    ("powder_snow_cauldron", &[d("cauldron",1,1)]),
+    ("powered_rail", &[d("powered_rail",1,1)]),
+    ("prismarine", &[d("prismarine",1,1)]),
+    ("prismarine_brick_slab", &[d("prismarine_brick_slab",1,1)]),
+    ("prismarine_brick_stairs", &[d("prismarine_brick_stairs",1,1)]),
+    ("prismarine_bricks", &[d("prismarine_bricks",1,1)]),
+    ("prismarine_slab", &[d("prismarine_slab",1,1)]),
+    ("prismarine_stairs", &[d("prismarine_stairs",1,1)]),
+    ("prismarine_wall", &[d("prismarine_wall",1,1)]),
+    ("pumpkin", &[d("pumpkin",1,1)]),
+    ("pumpkin_stem", &[d("pumpkin_seeds",1,1)]),
+    ("purple_banner", &[d("purple_banner",1,1)]),
+    ("purple_bed", &[d("purple_bed",1,1)]),
+    ("purple_candle", &[d("purple_candle",1,1)]),
+    ("purple_candle_cake", &[d("purple_candle",1,1)]),
+    ("purple_carpet", &[d("purple_carpet",1,1)]),
+    ("purple_concrete", &[d("purple_concrete",1,1)]),
+    ("purple_concrete_powder", &[d("purple_concrete_powder",1,1)]),
+    ("purple_glazed_terracotta", &[d("purple_glazed_terracotta",1,1)]),
+    ("purple_shulker_box", &[d("purple_shulker_box",1,1)]),
+    ("purple_terracotta", &[d("purple_terracotta",1,1)]),
+    ("purple_wool", &[d("purple_wool",1,1)]),
+    ("purpur_block", &[d("purpur_block",1,1)]),
+    ("purpur_pillar", &[d("purpur_pillar",1,1)]),
+    ("purpur_slab", &[d("purpur_slab",1,1)]),
+    ("purpur_stairs", &[d("purpur_stairs",1,1)]),
+    ("quartz_block", &[d("quartz_block",1,1)]),
+    ("quartz_bricks", &[d("quartz_bricks",1,1)]),
+    ("quartz_pillar", &[d("quartz_pillar",1,1)]),
+    ("quartz_slab", &[d("quartz_slab",1,1)]),
+    ("quartz_stairs", &[d("quartz_stairs",1,1)]),
+    ("rail", &[d("rail",1,1)]),
+    ("raw_copper_block", &[d("raw_copper_block",1,1)]),
+    ("raw_gold_block", &[d("raw_gold_block",1,1)]),
+    ("raw_iron_block", &[d("raw_iron_block",1,1)]),
+    ("red_banner", &[d("red_banner",1,1)]),
+    ("red_bed", &[d("red_bed",1,1)]),
+    ("red_candle", &[d("red_candle",1,1)]),
+    ("red_candle_cake", &[d("red_candle",1,1)]),
+    ("red_carpet", &[d("red_carpet",1,1)]),
+    ("red_concrete", &[d("red_concrete",1,1)]),
+    ("red_concrete_powder", &[d("red_concrete_powder",1,1)]),
+    ("red_glazed_terracotta", &[d("red_glazed_terracotta",1,1)]),
+    ("red_mushroom", &[d("red_mushroom",1,1)]),
+    ("red_mushroom_block", &[d("red_mushroom",0,2)]),
+    ("red_nether_brick_slab", &[d("red_nether_brick_slab",1,1)]),
+    ("red_nether_brick_stairs", &[d("red_nether_brick_stairs",1,1)]),
+    ("red_nether_brick_wall", &[d("red_nether_brick_wall",1,1)]),
+    ("red_nether_bricks", &[d("red_nether_bricks",1,1)]),
+    ("red_sand", &[d("red_sand",1,1)]),
+    ("red_sandstone", &[d("red_sandstone",1,1)]),
+    ("red_sandstone_slab", &[d("red_sandstone_slab",1,1)]),
+    ("red_sandstone_stairs", &[d("red_sandstone_stairs",1,1)]),
+    ("red_sandstone_wall", &[d("red_sandstone_wall",1,1)]),
+    ("red_shulker_box", &[d("red_shulker_box",1,1)]),
+    ("red_terracotta", &[d("red_terracotta",1,1)]),
+    ("red_tulip", &[d("red_tulip",1,1)]),
+    ("red_wool", &[d("red_wool",1,1)]),
+    ("redstone_block", &[d("redstone_block",1,1)]),
+    ("redstone_lamp", &[d("redstone_lamp",1,1)]),
+    ("redstone_ore", &[d("redstone",4,5)]),
+    ("redstone_torch", &[d("redstone_torch",1,1)]),
+    ("redstone_wire", &[d("redstone",1,1)]),
+    ("repeater", &[d("repeater",1,1)]),
+    ("resin_block", &[d("resin_block",1,1)]),
+    ("resin_brick_slab", &[d("resin_brick_slab",1,1)]),
+    ("resin_brick_stairs", &[d("resin_brick_stairs",1,1)]),
+    ("resin_brick_wall", &[d("resin_brick_wall",1,1)]),
+    ("resin_bricks", &[d("resin_bricks",1,1)]),
+    ("resin_clump", &[d("resin_clump",1,1)]),
+    ("respawn_anchor", &[d("respawn_anchor",1,1)]),
+    ("rooted_dirt", &[d("rooted_dirt",1,1)]),
+    ("rose_bush", &[d("rose_bush",1,1)]),
+    ("sand", &[d("sand",1,1)]),
+    ("sandstone", &[d("sandstone",1,1)]),
+    ("sandstone_slab", &[d("sandstone_slab",1,1)]),
+    ("sandstone_stairs", &[d("sandstone_stairs",1,1)]),
+    ("sandstone_wall", &[d("sandstone_wall",1,1)]),
+    ("scaffolding", &[d("scaffolding",1,1)]),
+    ("sea_lantern", &[d("prismarine_crystals",2,3)]),
+    ("sea_pickle", &[d("sea_pickle",1,1)]),
+    ("shroomlight", &[d("shroomlight",1,1)]),
+    ("shulker_box", &[d("shulker_box",1,1)]),
+    ("skeleton_skull", &[d("skeleton_skull",1,1)]),
+    ("slime_block", &[d("slime_block",1,1)]),
+    ("smithing_table", &[d("smithing_table",1,1)]),
+    ("smoker", &[d("smoker",1,1)]),
+    ("smooth_basalt", &[d("smooth_basalt",1,1)]),
+    ("smooth_quartz", &[d("smooth_quartz",1,1)]),
+    ("smooth_quartz_slab", &[d("smooth_quartz_slab",1,1)]),
+    ("smooth_quartz_stairs", &[d("smooth_quartz_stairs",1,1)]),
+    ("smooth_red_sandstone", &[d("smooth_red_sandstone",1,1)]),
+    ("smooth_red_sandstone_slab", &[d("smooth_red_sandstone_slab",1,1)]),
+    ("smooth_red_sandstone_stairs", &[d("smooth_red_sandstone_stairs",1,1)]),
+    ("smooth_sandstone", &[d("smooth_sandstone",1,1)]),
+    ("smooth_sandstone_slab", &[d("smooth_sandstone_slab",1,1)]),
+    ("smooth_sandstone_stairs", &[d("smooth_sandstone_stairs",1,1)]),
+    ("smooth_stone", &[d("smooth_stone",1,1)]),
+    ("smooth_stone_slab", &[d("smooth_stone_slab",1,1)]),
+    ("sniffer_egg", &[d("sniffer_egg",1,1)]),
+    ("snow_block", &[d("snowball",4,4)]),
+    ("soul_campfire", &[d("soul_soil",1,1)]),
+    ("soul_lantern", &[d("soul_lantern",1,1)]),
+    ("soul_sand", &[d("soul_sand",1,1)]),
+    ("soul_soil", &[d("soul_soil",1,1)]),
+    ("soul_torch", &[d("soul_torch",1,1)]),
+    ("sponge", &[d("sponge",1,1)]),
+    ("spore_blossom", &[d("spore_blossom",1,1)]),
+    ("spruce_button", &[d("spruce_button",1,1)]),
+    ("spruce_door", &[d("spruce_door",1,1)]),
+    ("spruce_fence", &[d("spruce_fence",1,1)]),
+    ("spruce_fence_gate", &[d("spruce_fence_gate",1,1)]),
+    ("spruce_hanging_sign", &[d("spruce_hanging_sign",1,1)]),
+    ("spruce_log", &[d("spruce_log",1,1)]),
+    ("spruce_planks", &[d("spruce_planks",1,1)]),
+    ("spruce_pressure_plate", &[d("spruce_pressure_plate",1,1)]),
+    ("spruce_sapling", &[d("spruce_sapling",1,1)]),
+    ("spruce_shelf", &[d("spruce_shelf",1,1)]),
+    ("spruce_sign", &[d("spruce_sign",1,1)]),
+    ("spruce_slab", &[d("spruce_slab",1,1)]),
+    ("spruce_stairs", &[d("spruce_stairs",1,1)]),
+    ("spruce_trapdoor", &[d("spruce_trapdoor",1,1)]),
+    ("spruce_wood", &[d("spruce_wood",1,1)]),
+    ("sticky_piston", &[d("sticky_piston",1,1)]),
+    ("stone", &[d("cobblestone",1,1)]),
+    ("stone_brick_slab", &[d("stone_brick_slab",1,1)]),
+    ("stone_brick_stairs", &[d("stone_brick_stairs",1,1)]),
+    ("stone_brick_wall", &[d("stone_brick_wall",1,1)]),
+    ("stone_bricks", &[d("stone_bricks",1,1)]),
+    ("stone_button", &[d("stone_button",1,1)]),
+    ("stone_pressure_plate", &[d("stone_pressure_plate",1,1)]),
+    ("stone_slab", &[d("stone_slab",1,1)]),
+    ("stone_stairs", &[d("stone_stairs",1,1)]),
+    ("stonecutter", &[d("stonecutter",1,1)]),
+    ("stripped_acacia_log", &[d("stripped_acacia_log",1,1)]),
+    ("stripped_acacia_wood", &[d("stripped_acacia_wood",1,1)]),
+    ("stripped_bamboo_block", &[d("stripped_bamboo_block",1,1)]),
+    ("stripped_birch_log", &[d("stripped_birch_log",1,1)]),
+    ("stripped_birch_wood", &[d("stripped_birch_wood",1,1)]),
+    ("stripped_cherry_log", &[d("stripped_cherry_log",1,1)]),
+    ("stripped_cherry_wood", &[d("stripped_cherry_wood",1,1)]),
+    ("stripped_crimson_hyphae", &[d("stripped_crimson_hyphae",1,1)]),
+    ("stripped_crimson_stem", &[d("stripped_crimson_stem",1,1)]),
+    ("stripped_dark_oak_log", &[d("stripped_dark_oak_log",1,1)]),
+    ("stripped_dark_oak_wood", &[d("stripped_dark_oak_wood",1,1)]),
+    ("stripped_jungle_log", &[d("stripped_jungle_log",1,1)]),
+    ("stripped_jungle_wood", &[d("stripped_jungle_wood",1,1)]),
+    ("stripped_mangrove_log", &[d("stripped_mangrove_log",1,1)]),
+    ("stripped_mangrove_wood", &[d("stripped_mangrove_wood",1,1)]),
+    ("stripped_oak_log", &[d("stripped_oak_log",1,1)]),
+    ("stripped_oak_wood", &[d("stripped_oak_wood",1,1)]),
+    ("stripped_pale_oak_log", &[d("stripped_pale_oak_log",1,1)]),
+    ("stripped_pale_oak_wood", &[d("stripped_pale_oak_wood",1,1)]),
+    ("stripped_spruce_log", &[d("stripped_spruce_log",1,1)]),
+    ("stripped_spruce_wood", &[d("stripped_spruce_wood",1,1)]),
+    ("stripped_warped_hyphae", &[d("stripped_warped_hyphae",1,1)]),
+    ("stripped_warped_stem", &[d("stripped_warped_stem",1,1)]),
+    ("sugar_cane", &[d("sugar_cane",1,1)]),
+    ("sulfur", &[d("sulfur",1,1)]),
+    ("sulfur_brick_slab", &[d("sulfur_brick_slab",1,1)]),
+    ("sulfur_brick_stairs", &[d("sulfur_brick_stairs",1,1)]),
+    ("sulfur_brick_wall", &[d("sulfur_brick_wall",1,1)]),
+    ("sulfur_bricks", &[d("sulfur_bricks",1,1)]),
+    ("sulfur_slab", &[d("sulfur_slab",1,1)]),
+    ("sulfur_spike", &[d("sulfur_spike",1,1)]),
+    ("sulfur_stairs", &[d("sulfur_stairs",1,1)]),
+    ("sulfur_wall", &[d("sulfur_wall",1,1)]),
+    ("sunflower", &[d("sunflower",1,1)]),
+    ("sweet_berry_bush", &[d("sweet_berries",1,1), d("sweet_berries",1,1)]),
+    ("target", &[d("target",1,1)]),
+    ("terracotta", &[d("terracotta",1,1)]),
+    ("tinted_glass", &[d("tinted_glass",1,1)]),
+    ("tnt", &[d("tnt",1,1)]),
+    ("torch", &[d("torch",1,1)]),
+    ("torchflower", &[d("torchflower",1,1)]),
+    ("torchflower_crop", &[d("torchflower_seeds",1,1)]),
+    ("trapped_chest", &[d("trapped_chest",1,1)]),
+    ("tripwire", &[d("string",1,1)]),
+    ("tripwire_hook", &[d("tripwire_hook",1,1)]),
+    ("tube_coral_block", &[d("dead_tube_coral_block",1,1)]),
+    ("tuff", &[d("tuff",1,1)]),
+    ("tuff_brick_slab", &[d("tuff_brick_slab",1,1)]),
+    ("tuff_brick_stairs", &[d("tuff_brick_stairs",1,1)]),
+    ("tuff_brick_wall", &[d("tuff_brick_wall",1,1)]),
+    ("tuff_bricks", &[d("tuff_bricks",1,1)]),
+    ("tuff_slab", &[d("tuff_slab",1,1)]),
+    ("tuff_stairs", &[d("tuff_stairs",1,1)]),
+    ("tuff_wall", &[d("tuff_wall",1,1)]),
+    ("verdant_froglight", &[d("verdant_froglight",1,1)]),
+    ("warped_button", &[d("warped_button",1,1)]),
+    ("warped_door", &[d("warped_door",1,1)]),
+    ("warped_fence", &[d("warped_fence",1,1)]),
+    ("warped_fence_gate", &[d("warped_fence_gate",1,1)]),
+    ("warped_fungus", &[d("warped_fungus",1,1)]),
+    ("warped_hanging_sign", &[d("warped_hanging_sign",1,1)]),
+    ("warped_hyphae", &[d("warped_hyphae",1,1)]),
+    ("warped_nylium", &[d("netherrack",1,1)]),
+    ("warped_planks", &[d("warped_planks",1,1)]),
+    ("warped_pressure_plate", &[d("warped_pressure_plate",1,1)]),
+    ("warped_roots", &[d("warped_roots",1,1)]),
+    ("warped_shelf", &[d("warped_shelf",1,1)]),
+    ("warped_sign", &[d("warped_sign",1,1)]),
+    ("warped_slab", &[d("warped_slab",1,1)]),
+    ("warped_stairs", &[d("warped_stairs",1,1)]),
+    ("warped_stem", &[d("warped_stem",1,1)]),
+    ("warped_trapdoor", &[d("warped_trapdoor",1,1)]),
+    ("warped_wart_block", &[d("warped_wart_block",1,1)]),
+    ("water_cauldron", &[d("cauldron",1,1)]),
+    ("waxed_chiseled_copper", &[d("waxed_chiseled_copper",1,1)]),
+    ("waxed_copper_bars", &[d("waxed_copper_bars",1,1)]),
+    ("waxed_copper_block", &[d("waxed_copper_block",1,1)]),
+    ("waxed_copper_bulb", &[d("waxed_copper_bulb",1,1)]),
+    ("waxed_copper_chain", &[d("waxed_copper_chain",1,1)]),
+    ("waxed_copper_chest", &[d("waxed_copper_chest",1,1)]),
+    ("waxed_copper_door", &[d("waxed_copper_door",1,1)]),
+    ("waxed_copper_golem_statue", &[d("waxed_copper_golem_statue",1,1)]),
+    ("waxed_copper_grate", &[d("waxed_copper_grate",1,1)]),
+    ("waxed_copper_lantern", &[d("waxed_copper_lantern",1,1)]),
+    ("waxed_copper_trapdoor", &[d("waxed_copper_trapdoor",1,1)]),
+    ("waxed_cut_copper", &[d("waxed_cut_copper",1,1)]),
+    ("waxed_cut_copper_slab", &[d("waxed_cut_copper_slab",1,1)]),
+    ("waxed_cut_copper_stairs", &[d("waxed_cut_copper_stairs",1,1)]),
+    ("waxed_exposed_chiseled_copper", &[d("waxed_exposed_chiseled_copper",1,1)]),
+    ("waxed_exposed_copper", &[d("waxed_exposed_copper",1,1)]),
+    ("waxed_exposed_copper_bars", &[d("waxed_exposed_copper_bars",1,1)]),
+    ("waxed_exposed_copper_bulb", &[d("waxed_exposed_copper_bulb",1,1)]),
+    ("waxed_exposed_copper_chain", &[d("waxed_exposed_copper_chain",1,1)]),
+    ("waxed_exposed_copper_chest", &[d("waxed_exposed_copper_chest",1,1)]),
+    ("waxed_exposed_copper_door", &[d("waxed_exposed_copper_door",1,1)]),
+    ("waxed_exposed_copper_golem_statue", &[d("waxed_exposed_copper_golem_statue",1,1)]),
+    ("waxed_exposed_copper_grate", &[d("waxed_exposed_copper_grate",1,1)]),
+    ("waxed_exposed_copper_lantern", &[d("waxed_exposed_copper_lantern",1,1)]),
+    ("waxed_exposed_copper_trapdoor", &[d("waxed_exposed_copper_trapdoor",1,1)]),
+    ("waxed_exposed_cut_copper", &[d("waxed_exposed_cut_copper",1,1)]),
+    ("waxed_exposed_cut_copper_slab", &[d("waxed_exposed_cut_copper_slab",1,1)]),
+    ("waxed_exposed_cut_copper_stairs", &[d("waxed_exposed_cut_copper_stairs",1,1)]),
+    ("waxed_exposed_lightning_rod", &[d("waxed_exposed_lightning_rod",1,1)]),
+    ("waxed_lightning_rod", &[d("waxed_lightning_rod",1,1)]),
+    ("waxed_oxidized_chiseled_copper", &[d("waxed_oxidized_chiseled_copper",1,1)]),
+    ("waxed_oxidized_copper", &[d("waxed_oxidized_copper",1,1)]),
+    ("waxed_oxidized_copper_bars", &[d("waxed_oxidized_copper_bars",1,1)]),
+    ("waxed_oxidized_copper_bulb", &[d("waxed_oxidized_copper_bulb",1,1)]),
+    ("waxed_oxidized_copper_chain", &[d("waxed_oxidized_copper_chain",1,1)]),
+    ("waxed_oxidized_copper_chest", &[d("waxed_oxidized_copper_chest",1,1)]),
+    ("waxed_oxidized_copper_door", &[d("waxed_oxidized_copper_door",1,1)]),
+    ("waxed_oxidized_copper_golem_statue", &[d("waxed_oxidized_copper_golem_statue",1,1)]),
+    ("waxed_oxidized_copper_grate", &[d("waxed_oxidized_copper_grate",1,1)]),
+    ("waxed_oxidized_copper_lantern", &[d("waxed_oxidized_copper_lantern",1,1)]),
+    ("waxed_oxidized_copper_trapdoor", &[d("waxed_oxidized_copper_trapdoor",1,1)]),
+    ("waxed_oxidized_cut_copper", &[d("waxed_oxidized_cut_copper",1,1)]),
+    ("waxed_oxidized_cut_copper_slab", &[d("waxed_oxidized_cut_copper_slab",1,1)]),
+    ("waxed_oxidized_cut_copper_stairs", &[d("waxed_oxidized_cut_copper_stairs",1,1)]),
+    ("waxed_oxidized_lightning_rod", &[d("waxed_oxidized_lightning_rod",1,1)]),
+    ("waxed_weathered_chiseled_copper", &[d("waxed_weathered_chiseled_copper",1,1)]),
+    ("waxed_weathered_copper", &[d("waxed_weathered_copper",1,1)]),
+    ("waxed_weathered_copper_bars", &[d("waxed_weathered_copper_bars",1,1)]),
+    ("waxed_weathered_copper_bulb", &[d("waxed_weathered_copper_bulb",1,1)]),
+    ("waxed_weathered_copper_chain", &[d("waxed_weathered_copper_chain",1,1)]),
+    ("waxed_weathered_copper_chest", &[d("waxed_weathered_copper_chest",1,1)]),
+    ("waxed_weathered_copper_door", &[d("waxed_weathered_copper_door",1,1)]),
+    ("waxed_weathered_copper_golem_statue", &[d("waxed_weathered_copper_golem_statue",1,1)]),
+    ("waxed_weathered_copper_grate", &[d("waxed_weathered_copper_grate",1,1)]),
+    ("waxed_weathered_copper_lantern", &[d("waxed_weathered_copper_lantern",1,1)]),
+    ("waxed_weathered_copper_trapdoor", &[d("waxed_weathered_copper_trapdoor",1,1)]),
+    ("waxed_weathered_cut_copper", &[d("waxed_weathered_cut_copper",1,1)]),
+    ("waxed_weathered_cut_copper_slab", &[d("waxed_weathered_cut_copper_slab",1,1)]),
+    ("waxed_weathered_cut_copper_stairs", &[d("waxed_weathered_cut_copper_stairs",1,1)]),
+    ("waxed_weathered_lightning_rod", &[d("waxed_weathered_lightning_rod",1,1)]),
+    ("weathered_chiseled_copper", &[d("weathered_chiseled_copper",1,1)]),
+    ("weathered_copper", &[d("weathered_copper",1,1)]),
+    ("weathered_copper_bars", &[d("weathered_copper_bars",1,1)]),
+    ("weathered_copper_bulb", &[d("weathered_copper_bulb",1,1)]),
+    ("weathered_copper_chain", &[d("weathered_copper_chain",1,1)]),
+    ("weathered_copper_chest", &[d("weathered_copper_chest",1,1)]),
+    ("weathered_copper_door", &[d("weathered_copper_door",1,1)]),
+    ("weathered_copper_golem_statue", &[d("weathered_copper_golem_statue",1,1)]),
+    ("weathered_copper_grate", &[d("weathered_copper_grate",1,1)]),
+    ("weathered_copper_lantern", &[d("weathered_copper_lantern",1,1)]),
+    ("weathered_copper_trapdoor", &[d("weathered_copper_trapdoor",1,1)]),
+    ("weathered_cut_copper", &[d("weathered_cut_copper",1,1)]),
+    ("weathered_cut_copper_slab", &[d("weathered_cut_copper_slab",1,1)]),
+    ("weathered_cut_copper_stairs", &[d("weathered_cut_copper_stairs",1,1)]),
+    ("weathered_lightning_rod", &[d("weathered_lightning_rod",1,1)]),
+    ("wet_sponge", &[d("wet_sponge",1,1)]),
+    ("wheat", &[d("wheat",1,1), d("wheat_seeds",1,1)]),
+    ("white_banner", &[d("white_banner",1,1)]),
+    ("white_bed", &[d("white_bed",1,1)]),
+    ("white_candle", &[d("white_candle",1,1)]),
+    ("white_candle_cake", &[d("white_candle",1,1)]),
+    ("white_carpet", &[d("white_carpet",1,1)]),
+    ("white_concrete", &[d("white_concrete",1,1)]),
+    ("white_concrete_powder", &[d("white_concrete_powder",1,1)]),
+    ("white_glazed_terracotta", &[d("white_glazed_terracotta",1,1)]),
+    ("white_shulker_box", &[d("white_shulker_box",1,1)]),
+    ("white_terracotta", &[d("white_terracotta",1,1)]),
+    ("white_tulip", &[d("white_tulip",1,1)]),
+    ("white_wool", &[d("white_wool",1,1)]),
+    ("wildflowers", &[d("wildflowers",1,1)]),
+    ("wither_rose", &[d("wither_rose",1,1)]),
+    ("wither_skeleton_skull", &[d("wither_skeleton_skull",1,1)]),
+    ("yellow_banner", &[d("yellow_banner",1,1)]),
+    ("yellow_bed", &[d("yellow_bed",1,1)]),
+    ("yellow_candle", &[d("yellow_candle",1,1)]),
+    ("yellow_candle_cake", &[d("yellow_candle",1,1)]),
+    ("yellow_carpet", &[d("yellow_carpet",1,1)]),
+    ("yellow_concrete", &[d("yellow_concrete",1,1)]),
+    ("yellow_concrete_powder", &[d("yellow_concrete_powder",1,1)]),
+    ("yellow_glazed_terracotta", &[d("yellow_glazed_terracotta",1,1)]),
+    ("yellow_shulker_box", &[d("yellow_shulker_box",1,1)]),
+    ("yellow_terracotta", &[d("yellow_terracotta",1,1)]),
+    ("yellow_wool", &[d("yellow_wool",1,1)]),
+    ("zombie_head", &[d("zombie_head",1,1)]),
+];
 
 /// The item stacks a block-state drops when destroyed by a bare hand in survival.
 ///
-/// Returns an empty vector for states that drop nothing (e.g. bedrock, which is
-/// unbreakable in survival and has an empty loot table) and for any state not yet
-/// in the table. Mirrors `Block.getDrops`, whose result `dropResources` feeds one
-/// stack at a time into `popResource`.
+/// Resolves the state to its block, looks the block up in [`DROPS`], and rolls
+/// each line's count (fixed when `min == max`, otherwise a uniform draw over the
+/// inclusive range -- vanilla's per-break `set_count`). Returns an empty vector
+/// for blocks that drop nothing and for any state outside the palette. Mirrors
+/// `Block.getDrops`, whose result `dropResources` feeds one stack at a time into
+/// `popResource`.
 pub fn drops_for(state: BlockState) -> Vec<ItemStack> {
-    // Block-state ids are the global palette ids from the server's block
-    // registration order (see `world::states` / `block_item`). The self-dropping
-    // blocks still list an explicit item id because block-state ids and item ids
-    // are different numbering schemes.
-    let item = match state.get() {
-        1 => ITEM_COBBLESTONE,  // stone       → cobblestone (no Silk Touch)
-        2 => ITEM_GRANITE,      // granite     → itself
-        4 => ITEM_DIORITE,      // diorite     → itself
-        6 => ITEM_ANDESITE,     // andesite    → itself
-        9 => ITEM_DIRT,         // grass_block → dirt (no Silk Touch)
-        10 => ITEM_DIRT,        // dirt        → itself
-        14 => ITEM_COBBLESTONE, // cobblestone → itself
-        15 => ITEM_OAK_PLANKS,  // oak_planks  → itself
-        // bedrock (85) and everything else: no drops.
-        _ => return Vec::new(),
+    let Some(block_id) = crate::registry::block_state::block_of_state(state.get()) else {
+        return Vec::new();
     };
-    vec![ItemStack::new(item, 1)]
+    let Some(name) = crate::registry::builtin::BLOCK.name_of(block_id) else {
+        return Vec::new();
+    };
+    let key = name.strip_prefix("minecraft:").unwrap_or(name);
+    let Ok(idx) = DROPS.binary_search_by_key(&key, |&(n, _)| n) else {
+        return Vec::new();
+    };
+
+    let mut rng = rand::thread_rng();
+    let mut out = Vec::new();
+    for line in DROPS[idx].1 {
+        let count = if line.min >= line.max {
+            line.min
+        } else {
+            rng.gen_range(line.min..=line.max)
+        };
+        if count == 0 {
+            continue;
+        }
+        // Every generated item path is present in the registry (verified at
+        // generation), so `id_of` is expected to resolve; skip defensively if not.
+        if let Some(id) = crate::registry::item::id_of(line.item) {
+            out.push(ItemStack::new(id.get(), count as i32));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::block_state::default_state_of;
 
-    fn only(state: u32) -> ItemStack {
-        let d = drops_for(BlockState(state));
-        assert_eq!(d.len(), 1, "state {state} should drop exactly one stack");
-        d[0]
+    /// Drops for a block's default state, by registry name.
+    fn drops(name: &str) -> Vec<ItemStack> {
+        drops_for(BlockState(default_state_of(name).expect("known block")))
+    }
+
+    /// The single item id a block's default state yields (asserts exactly one).
+    fn one(name: &str) -> i32 {
+        let d = drops(name);
+        assert_eq!(d.len(), 1, "{name} should drop exactly one stack, got {d:?}");
+        d[0].id.get()
+    }
+
+    fn item(name: &str) -> i32 {
+        crate::registry::item::id_of(name).expect("known item").get()
     }
 
     #[test]
     fn self_dropping_blocks() {
-        assert_eq!(only(2).id.get(), ITEM_GRANITE);
-        assert_eq!(only(4).id.get(), ITEM_DIORITE);
-        assert_eq!(only(6).id.get(), ITEM_ANDESITE);
-        assert_eq!(only(10).id.get(), ITEM_DIRT);
-        assert_eq!(only(14).id.get(), ITEM_COBBLESTONE);
-        assert_eq!(only(15).id.get(), ITEM_OAK_PLANKS);
-    }
-
-    #[test]
-    fn special_case_drops() {
-        // stone → cobblestone, grass_block → dirt (empty-hand, no Silk Touch).
-        assert_eq!(only(1).id.get(), ITEM_COBBLESTONE);
-        assert_eq!(only(9).id.get(), ITEM_DIRT);
-    }
-
-    #[test]
-    fn every_drop_is_a_single_item() {
-        for s in [1u32, 2, 4, 6, 9, 10, 14, 15] {
-            assert_eq!(only(s).count, 1);
+        // The regression that motivated the full table: logs, planks, sand, and
+        // the stone variants used to drop nothing; each now yields itself.
+        for b in [
+            "minecraft:oak_log", "minecraft:birch_log", "minecraft:spruce_planks",
+            "minecraft:sand", "minecraft:gravel", "minecraft:granite",
+            "minecraft:diorite", "minecraft:andesite", "minecraft:dirt",
+            "minecraft:cobblestone", "minecraft:oak_planks", "minecraft:sandstone",
+            "minecraft:pumpkin", "minecraft:oak_fence",
+        ] {
+            assert_eq!(one(b), item(b), "{b} should drop itself");
         }
     }
 
     #[test]
-    fn no_drops_for_bedrock_air_and_unknown() {
-        assert!(drops_for(BlockState(0)).is_empty()); // air
-        assert!(drops_for(BlockState(85)).is_empty()); // bedrock (unbreakable)
-        assert!(drops_for(BlockState(9999)).is_empty()); // unmapped
+    fn special_case_item_drops() {
+        assert_eq!(one("minecraft:stone"), item("minecraft:cobblestone"));
+        assert_eq!(one("minecraft:grass_block"), item("minecraft:dirt"));
+        assert_eq!(one("minecraft:podzol"), item("minecraft:dirt"));
+        assert_eq!(one("minecraft:deepslate"), item("minecraft:cobbled_deepslate"));
+        assert_eq!(one("minecraft:coal_ore"), item("minecraft:coal"));
+        assert_eq!(one("minecraft:deepslate_coal_ore"), item("minecraft:coal"));
+        assert_eq!(one("minecraft:iron_ore"), item("minecraft:raw_iron"));
+        assert_eq!(one("minecraft:gold_ore"), item("minecraft:raw_gold"));
+        assert_eq!(one("minecraft:diamond_ore"), item("minecraft:diamond"));
+        assert_eq!(one("minecraft:emerald_ore"), item("minecraft:emerald"));
+        assert_eq!(one("minecraft:nether_quartz_ore"), item("minecraft:quartz"));
+        assert_eq!(one("minecraft:cobweb"), item("minecraft:string"));
+    }
+
+    #[test]
+    fn fixed_multi_count_drops() {
+        // Constant `set_count` lines drop a fixed amount.
+        let clay = drops("minecraft:clay");
+        assert_eq!(clay.len(), 1);
+        assert_eq!(clay[0].id.get(), item("minecraft:clay_ball"));
+        assert_eq!(clay[0].count, 4);
+
+        let snow = drops("minecraft:snow_block");
+        assert_eq!(snow[0].id.get(), item("minecraft:snowball"));
+        assert_eq!(snow[0].count, 4);
+
+        assert_eq!(drops("minecraft:bookshelf")[0].count, 3);
+        assert_eq!(drops("minecraft:ender_chest")[0].count, 8);
+    }
+
+    #[test]
+    fn ranged_counts_stay_within_the_loot_range() {
+        // Roll many times: lapis ore drops 4..=9 lapis, redstone ore 4..=5.
+        let lapis = item("minecraft:lapis_lazuli");
+        for _ in 0..200 {
+            let d = drops("minecraft:lapis_ore");
+            assert_eq!(d.len(), 1);
+            assert_eq!(d[0].id.get(), lapis);
+            assert!((4..=9).contains(&d[0].count), "lapis count {} out of 4..=9", d[0].count);
+        }
+        for _ in 0..200 {
+            let c = drops("minecraft:redstone_ore")[0].count;
+            assert!((4..=5).contains(&c), "redstone count {c} out of 4..=5");
+        }
+    }
+
+    #[test]
+    fn blocks_that_drop_nothing() {
+        // No loot table (bedrock, air, water/lava) or reduced-to-empty (leaves,
+        // plants, glass, ice) -> empty hand yields nothing.
+        for b in [
+            "minecraft:air", "minecraft:bedrock", "minecraft:water", "minecraft:lava",
+            "minecraft:oak_leaves", "minecraft:birch_leaves", "minecraft:short_grass",
+            "minecraft:tall_grass", "minecraft:fern", "minecraft:glass", "minecraft:ice",
+            "minecraft:blue_ice", "minecraft:oak_wall_sign",
+        ] {
+            assert!(drops(b).is_empty(), "{b} should drop nothing");
+        }
+        // Out-of-range palette id also yields nothing.
+        assert!(drops_for(BlockState(u32::MAX)).is_empty());
+    }
+
+    #[test]
+    fn both_door_halves_yield_one_door() {
+        // A block whose single drop is gated on a state property still yields it.
+        assert_eq!(one("minecraft:oak_door"), item("minecraft:oak_door"));
+        assert_eq!(one("minecraft:white_bed"), item("minecraft:white_bed"));
+    }
+
+    #[test]
+    fn table_is_sorted_and_resolvable() {
+        // Binary search relies on sort order, and every drop item must resolve.
+        for w in DROPS.windows(2) {
+            assert!(w[0].0 < w[1].0, "DROPS not sorted at {} / {}", w[0].0, w[1].0);
+        }
+        for (block, lines) in DROPS {
+            assert!(
+                default_state_of(&format!("minecraft:{block}")).is_some(),
+                "unknown block in table: {block}",
+            );
+            for line in *lines {
+                assert!(
+                    crate::registry::item::id_of(line.item).is_some(),
+                    "unknown drop item {} for block {block}", line.item,
+                );
+                assert!(line.min <= line.max, "bad range for {block}");
+            }
+        }
     }
 }

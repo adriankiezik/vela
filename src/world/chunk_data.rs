@@ -181,23 +181,93 @@ pub(super) fn cell_state(
     gen.base_state(lx, world_y, lz)
 }
 
+/// A region key `(cx >> 5, cz >> 5)` — the 32×32-column region a chunk belongs
+/// to, matching the on-disk region-file granularity.
+type RegionKey = (i32, i32);
+
+fn region_key(cx: i32, cz: i32) -> RegionKey {
+    (cx >> 5, cz >> 5)
+}
+
+/// The resident chunks plus a per-region resident count. The count map lets
+/// eviction answer "does this region still hold any resident column?" in O(1)
+/// instead of scanning every resident key, which matters on the movement hot
+/// path where a boundary crossing evicts a whole edge row of columns.
+///
+/// Invariant: `region_counts[r]` equals the number of `columns` keys whose
+/// `region_key` is `r`, and an entry is present iff that count is nonzero. Every
+/// insert into / removal from `columns` must go through [`ChunkStore::insert`] /
+/// [`ChunkStore::remove_column`] (or [`ChunkStore::get_or_generate`]) so the two
+/// maps can never drift.
+#[derive(Default)]
+struct ChunkStore {
+    columns: HashMap<(i32, i32), ChunkData>,
+    region_counts: HashMap<RegionKey, usize>,
+}
+
+impl ChunkStore {
+    /// Insert `data` at `coord`, bumping the owning region's resident count when
+    /// this adds a new column (a replacement of an existing key leaves the count
+    /// unchanged). Returns any displaced `ChunkData`.
+    fn insert(&mut self, coord: (i32, i32), data: ChunkData) -> Option<ChunkData> {
+        let replaced = self.columns.insert(coord, data);
+        if replaced.is_none() {
+            *self
+                .region_counts
+                .entry(region_key(coord.0, coord.1))
+                .or_insert(0) += 1;
+        }
+        replaced
+    }
+
+    /// Remove `coord`, decrementing the owning region's resident count and
+    /// dropping the region entry once it reaches zero. Returns the removed
+    /// `ChunkData`, or `None` if it was not resident.
+    fn remove_column(&mut self, coord: (i32, i32)) -> Option<ChunkData> {
+        let removed = self.columns.remove(&coord);
+        if removed.is_some() {
+            let rk = region_key(coord.0, coord.1);
+            if let Some(count) = self.region_counts.get_mut(&rk) {
+                *count -= 1;
+                if *count == 0 {
+                    self.region_counts.remove(&rk);
+                }
+            }
+        }
+        removed
+    }
+
+    /// Get chunk `(cx, cz)`, generating and inserting it (and bumping the region
+    /// count) on first touch.
+    fn get_or_generate(&mut self, cx: i32, cz: i32) -> &mut ChunkData {
+        if !self.columns.contains_key(&(cx, cz)) {
+            self.insert((cx, cz), ChunkData::new(cx, cz));
+        }
+        self.columns
+            .get_mut(&(cx, cz))
+            .expect("column just inserted")
+    }
+
+    /// Whether the region owning `(cx, cz)` retains no resident column — an O(1)
+    /// lookup against the resident-count map.
+    fn region_is_empty(&self, cx: i32, cz: i32) -> bool {
+        !self.region_counts.contains_key(&region_key(cx, cz))
+    }
+}
+
 /// Process-wide store of chunks, keyed by `(cx, cz)`. Each chunk caches its wire
 /// data and carries its edits. Guarded by a `Mutex` because, while the
 /// simulation is single-threaded today, nothing about the signatures promises
 /// that; the lock is uncontended in practice.
-type ChunkStore = Mutex<HashMap<(i32, i32), ChunkData>>;
-
-fn store() -> &'static ChunkStore {
-    static STORE: OnceLock<ChunkStore> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+fn store() -> &'static Mutex<ChunkStore> {
+    static STORE: OnceLock<Mutex<ChunkStore>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(ChunkStore::default()))
 }
 
 /// Run `f` against chunk `(cx, cz)`'s `ChunkData`, generating it on first touch.
 fn with_chunk<R>(cx: i32, cz: i32, f: impl FnOnce(&mut ChunkData) -> R) -> R {
     let mut guard = store().lock().expect("chunk store mutex poisoned");
-    let chunk = guard
-        .entry((cx, cz))
-        .or_insert_with(|| ChunkData::new(cx, cz));
+    let chunk = guard.get_or_generate(cx, cz);
     f(chunk)
 }
 
@@ -239,7 +309,7 @@ pub fn save_dirty_chunks(game_time: i64) {
         return;
     }
     let mut guard = store().lock().expect("chunk store mutex poisoned");
-    for ((cx, cz), chunk) in guard.iter_mut() {
+    for ((cx, cz), chunk) in guard.columns.iter_mut() {
         if chunk.dirty {
             match super::storage::save_chunk(*cx, *cz, &chunk.gen, &chunk.edits, game_time) {
                 // Only clear the dirty flag once the write succeeds; on failure
@@ -254,6 +324,142 @@ pub fn save_dirty_chunks(game_time: i64) {
     }
     drop(guard);
     super::storage::flush();
+}
+
+/// Evict a single chunk column the moment its last player reference is dropped —
+/// the primary, incremental unload path. Here the sim's per-column reference
+/// count (see `sim::chunking::ChunkRefs`) hits zero and calls this, evicting the
+/// column *eagerly* the same tick the last viewer leaves.
+///
+/// This is a deliberate simplification, not a port of vanilla's unload pipeline:
+/// Vela does **not** replicate `ChunkMap.processUnloads`, which defers unloads
+/// through `toDrop → pendingUnloads → scheduleUnload` gated by a per-tick time
+/// budget, and which holds columns via a ticket radius larger than the view
+/// distance. Vela drops the column immediately once no viewer references it.
+///
+/// Applies the same dirty-safety rule as [`evict_from`]: a dirty chunk is saved
+/// first when persistence is enabled, and kept resident if persistence is off or
+/// the save fails, so unsaved player edits are never dropped. When the chunk does
+/// leave memory and no other resident chunk shares its region, the region file is
+/// closed to bound open file handles. Returns whether the chunk left memory.
+pub fn evict_chunk(cx: i32, cz: i32, game_time: i64) -> bool {
+    let enabled = super::storage::is_enabled();
+    let (evicted, saved, region_now_empty) = {
+        let mut guard = store().lock().expect("chunk store mutex poisoned");
+        let (evicted, saved) = evict_one_from(&mut guard, (cx, cz), enabled, game_time);
+        // Whether this region retains any resident chunk, read in O(1) from the
+        // per-region resident count (kept in lockstep with `columns`), so the
+        // region file is closed exactly when its last resident chunk is gone.
+        let region_now_empty = evicted && guard.region_is_empty(cx, cz);
+        (evicted, saved, region_now_empty)
+    };
+    if saved {
+        super::storage::flush();
+    }
+    if region_now_empty {
+        super::storage::close_region(cx >> 5, cz >> 5);
+    }
+    evicted
+}
+
+/// Single-chunk eviction core, factored out of [`evict_chunk`] so it can be
+/// unit-tested against a local map. Removes `coord` from `store` unless it is a
+/// dirty chunk that cannot be persisted (persistence off, or the save failed), in
+/// which case it is kept resident so its edits survive. Returns
+/// `(evicted, saved)`: whether the chunk left the map and whether a save ran (so
+/// the caller can decide to `flush`). A chunk absent from the map is a no-op.
+fn evict_one_from(
+    store: &mut ChunkStore,
+    coord: (i32, i32),
+    enabled: bool,
+    game_time: i64,
+) -> (bool, bool) {
+    let Some(chunk) = store.columns.get(&coord) else {
+        return (false, false); // never resident (e.g. never generated)
+    };
+    let mut saved = false;
+    if chunk.dirty {
+        if !enabled {
+            return (false, false); // no disk to hold the edits — keep it resident
+        }
+        match super::storage::save_chunk(coord.0, coord.1, &chunk.gen, &chunk.edits, game_time) {
+            Ok(()) => saved = true,
+            Err(e) => {
+                warn!(cx = coord.0, cz = coord.1, error = %e, "failed to save chunk before eviction; keeping resident");
+                return (false, false); // keep so a later save retries the write
+            }
+        }
+    }
+    store.remove_column(coord);
+    (true, saved)
+}
+
+/// Evict every in-memory chunk absent from `keep` (the columns still referenced
+/// by some player), reclaiming the generated grid, wire cache, and light for
+/// columns no player is tracking. This is the *backstop* to the incremental
+/// [`evict_chunk`] path: it reclaims columns that were generated by a bare block
+/// read/write (`with_chunk` inserts on first touch) outside any player's loaded
+/// set, and so were never reference-counted and never released. The primary
+/// mechanism is [`evict_chunk`]; this only sweeps the untracked remainder and is
+/// called on a slow cadence (see `sim::chunking`), not on the hot path.
+///
+/// A dirty chunk is saved before eviction when persistence is enabled; if it is
+/// dirty and persistence is disabled (or the save fails) the chunk is *kept*
+/// resident so unsaved player edits are never silently dropped — only the vastly
+/// more numerous clean, generated-only columns are freed in that case. Returns
+/// the number of chunks evicted.
+pub fn evict_unused_chunks(keep: &std::collections::HashSet<(i32, i32)>, game_time: i64) -> usize {
+    let enabled = super::storage::is_enabled();
+    let (evicted, saved_any) = {
+        let mut guard = store().lock().expect("chunk store mutex poisoned");
+        evict_from(&mut guard, keep, enabled, game_time)
+    };
+    if saved_any {
+        super::storage::flush();
+    }
+    evicted
+}
+
+/// The eviction core, factored out of the global-store wrapper so it can be
+/// unit-tested against a local map without disturbing the process-wide store.
+/// Retains every chunk in `keep`; of the rest, evicts clean chunks always and
+/// dirty chunks only once persisted (when `enabled`), keeping an unsaveable dirty
+/// chunk resident so edits are never lost. Returns `(evicted, saved_any)` —
+/// `saved_any` telling the caller whether a `flush` is warranted.
+fn evict_from(
+    store: &mut ChunkStore,
+    keep: &std::collections::HashSet<(i32, i32)>,
+    enabled: bool,
+    game_time: i64,
+) -> (usize, bool) {
+    let mut saved_any = false;
+    // Decide what to drop in one immutable pass (so persistence errors keep the
+    // chunk), then remove through `remove_column` so the region counts stay in
+    // lockstep — `retain` can't do the count bookkeeping mid-iteration.
+    let mut to_evict: Vec<(i32, i32)> = Vec::new();
+    for (&(cx, cz), chunk) in store.columns.iter() {
+        if keep.contains(&(cx, cz)) {
+            continue; // a player is tracking this column
+        }
+        if chunk.dirty {
+            if !enabled {
+                continue; // no disk to hold the edits — keep it resident
+            }
+            match super::storage::save_chunk(cx, cz, &chunk.gen, &chunk.edits, game_time) {
+                Ok(()) => saved_any = true,
+                Err(e) => {
+                    warn!(cx, cz, error = %e, "failed to save chunk before eviction; keeping resident");
+                    continue; // keep so a later autosave retries the write
+                }
+            }
+        }
+        to_evict.push((cx, cz));
+    }
+    let evicted = to_evict.len();
+    for coord in to_evict {
+        store.remove_column(coord);
+    }
+    (evicted, saved_any)
 }
 
 #[cfg(test)]
@@ -398,6 +604,85 @@ mod tests {
         let raw = longs[col / per_long] as u64;
         let value = (raw >> ((col % per_long) * bits)) & ((1 << bits) - 1);
         assert_eq!(value as i32, place_y + 1 - MIN_Y);
+    }
+
+    #[test]
+    fn eviction_frees_clean_keeps_referenced_and_keeps_unsaveable_dirty() {
+        use std::collections::HashSet;
+        // Operate on a *local* map via the factored-out core, so this test never
+        // touches (and can't race) the process-wide store. `enabled = false` models
+        // persistence being off, where a dirty chunk has no disk to hold it. The
+        // lock keeps a concurrent storage test from enabling the global handle,
+        // which `ChunkData::new` → `load_chunk` would otherwise observe.
+        let _guard = crate::world::WORLD_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let kept = (10, 10);
+        let clean = (11, 11);
+        let dirty = (12, 12);
+
+        let mut map = ChunkStore::default();
+        map.insert(kept, ChunkData::new(kept.0, kept.1));
+        map.insert(clean, ChunkData::new(clean.0, clean.1));
+        let mut edited = ChunkData::new(dirty.0, dirty.1);
+        edited.set(1, 200, 1, states::STONE); // an edit above the surface marks it dirty
+        assert!(edited.dirty);
+        map.insert(dirty, edited);
+
+        let keep: HashSet<(i32, i32)> = [kept].into_iter().collect();
+        let (evicted, saved_any) = evict_from(&mut map, &keep, false, 0);
+
+        assert_eq!(evicted, 1, "only the clean unreferenced chunk is freed");
+        assert!(!saved_any, "persistence off: nothing was written");
+        assert!(map.columns.contains_key(&kept), "a referenced chunk stays resident");
+        assert!(!map.columns.contains_key(&clean), "a clean unreferenced chunk is evicted");
+        assert!(
+            map.columns.contains_key(&dirty),
+            "an unsaveable dirty chunk is kept so its edits aren't lost"
+        );
+        // The per-region resident count tracks exactly the surviving columns.
+        assert_eq!(map.region_counts.values().sum::<usize>(), map.columns.len());
+    }
+
+    #[test]
+    fn single_evict_frees_clean_but_keeps_unsaveable_dirty() {
+        // The incremental (reference-count-to-zero) eviction core, tested on a
+        // *local* map so it never touches the process-wide store. With persistence
+        // off, a clean column evicts but a dirty one is kept resident so its edits
+        // survive. Lock held for the same reason as the batch test: keep a
+        // concurrent storage test from enabling the global handle that
+        // `ChunkData::new` → `load_chunk` would observe.
+        let _guard = crate::world::WORLD_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let clean = (21, 21);
+        let dirty = (22, 22);
+
+        let mut map = ChunkStore::default();
+        map.insert(clean, ChunkData::new(clean.0, clean.1));
+        let mut edited = ChunkData::new(dirty.0, dirty.1);
+        edited.set(1, 200, 1, states::STONE); // an edit above the surface marks it dirty
+        assert!(edited.dirty);
+        map.insert(dirty, edited);
+
+        // Clean column: last viewer left → evicted, nothing written.
+        let (evicted, saved) = evict_one_from(&mut map, clean, false, 0);
+        assert!(evicted, "a clean unreferenced column is freed");
+        assert!(!saved, "persistence off: nothing was written");
+        assert!(!map.columns.contains_key(&clean));
+
+        // Dirty column with persistence off: kept resident, not evicted, not saved.
+        let (evicted, saved) = evict_one_from(&mut map, dirty, false, 0);
+        assert!(!evicted, "an unsaveable dirty column is kept so its edits aren't lost");
+        assert!(!saved);
+        assert!(map.columns.contains_key(&dirty));
+
+        // A column that isn't resident is a no-op.
+        assert_eq!(evict_one_from(&mut map, (23, 23), false, 0), (false, false));
+
+        // The region count matches the single surviving (dirty) column, and the
+        // evicted clean column's region entry was dropped to zero, not left to leak.
+        assert_eq!(map.region_counts.values().sum::<usize>(), map.columns.len());
     }
 
     #[test]

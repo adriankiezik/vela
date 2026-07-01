@@ -232,7 +232,7 @@ mod tests {
                 Profile { name: format!("p{entity_id}"), entity_id },
                 p,
                 t,
-                Conn { outbox: tx },
+                Conn::new(tx),
             ))
             .id();
         (e, rx)

@@ -8,20 +8,47 @@
 //! that model and the wire path to viewers, generalizing the previously
 //! player-only spawn/track code.
 //!
-//! Tracking mirrors vanilla's `ServerEntity` pairing for the spawn case: a viewer
-//! is sent `ClientboundAddEntityPacket` followed by `ClientboundSetEntityDataPacket`
-//! (the non-default metadata) — see `ServerEntity.sendPairingData`. Movement of
-//! these entities is not modelled yet (they spawn at rest); when it is, they gain
-//! a `Tracking` component and join the `broadcast_movement` path.
+//! Tracking mirrors vanilla's `ChunkMap.TrackedEntity` / `ServerEntity`: each net
+//! entity carries a [`Tracked`] set of the player entities that currently have it
+//! paired (vanilla `TrackedEntity.seenBy`). Every tick [`update_entity_tracking`]
+//! reconciles that set against each player's position and view — a player entering
+//! range is *paired* (`ServerEntity.addPairing`: `ClientboundAddEntityPacket` then
+//! `ClientboundSetEntityDataPacket`, see `sendPairingData`) and one leaving range
+//! is *unpaired* (`ServerEntity.removePairing`: `ClientboundRemoveEntitiesPacket`).
+//! This closes the pre-fix leak where an entity was sent only to the viewers
+//! present at spawn time and never removed as a player travelled away.
 //!
-//! Per-viewer culling reuses the player's [`LoadedChunks`] set: an entity is sent
-//! only to players that have its column loaded, matching how vanilla scopes an
-//! entity tracker to players whose chunk view covers it.
+//! The visibility predicate is vanilla's `TrackedEntity.updatePlayer`: the
+//! horizontal (x/z) distance-squared to the player is compared to
+//! `min(clientTrackingRange*16, playerViewDistance*16)²`, *and* the player must
+//! have the entity's column tracked. Vela mirrors `ChunkMap.isChunkTracked`
+//! (`getChunkTrackingView().contains(x,z) && !chunkSender.isPending(...)`) with
+//! [`LoadedChunks`] membership minus the [`ChunkSender`]'s still-pending columns,
+//! so a loaded-but-not-yet-streamed column does not spawn entities early. All
+//! per-entity clientbound fan-out — spawn,
+//! movement deltas, metadata, hurt-animation, despawn — is routed through exactly
+//! this [`Tracked::seen_by`] set (see [`fan_to_seen`]), so a player is fed an
+//! entity iff it is spawned on their client (no spawned-but-unfed or fed-but-
+//! unspawned desync).
+//!
+//! Documented deviation from vanilla: Vela has no per-entity `ServerEntity`
+//! position-codec base shared across viewers — the delta base lives in each mob's
+//! `MobState` / item's `ItemPhysics`. A viewer entering range therefore receives an
+//! `AddEntity` at the entity's *current* `Pos` rather than the tracker base; for a
+//! moving entity the two differ by at most one tick of sub-block motion, which the
+//! next delta/absolute-sync corrects. Player↔player tracking is still handled by
+//! the player-specific path (`movement::broadcast_movement` and the join/leave
+//! pairing in `player_lifecycle`), not this system — see that code for why (player
+//! count is bounded, so the unbounded-leak concern this fix addresses does not
+//! apply; bringing players into the unified tracker is a documented follow-up).
 
 pub mod packets;
 pub mod syncher;
 
+use std::collections::{HashMap, HashSet};
+
 use bevy_ecs::prelude::*;
+use bytes::Bytes;
 use rand::RngCore;
 use uuid::Uuid;
 
@@ -92,6 +119,114 @@ pub struct NetEntity {
 /// `AddEntity` and resent on change.
 #[derive(Component)]
 pub struct EntityMeta(pub EntityData);
+
+/// Per-entity tracking state, mirroring `ChunkMap.TrackedEntity`: the set of
+/// player ECS entities that currently have this entity paired on their client
+/// (`TrackedEntity.seenBy`), and the un-clamped tracking range in blocks
+/// (`EntityType.clientTrackingRange() * 16`, vanilla `TrackedEntity.range`).
+///
+/// All per-entity clientbound fan-out targets exactly `seen_by`; the set is
+/// reconciled each tick by [`update_entity_tracking`].
+#[derive(Component)]
+pub struct Tracked {
+    /// `ChunkMap.TrackedEntity.seenBy` — player entities this is spawned to.
+    pub seen_by: HashSet<Entity>,
+    /// `EntityType.clientTrackingRange() * 16` in blocks (vanilla `range`).
+    pub range: f64,
+}
+
+/// `EntityType.clientTrackingRange()` in **chunks** for the types Vela spawns,
+/// transcribed 1:1 from `EntityTypes` (MC 26.2): pig/cow/sheep/chicken `10`,
+/// item/experience_orb `6`, player `32`. Anything else falls back to the
+/// `EntityType.Builder` default of `5`.
+fn client_tracking_range_chunks(type_id: i32) -> i32 {
+    use crate::registry::builtin::ENTITY_TYPE;
+    let is = |name: &str| ENTITY_TYPE.id_of(name) == Some(type_id);
+    if is("minecraft:player") {
+        32
+    } else if is("minecraft:pig")
+        || is("minecraft:cow")
+        || is("minecraft:sheep")
+        || is("minecraft:chicken")
+    {
+        10
+    } else if is("minecraft:item") || is("minecraft:experience_orb") {
+        6
+    } else {
+        5
+    }
+}
+
+/// A viewer snapshot for the tracking pass: a player's position, tracked columns,
+/// still-pending columns, view-distance cap, and outbox. Only players match
+/// `(&Pos, &LoadedChunks, &Conn, &ChunkSender, &RequestedViewDistance)` — net
+/// entities carry `Pos` but none of the others.
+struct Viewer {
+    entity: Entity,
+    x: f64,
+    z: f64,
+    loaded: HashSet<(i32, i32)>,
+    /// Columns in `LoadedChunks` that are still queued for streaming and have not
+    /// yet been sent to the client (`ChunkSender.pending`); a column here is
+    /// loaded-but-not-yet-tracked and must not count for entity visibility.
+    pending: HashSet<(i32, i32)>,
+    /// This viewer's `getPlayerViewDistance` cap on the visible range, in blocks
+    /// (`clamp(requestedViewDistance, 2, serverViewDistance) * 16`). Per player, so
+    /// a client with a smaller render distance sees a correspondingly smaller entity
+    /// range. Unbounded in unit-test worlds with no [`Config`].
+    view: f64,
+    outbox: OutboxTx,
+}
+
+fn snapshot_viewers(world: &mut World) -> Vec<Viewer> {
+    // `ChunkMap.getPlayerViewDistance` clamps *per player*, so each viewer carries its
+    // own view range. Read the server distance once (unbounded when no `Config`, i.e.
+    // in unit-test worlds — column membership still gates visibility there).
+    let server_view_distance = world.get_resource::<Config>().map(|c| c.0.properties.view_distance());
+    // `RequestedViewDistance` is queried optionally: a real player always carries it
+    // (attached at join), but tracking fixtures in sibling modules spawn bare viewers.
+    // An absent request falls back to the vanilla default (which then clamps to 2).
+    let mut q = world.query::<(
+        Entity,
+        &Pos,
+        &LoadedChunks,
+        &Conn,
+        &ChunkSender,
+        Option<&RequestedViewDistance>,
+    )>();
+    q.iter(world)
+        .map(|(entity, p, l, c, sender, requested)| Viewer {
+            entity,
+            x: p.x,
+            z: p.z,
+            loaded: l.loaded.clone(),
+            pending: sender.pending.iter().copied().collect(),
+            view: match server_view_distance {
+                Some(svd) => {
+                    let r = requested.copied().unwrap_or(RequestedViewDistance(RequestedViewDistance::DEFAULT));
+                    (r.clamped(svd) as f64) * 16.0
+                }
+                None => f64::INFINITY,
+            },
+            outbox: c.outbox.clone(),
+        })
+        .collect()
+}
+
+/// `ChunkMap.TrackedEntity.updatePlayer`'s visibility test: horizontal
+/// distance-squared within `min(range, viewDistance)²` **and** the entity's column
+/// tracked by the player. The `viewDistance` cap is the viewer's own
+/// `getPlayerViewDistance` (`Viewer::view`). Vanilla `isChunkTracked` is
+/// `getChunkTrackingView().contains(x, z) && !chunkSender.isPending(pack(x, z))`, so a
+/// column that is loaded but still *pending* (queued, bytes not yet sent) does not count.
+fn is_visible(v: &Viewer, ex: f64, ez: f64, chunk: (i32, i32), range: f64) -> bool {
+    let visible_range = range.min(v.view);
+    let dx = v.x - ex;
+    let dz = v.z - ez;
+    dx * dx + dz * dz <= visible_range * visible_range
+        && v.loaded.contains(&chunk)
+        && !v.pending.contains(&chunk)
+}
 
 /// Marker for dropped-item entities (`minecraft:item`). Inserted by
 /// [`spawn_item_entity`] on every survival block break; the item-pickup system
@@ -216,10 +351,11 @@ fn spawn_tracked(
 ) -> Entity {
     let (x, y, z) = pos;
     let (id, uuid, type_id) = (net.id, net.uuid, net.type_id);
+    let range = (client_tracking_range_chunks(type_id) * 16) as f64;
 
-    // Build the pairing packets once, then fan out to viewers. The body yaw is
-    // packed (`Mth.packDegrees`) and reused for the head yaw — mobs spawn facing a
-    // single direction with head and body aligned.
+    // Build the pairing packets once, then pair to in-range viewers. The body yaw
+    // is packed (`Mth.packDegrees`) and reused for the head yaw — spawned entities
+    // face a single direction with head and body aligned.
     let packed_yaw = super::packets::pack_angle(yaw);
     let add = packets::add_entity(id, uuid, type_id, pos, packed_yaw, 0, packed_yaw, 0);
     let data = packets::set_entity_data(id, &meta);
@@ -228,70 +364,202 @@ fn spawn_tracked(
         net,
         Pos { x, y, z, yaw, pitch: 0.0, on_ground: false },
         EntityMeta(meta),
+        Tracked { seen_by: HashSet::new(), range },
     ));
     tag(&mut ec);
     let entity = ec.id();
 
-    send_to_viewers(world, chunk_of(x, z), &[add, data]);
+    // Immediate pairing to viewers already in range — vanilla `ChunkMap.addEntity`
+    // calls `TrackedEntity.updatePlayers` right after construction. `seen_by` is
+    // seeded so [`update_entity_tracking`] only sends *changes* afterward. Pairing
+    // is *reliable* (vanilla `ServerEntity.addPairing` uses `connection.send`): on
+    // outbox overflow the send flags the player for a forced disconnect rather than
+    // silently dropping the spawn, and `seen_by` is latched only when it succeeded —
+    // otherwise later movement/metadata would reference an entity the client never
+    // created.
+    let chunk = chunk_of(x, z);
+    let viewers = snapshot_viewers(world);
+    let mut seen = HashSet::new();
+    for v in &viewers {
+        if is_visible(v, x, z, chunk, range) {
+            let ok = world
+                .get::<Conn>(v.entity)
+                .map(|conn| conn.send_reliable(add.clone()) && conn.send_reliable(data.clone()))
+                .unwrap_or(false);
+            if ok {
+                seen.insert(v.entity);
+            }
+        }
+    }
+    if let Some(mut t) = world.get_mut::<Tracked>(entity) {
+        t.seen_by = seen;
+    }
     entity
 }
 
-/// Send framed packets to every player whose loaded-chunk set covers `chunk`.
-/// Best-effort per the outbox contract (a momentarily-full outbox drops the
-/// send); this is the same delivery guarantee the player spawn path uses.
-fn send_to_viewers(world: &mut World, chunk: (i32, i32), pkts: &[bytes::Bytes]) {
-    let mut q = world.query::<(&LoadedChunks, &Conn)>();
-    for (loaded, conn) in q.iter(world) {
-        if loaded.loaded.contains(&chunk) {
-            for pkt in pkts {
-                let _ = conn.outbox.try_send(Outbound::Packet(pkt.clone()));
+/// Fan per-source-entity clientbound packets to exactly each entity's tracking set
+/// (`Tracked::seen_by`) — the movement/metadata/hurt counterpart to spawn pairing,
+/// so a player is fed an entity iff it is spawned on their client. Best-effort per
+/// the outbox contract: a momentarily-full outbox drops the (self-correcting) send.
+pub fn fan_to_seen(world: &mut World, emissions: &[(Entity, Bytes)]) {
+    if emissions.is_empty() {
+        return;
+    }
+    let outboxes: HashMap<Entity, OutboxTx> = {
+        let mut q = world.query::<(Entity, &Conn)>();
+        q.iter(world).map(|(e, c)| (e, c.outbox.clone())).collect()
+    };
+    for (src, pkt) in emissions {
+        if let Some(t) = world.get::<Tracked>(*src) {
+            for viewer in &t.seen_by {
+                if let Some(outbox) = outboxes.get(viewer) {
+                    let _ = outbox.try_send(Outbound::Packet(pkt.clone()));
+                }
             }
         }
     }
 }
 
-/// Replay every existing net entity to a newcomer whose loaded-chunk set is
-/// `loaded`. Called from the join path after the newcomer's chunks are seeded, so
-/// items and orbs already in the world render for the arriving player — the
-/// non-player counterpart to spawning existing players to a newcomer.
-pub fn spawn_existing_entities_for(
-    world: &mut World,
-    outbox: &OutboxTx,
-    loaded: &std::collections::HashSet<(i32, i32)>,
-) {
-    let mut q = world.query::<(&NetEntity, &Pos, &EntityMeta)>();
-    for (net, pos, meta) in q.iter(world) {
-        if !loaded.contains(&chunk_of(pos.x, pos.z)) {
+/// Reconcile every net entity's [`Tracked::seen_by`] against the current players,
+/// mirroring `ChunkMap.TrackedEntity.updatePlayers`: a player entering range is
+/// paired (`addPairing`: `AddEntity` + `SetEntityData`), one leaving range is
+/// unpaired (`removePairing`: `RemoveEntities`). A player that has disconnected is
+/// dropped from `seen_by` with no packet (its client is gone) — this covers *every*
+/// player-despawn path uniformly (clean `Left`, forced overflow disconnect, and
+/// keep-alive timeout) since it prunes any `seen_by` id no longer present among
+/// live viewers, without each despawn site needing to touch tracking state.
+pub fn update_entity_tracking(world: &mut World) {
+    let viewers = snapshot_viewers(world);
+    let live: HashSet<Entity> = viewers.iter().map(|v| v.entity).collect();
+    let outboxes: HashMap<Entity, OutboxTx> =
+        viewers.iter().map(|v| (v.entity, v.outbox.clone())).collect();
+
+    struct Ent {
+        entity: Entity,
+        x: f64,
+        z: f64,
+        chunk: (i32, i32),
+        range: f64,
+    }
+    let ents: Vec<Ent> = {
+        let mut q = world.query::<(Entity, &Pos, &Tracked)>();
+        q.iter(world)
+            .map(|(entity, p, t)| Ent {
+                entity,
+                x: p.x,
+                z: p.z,
+                chunk: chunk_of(p.x, p.z),
+                range: t.range,
+            })
+            .collect()
+    };
+
+    for ent in &ents {
+        let prev = world
+            .get::<Tracked>(ent.entity)
+            .map(|t| t.seen_by.clone())
+            .unwrap_or_default();
+
+        let mut enters: Vec<Entity> = Vec::new();
+        let mut leaves: Vec<Entity> = Vec::new();
+        for v in &viewers {
+            let visible = is_visible(v, ent.x, ent.z, ent.chunk, ent.range);
+            let seen = prev.contains(&v.entity);
+            if visible && !seen {
+                enters.push(v.entity);
+            } else if !visible && seen {
+                leaves.push(v.entity);
+            }
+        }
+        // Viewers still in `seen_by` that are no longer live: disconnected — drop
+        // silently (no removal packet; the client is gone).
+        let gone: Vec<Entity> = prev.iter().copied().filter(|p| !live.contains(p)).collect();
+
+        if enters.is_empty() && leaves.is_empty() && gone.is_empty() {
             continue;
         }
-        let add = packets::add_entity(
-            net.id,
-            net.uuid,
-            net.type_id,
-            (pos.x, pos.y, pos.z),
-            0,
-            0,
-            0,
-            0,
-        );
-        let data = packets::set_entity_data(net.id, &meta.0);
-        let _ = outbox.try_send(Outbound::Packet(add));
-        let _ = outbox.try_send(Outbound::Packet(data));
+
+        // Enter-range pairing is *reliable*, same as the immediate spawn pairing
+        // above (vanilla `ServerEntity.addPairing` uses `connection.send`): a viewer
+        // is retained in `enters` (and later latched into `seen_by`) only if both
+        // frames enqueued, so an overflow disconnects the player rather than leaving
+        // a spawn silently dropped while later deltas reference a nonexistent entity.
+        if !enters.is_empty() {
+            let (add, data) = {
+                let net = world.get::<NetEntity>(ent.entity).expect("net entity");
+                let pos = world.get::<Pos>(ent.entity).expect("net entity Pos");
+                let meta = world.get::<EntityMeta>(ent.entity).expect("net entity meta");
+                let packed_yaw = super::packets::pack_angle(pos.yaw);
+                (
+                    packets::add_entity(
+                        net.id,
+                        net.uuid,
+                        net.type_id,
+                        (pos.x, pos.y, pos.z),
+                        packed_yaw,
+                        super::packets::pack_angle(pos.pitch),
+                        packed_yaw,
+                        0,
+                    ),
+                    packets::set_entity_data(net.id, &meta.0),
+                )
+            };
+            enters.retain(|p| {
+                world
+                    .get::<Conn>(*p)
+                    .map(|conn| conn.send_reliable(add.clone()) && conn.send_reliable(data.clone()))
+                    .unwrap_or(false)
+            });
+        }
+
+        if !leaves.is_empty() {
+            let id = world.get::<NetEntity>(ent.entity).expect("net entity").id;
+            let remove = super::packets::remove_entities(&[id]);
+            for p in &leaves {
+                if let Some(outbox) = outboxes.get(p) {
+                    let _ = outbox.try_send(Outbound::Packet(remove.clone()));
+                }
+            }
+        }
+
+        if let Some(mut t) = world.get_mut::<Tracked>(ent.entity) {
+            for p in leaves.iter().chain(gone.iter()) {
+                t.seen_by.remove(p);
+            }
+            for p in enters {
+                t.seen_by.insert(p);
+            }
+        }
     }
 }
 
-/// Despawn a net entity and tell its viewers to remove it. Returns the removed
-/// network id, or `None` if `entity` was not a net entity.
-#[allow(dead_code)] // removal API for the gameplay layer (pickup/expiry) once it exists.
+/// Despawn a net entity and tell its current viewers (`Tracked::seen_by`) to
+/// remove it — vanilla `TrackedEntity.broadcastRemoved` (`removePairing` for each
+/// seen player). Returns the removed network id, or `None` if `entity` was not a
+/// net entity.
 pub fn remove_entity(world: &mut World, entity: Entity) -> Option<i32> {
-    let (id, chunk) = {
+    let (id, seen) = {
         let net = world.get::<NetEntity>(entity)?;
-        let pos = world.get::<Pos>(entity)?;
-        (net.id, chunk_of(pos.x, pos.z))
+        let seen = world
+            .get::<Tracked>(entity)
+            .map(|t| t.seen_by.clone())
+            .unwrap_or_default();
+        (net.id, seen)
     };
     world.despawn(entity);
+    if seen.is_empty() {
+        return Some(id);
+    }
     let remove = super::packets::remove_entities(&[id]);
-    send_to_viewers(world, chunk, std::slice::from_ref(&remove));
+    let outboxes: HashMap<Entity, OutboxTx> = {
+        let mut q = world.query::<(Entity, &Conn)>();
+        q.iter(world).map(|(e, c)| (e, c.outbox.clone())).collect()
+    };
+    for viewer in seen {
+        if let Some(outbox) = outboxes.get(&viewer) {
+            let _ = outbox.try_send(Outbound::Packet(remove.clone()));
+        }
+    }
     Some(id)
 }
 
@@ -317,17 +585,48 @@ mod tests {
         ids
     }
 
-    /// A minimal viewer whose loaded set covers `chunks`.
+    /// A minimal viewer at world origin whose loaded set covers `chunks`. The
+    /// `Pos` is required now that visibility is distance-gated (mirroring a real
+    /// player, which always carries `Pos` + `LoadedChunks` + `Conn`).
     fn spawn_viewer(world: &mut World, chunks: &[(i32, i32)]) -> mpsc::Receiver<Outbound> {
+        spawn_viewer_at(world, chunks, 0.0, 0.0)
+    }
+
+    fn spawn_viewer_at(
+        world: &mut World,
+        chunks: &[(i32, i32)],
+        x: f64,
+        z: f64,
+    ) -> mpsc::Receiver<Outbound> {
         let (tx, rx) = mpsc::channel(64);
         world.spawn((
-            Conn { outbox: tx },
+            Conn::new(tx),
             LoadedChunks {
                 center: (0, 0),
                 loaded: chunks.iter().copied().collect::<HashSet<_>>(),
             },
+            // Real players carry a `ChunkSender`; the tracking query now requires it
+            // (a fresh sender has no pending columns, so all `loaded` count as tracked).
+            ChunkSender::new(),
+            // The tracking query also requires `RequestedViewDistance` now. These test
+            // worlds have no `Config`, so the view range is unbounded regardless of the
+            // value — column membership alone gates visibility here.
+            RequestedViewDistance(RequestedViewDistance::DEFAULT),
+            Pos { x, y: 64.0, z, yaw: 0.0, pitch: 0.0, on_ground: true },
         ));
         rx
+    }
+
+    /// Move the single viewer (the only entity carrying `LoadedChunks`) to `(x,z)`.
+    fn move_viewer(world: &mut World, x: f64, z: f64) {
+        let e = world
+            .query_filtered::<Entity, With<LoadedChunks>>()
+            .iter(world)
+            .next()
+            .unwrap();
+        let mut pos = world.get_mut::<Pos>(e).unwrap();
+        pos.x = x;
+        pos.z = z;
     }
 
     fn expected_ids() -> (i32, i32) {
@@ -372,19 +671,90 @@ mod tests {
     }
 
     #[test]
-    fn join_replay_sends_existing_entities_in_range() {
+    fn entity_enters_leaves_and_reenters_view() {
+        // The core of Fix C: an entity spawned before a player arrives is paired
+        // when the player enters range, unpaired when they recede, and re-paired
+        // when they return — all driven by `update_entity_tracking`.
         let mut world = world_with_id();
-        // No viewers yet, so the spawn broadcasts to nobody.
-        spawn_item_entity(&mut world, (1.0, 64.0, 2.0), ItemStack::new(1, 1));
-        spawn_xp_orb(&mut world, (300.0, 64.0, 0.0), 3); // chunk (18,0), out of range
-
-        let (tx, mut rx) = mpsc::channel(64);
-        let loaded: HashSet<(i32, i32)> = [(0, 0)].into_iter().collect();
-        spawn_existing_entities_for(&mut world, &tx, &loaded);
-
-        // Only the in-range item is replayed: AddEntity + SetEntityData.
+        // Item spawns with no viewers present, so its `seen_by` starts empty.
+        spawn_item_entity(&mut world, (0.5, 64.0, 0.5), ItemStack::new(1, 1));
+        let mut rx = spawn_viewer(&mut world, &[(0, 0)]); // at origin, column loaded
         let (add_id, data_id) = expected_ids();
+        let remove_id = frame_id(&super::super::packets::remove_entities(&[0]));
+
+        // Enter: the approaching player receives the spawn pairing.
+        update_entity_tracking(&mut world);
         assert_eq!(drain(&mut rx), vec![add_id, data_id]);
+        // Idempotent: a second pass with nothing changed sends nothing.
+        update_entity_tracking(&mut world);
+        assert!(drain(&mut rx).is_empty());
+
+        // Recede beyond the item's 6-chunk (96-block) range (column still loaded,
+        // so only the distance predicate trips): the entity is removed.
+        move_viewer(&mut world, 1000.0, 1000.0);
+        update_entity_tracking(&mut world);
+        assert_eq!(drain(&mut rx), vec![remove_id]);
+
+        // Approach again: re-spawned.
+        move_viewer(&mut world, 0.0, 0.0);
+        update_entity_tracking(&mut world);
+        assert_eq!(drain(&mut rx), vec![add_id, data_id]);
+    }
+
+    #[test]
+    fn fan_to_seen_matches_tracked_set() {
+        // Movement/metadata fan-out reaches exactly the tracked viewers: an in-range
+        // player (in `seen_by`) receives it, an out-of-range one does not.
+        let mut world = world_with_id();
+        spawn_item_entity(&mut world, (0.5, 64.0, 0.5), ItemStack::new(1, 1));
+        let mut near = spawn_viewer_at(&mut world, &[(0, 0)], 0.0, 0.0);
+        let mut far = spawn_viewer_at(&mut world, &[(0, 0)], 1000.0, 1000.0);
+
+        update_entity_tracking(&mut world);
+        // near paired (add+data); far out of range, nothing.
+        let (add_id, data_id) = expected_ids();
+        assert_eq!(drain(&mut near), vec![add_id, data_id]);
+        assert!(drain(&mut far).is_empty());
+
+        // Fan one packet through the tracking set.
+        let item = world
+            .query::<(Entity, &NetEntity)>()
+            .iter(&world)
+            .next()
+            .map(|(e, _)| e)
+            .unwrap();
+        let pkt = super::super::packets::remove_entities(&[42]);
+        let pkt_id = frame_id(&pkt);
+        fan_to_seen(&mut world, &[(item, pkt)]);
+        assert_eq!(drain(&mut near), vec![pkt_id]);
+        assert!(drain(&mut far).is_empty());
+    }
+
+    #[test]
+    fn disconnected_viewer_is_pruned_from_seen_without_packet() {
+        // A viewer that despawns (any disconnect path) is dropped from `seen_by`
+        // silently on the next tracking pass — no removal packet, no stale id.
+        let mut world = world_with_id();
+        spawn_item_entity(&mut world, (0.5, 64.0, 0.5), ItemStack::new(1, 1));
+        let _rx = spawn_viewer(&mut world, &[(0, 0)]);
+        update_entity_tracking(&mut world);
+        let item = world
+            .query::<(Entity, &NetEntity)>()
+            .iter(&world)
+            .next()
+            .map(|(e, _)| e)
+            .unwrap();
+        assert_eq!(world.get::<Tracked>(item).unwrap().seen_by.len(), 1);
+
+        // Despawn the viewer (as a keep-alive timeout / overflow disconnect would).
+        let viewer = world
+            .query_filtered::<Entity, With<LoadedChunks>>()
+            .iter(&world)
+            .next()
+            .unwrap();
+        world.despawn(viewer);
+        update_entity_tracking(&mut world);
+        assert!(world.get::<Tracked>(item).unwrap().seen_by.is_empty());
     }
 
     #[test]

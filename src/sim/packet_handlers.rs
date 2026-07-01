@@ -97,6 +97,29 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         Serverbound::AcceptTeleport(tp) => {
             debug!(teleport_id = tp, "teleport confirmed");
         }
+        // The client resent its settings mid-session. Vanilla `updateOptions`
+        // copies `viewDistance` into `requestedViewDistance`; when it changes, the
+        // effective radius (`getPlayerViewDistance`) changes, so re-diff the
+        // player's tracked chunks against the new square. Other options are dropped.
+        Serverbound::ClientInformation { view_distance } => {
+            let changed = world
+                .get_mut::<RequestedViewDistance>(entity)
+                .is_some_and(|mut r| std::mem::replace(&mut r.0, view_distance) != view_distance);
+            if changed {
+                debug!(view_distance, "client view distance changed");
+                super::chunking::apply_view_distance_change(world, entity);
+            }
+        }
+        // The client acknowledged a chunk batch and reports its sustainable rate.
+        // Feed the per-player `ChunkSender` throttle so the next batch is released
+        // (`PlayerChunkSender.onChunkBatchReceivedByClient`).
+        Serverbound::ChunkBatchReceived {
+            desired_chunks_per_tick,
+        } => {
+            if let Some(mut sender) = world.get_mut::<ChunkSender>(entity) {
+                sender.on_ack(desired_chunks_per_tick);
+            }
+        }
         Serverbound::Swing { hand } => {
             let Some(eid) = world.get::<Profile>(entity).map(|p| p.entity_id) else {
                 return;
@@ -110,6 +133,7 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
             };
             broadcast_to_others(world, entity, packets::animate(eid, action));
         }
+        Serverbound::Attack { entity_id } => on_attack(world, entity, entity_id),
         Serverbound::PlayerCommand { action } => {
             // 26.2 `Action` ordinals: 1 = START_SPRINTING, 2 = STOP_SPRINTING.
             // The others (sleeping, riding jump, open inventory, fall flying) have
@@ -606,6 +630,71 @@ fn on_command(world: &mut World, sender: Entity, line: &str) {
     }
 }
 
+/// Bare-hand attack damage — `Attributes.ATTACK_DAMAGE`'s base value for a player
+/// (1.0). Held-weapon bonuses come from item attribute modifiers, which Vela has
+/// no model for yet (see the attribute note in `sim::mob`), so every hit is the
+/// fist's 1.0 for now — enough to kill a chicken in 4 hits, a pig/cow in 10, as
+/// bare-handed vanilla does.
+const PLAYER_ATTACK_DAMAGE: f32 = 1.0;
+
+/// Max squared distance from attacker to target for a melee hit to register. A
+/// lenient server-side sanity gate around vanilla's 3.0-block reach
+/// (`Player.isWithinAttackRange`), widened here to absorb the target's bounding
+/// box, the attacker's eye height, and movement latency — the client already
+/// raycast the target before sending, so this only rejects wildly out-of-range
+/// (e.g. cheated) attacks rather than reproducing vanilla's exact AABB test.
+const ATTACK_REACH_SQ: f64 = 6.0 * 6.0;
+
+/// Handle a `ServerboundAttackPacket`: the player left-clicked an entity. Resolve
+/// the target by its network id, gate on game mode and reach, then apply melee
+/// damage — the player→mob half of the combat seam, mirroring
+/// `ServerGamePacketListenerImpl.handleAttack` → `Player.attack`. Attacks on
+/// non-mob entities (other players, dropped items, XP orbs) are ignored for now:
+/// PvP routes through `survival::hurt` and item entities aren't attackable — both
+/// separate milestones.
+fn on_attack(world: &mut World, attacker: Entity, target_net_id: i32) {
+    // Spectators can't attack (handleAttack's `!player.isSpectator()` gate). An
+    // unattached game mode means the server default (survival), which may attack.
+    if world.get::<GameMode>(attacker) == Some(&GameMode::Spectator) {
+        return;
+    }
+    // Resolve the target to a live, damageable mob by its network id.
+    let Some(target) = find_mob_by_net_id(world, target_net_id) else {
+        return; // unknown id, or the entity isn't a mob
+    };
+    // Reach check: reject a hit thrown from implausibly far away.
+    let within_reach = match (
+        world.get::<Pos>(attacker).map(|p| (p.x, p.y, p.z)),
+        world.get::<Pos>(target).map(|p| (p.x, p.y, p.z)),
+    ) {
+        (Some(a), Some(t)) => {
+            let (dx, dy, dz) = (a.0 - t.0, a.1 - t.1, a.2 - t.2);
+            dx * dx + dy * dy + dz * dz <= ATTACK_REACH_SQ
+        }
+        _ => false,
+    };
+    if !within_reach {
+        return;
+    }
+    // Land the blow: health subtraction, the hurt-animation flash, and the
+    // death/despawn all live in `mob::damage`.
+    super::mob::damage(world, target, PLAYER_ATTACK_DAMAGE);
+    // causeFoodExhaustion(0.1) on a landed attack (`Player.attack`). Mobs have no
+    // i-frames yet, so a hit within reach always connects.
+    if let Some(mut food) = world.get_mut::<super::survival::FoodData>(attacker) {
+        food.add_exhaustion(0.1);
+    }
+}
+
+/// Find the live mob entity whose network id is `net_id`, if any. Only entities
+/// carrying [`super::mob::Mob`] (and thus `Health`) are melee-damageable targets
+/// today; players and item/XP entities share the id space but aren't returned.
+fn find_mob_by_net_id(world: &mut World, net_id: i32) -> Option<Entity> {
+    let mut q =
+        world.query_filtered::<(Entity, &super::entity::NetEntity), With<super::mob::Mob>>();
+    q.iter(world).find(|(_, n)| n.id == net_id).map(|(e, _)| e)
+}
+
 /// Handle a `ServerboundChatPacket`: broadcast the message to every player as an
 /// (unsigned) `ClientboundPlayerChatPacket`, mirroring
 /// `ServerGamePacketListenerImpl.broadcastChatMessage` →
@@ -728,6 +817,68 @@ mod tests {
         // 0x04 (an unrelated ability bit) set but 0x02 clear -> not flying.
         on_packet(&mut world, uuid, Serverbound::PlayerAbilities { flags: 0x04 });
         assert!(!world.get::<Meta>(entity).unwrap().flying);
+    }
+
+    /// Spawn a chicken (4 hp) at `pos`, returning its network id and entity. The
+    /// world must already carry `NextEntityId` (and `Tick`, for the spawn path).
+    fn spawn_test_chicken(world: &mut World, pos: (f64, f64, f64)) -> (i32, Entity) {
+        let id = crate::sim::mob::spawn_mob(world, crate::sim::mob::MobKind::Chicken, pos);
+        let e = world
+            .query_filtered::<Entity, With<crate::sim::mob::Mob>>()
+            .iter(world)
+            .next()
+            .expect("chicken spawned");
+        (id, e)
+    }
+
+    #[test]
+    fn attack_damages_a_mob_in_reach() {
+        let (mut world, uuid, attacker) = one_player();
+        world.insert_resource(NextEntityId(100));
+        world.insert_resource(Tick(0));
+        world.entity_mut(attacker).insert(Pos {
+            x: 0.0, y: 64.0, z: 0.0, yaw: 0.0, pitch: 0.0, on_ground: true,
+        });
+        // A chicken one block away is well within reach.
+        let (mob_id, mob) = spawn_test_chicken(&mut world, (1.0, 64.0, 0.0));
+        let before = world.get::<crate::sim::mob::Health>(mob).unwrap().current;
+
+        on_packet(&mut world, uuid, Serverbound::Attack { entity_id: mob_id });
+
+        let after = world.get::<crate::sim::mob::Health>(mob).unwrap().current;
+        assert_eq!(after, before - 1.0, "a bare-hand hit deals 1.0 damage");
+    }
+
+    #[test]
+    fn attack_out_of_reach_is_ignored() {
+        let (mut world, uuid, attacker) = one_player();
+        world.insert_resource(NextEntityId(100));
+        world.insert_resource(Tick(0));
+        world.entity_mut(attacker).insert(Pos {
+            x: 0.0, y: 64.0, z: 0.0, yaw: 0.0, pitch: 0.0, on_ground: true,
+        });
+        // A chicken 100 blocks away is far past the reach gate.
+        let (mob_id, mob) = spawn_test_chicken(&mut world, (100.0, 64.0, 0.0));
+        let before = world.get::<crate::sim::mob::Health>(mob).unwrap().current;
+
+        on_packet(&mut world, uuid, Serverbound::Attack { entity_id: mob_id });
+
+        assert_eq!(
+            world.get::<crate::sim::mob::Health>(mob).unwrap().current,
+            before,
+            "an out-of-reach attack deals no damage"
+        );
+    }
+
+    #[test]
+    fn attack_on_unknown_entity_is_a_noop() {
+        // No mob exists; resolving the id fails and nothing panics.
+        let (mut world, uuid, attacker) = one_player();
+        world.insert_resource(NextEntityId(100));
+        world.entity_mut(attacker).insert(Pos {
+            x: 0.0, y: 64.0, z: 0.0, yaw: 0.0, pitch: 0.0, on_ground: true,
+        });
+        on_packet(&mut world, uuid, Serverbound::Attack { entity_id: 4242 });
     }
 
     #[test]

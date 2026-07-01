@@ -33,7 +33,13 @@ struct Existing {
     outbox: OutboxTx,
 }
 
-pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: OutboxTx) {
+pub(super) fn on_joined(
+    world: &mut World,
+    id: Uuid,
+    name: String,
+    outbox: OutboxTx,
+    view_distance: i32,
+) {
     let entity_id = {
         let mut next = world.resource_mut::<NextEntityId>();
         let v = next.0;
@@ -115,15 +121,48 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
     // same `in_view` predicate the streaming diff uses means the seeded set equals
     // what `send_join_sequence` streamed — no double-send, no gap — and the
     // streaming system (`stream_chunks`) sends only deltas as the player moves.
-    let radius = join.view_distance;
+    // Seed the per-player requested view distance from the client's
+    // `ClientInformation` (carried on `ToSim::Joined`), mirroring vanilla feeding
+    // the Configuration-phase value into the `ServerPlayer` constructor. The join
+    // radius is `getPlayerViewDistance = clamp(requestedViewDistance, 2,
+    // serverViewDistance)`, so a client asking for a smaller render distance is
+    // honoured from the very first streamed chunk.
+    let requested_view_distance = RequestedViewDistance(view_distance);
+    let radius = requested_view_distance.clamped(join.view_distance);
     let spawn_center = ((sx.floor() as i32) >> 4, (sz.floor() as i32) >> 4);
-    let mut loaded = std::collections::HashSet::new();
+    // Collect the region nearest-first (squared chunk distance to spawn), matching
+    // `PlayerChunkSender.collectChunksToSend`'s distance sort, so the queue drains
+    // the columns under the player first.
+    let mut ordered: Vec<(i32, i32)> = Vec::new();
     for cx in (spawn_center.0 - radius - 1)..=(spawn_center.0 + radius + 1) {
         for cz in (spawn_center.1 - radius - 1)..=(spawn_center.1 + radius + 1) {
             if in_view(spawn_center, cx, cz, radius) {
-                loaded.insert((cx, cz));
+                ordered.push((cx, cz));
             }
         }
+    }
+    ordered.sort_by_key(|&(cx, cz)| {
+        let dx = (cx - spawn_center.0) as i64;
+        let dz = (cz - spawn_center.1) as i64;
+        dx * dx + dz * dz
+    });
+    let loaded: std::collections::HashSet<(i32, i32)> = ordered.iter().copied().collect();
+    // Reference-count every seeded column (+1 per player tracking it), the join
+    // counterpart to `stream_chunks`' `acquire` on movement. Keeps the incremental
+    // evictor's refcounts correct so a column stays resident while this player —
+    // or any other — is viewing it.
+    {
+        let mut refs = world.resource_mut::<super::chunking::ChunkRefs>();
+        for &c in &loaded {
+            refs.acquire(c);
+        }
+    }
+    // Seed the player's chunk sender: the seeded columns are queued (nearest-first)
+    // to stream through the batch/ack pacer, exactly as vanilla's initial send goes
+    // through `PlayerChunkSender` rather than being blasted in one burst.
+    let mut chunk_sender = ChunkSender::new();
+    for &c in &ordered {
+        chunk_sender.mark_pending(c);
     }
 
     let tick = world.resource::<Tick>().0;
@@ -216,11 +255,11 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
         let _ = e.outbox.try_send(Outbound::Packet(newcomer_meta.clone()));
     }
 
-    // Replay non-player entities (dropped items, XP orbs, …) already in the world
-    // to the newcomer, scoped to the columns they just loaded — the non-player
-    // arm of the entity tracker (see `sim::entity`). Done before `outbox`/`loaded`
-    // are moved into the player's components below.
-    super::entity::spawn_existing_entities_for(world, &outbox, &loaded);
+    // Non-player entities (dropped items, XP orbs, mobs) already in the world are
+    // paired to the newcomer by `entity::update_entity_tracking`, which runs later
+    // this same tick and pairs every in-range entity to the player entity spawned
+    // below — the newcomer joins the shared tracking set exactly like any player
+    // moving into range, so no separate join-time replay is needed.
 
     // Sync the (loaded or fresh) inventory to the newcomer, mirroring vanilla
     // `PlayerList.sendAllPlayerInfo`: a full `ContainerSetContent` for the player
@@ -270,7 +309,9 @@ pub(super) fn on_joined(world: &mut World, id: Uuid, name: String, outbox: Outbo
                 center: spawn_center,
                 loaded,
             },
-            Conn { outbox },
+            chunk_sender,
+            requested_view_distance,
+            Conn::new(outbox),
             KeepAlive {
                 id: 0,
                 awaiting: false,
@@ -315,16 +356,12 @@ fn send_join_sequence(
     // region tracks spawn automatically and matches the seeded `LoadedChunks`.
     let center = ((sx.floor() as i32) >> 4, (sz.floor() as i32) >> 4);
     ok &= send(outbox, packets::set_chunk_center(center.0, center.1));
-    // Stream exactly the rounded view region (vanilla `ChunkTrackingView`) so the
-    // client's "Loading terrain" wait is fully satisfied — no more, no less.
-    let radius = join.view_distance;
-    for cx in (center.0 - radius - 1)..=(center.0 + radius + 1) {
-        for cz in (center.1 - radius - 1)..=(center.1 + radius + 1) {
-            if in_view(center, cx, cz, radius) {
-                ok &= send(outbox, packets::level_chunk(cx, cz));
-            }
-        }
-    }
+    // The initial view region is NOT blasted here: like vanilla, the spawn chunks
+    // flow through the player's `PlayerChunkSender` (Vela's `ChunkSender`) so a high
+    // view distance can't flood the joining client. `on_joined` seeds the pending
+    // queue (nearest-first) right after this sequence; `send_queued_chunks` drains
+    // it batch-by-batch, and the "Loading terrain" wait clears as the spawn chunks
+    // arrive over the next few ticks.
     ok &= send(
         outbox,
         packets::player_position(SPAWN_TELEPORT_ID, sx, sy, sz, syaw, spitch),
@@ -366,20 +403,59 @@ fn send_world_state(world: &World, outbox: &OutboxTx) {
 pub(super) fn on_left(world: &mut World, id: Uuid) {
     let entity = world.resource_mut::<PlayerIndex>().0.remove(&id);
     if let Some(e) = entity {
-        let profile = world.get::<Profile>(e).map(|p| (p.name.clone(), p.entity_id));
-        save_player_data(world, e, id);
-        world.despawn(e);
-        if let Some((name, entity_id)) = profile {
-            // Drop the leaver from every remaining client's tab list and world.
-            let info_remove = packets::player_info_remove(&[id]);
-            let despawn = packets::remove_entities(&[entity_id]);
-            let mut q = world.query::<&Conn>();
-            for conn in q.iter(world) {
-                let _ = conn.outbox.try_send(Outbound::Packet(info_remove.clone()));
-                let _ = conn.outbox.try_send(Outbound::Packet(despawn.clone()));
-            }
-            info!(%name, "left");
+        despawn_player(world, e, id);
+    }
+}
+
+/// The shared teardown for a departing player: persist their data, release their
+/// chunk references (so the incremental evictor's refcounts stay balanced — see
+/// [`release_loaded_chunks`]), despawn the entity, and drop them from every other
+/// client's tab list and world. Runs exactly once per player.
+///
+/// The caller must have already removed `id` from [`PlayerIndex`] (so any later
+/// `ToSim::Left` for the same player finds nothing and `on_left` no-ops). Reused
+/// by both the clean network-`Left` path ([`on_left`]) and the forced
+/// outbox-overflow disconnect ([`super::systems::drop_lagging_players`]), keeping
+/// the release/despawn/broadcast exactly identical between them.
+pub(super) fn despawn_player(world: &mut World, e: Entity, id: Uuid) {
+    let profile = world.get::<Profile>(e).map(|p| (p.name.clone(), p.entity_id));
+    save_player_data(world, e, id);
+    // Release this player's chunk references before the entity (and its
+    // `LoadedChunks`) is despawned: every column it was viewing drops a
+    // reference, and any that hit zero unload this tick. Without this a
+    // disconnect would leak the leaver's columns resident forever.
+    release_loaded_chunks(world, e);
+    world.despawn(e);
+    if let Some((name, entity_id)) = profile {
+        // Drop the leaver from every remaining client's tab list and world.
+        let info_remove = packets::player_info_remove(&[id]);
+        let despawn = packets::remove_entities(&[entity_id]);
+        let mut q = world.query::<&Conn>();
+        for conn in q.iter(world) {
+            let _ = conn.outbox.try_send(Outbound::Packet(info_remove.clone()));
+            let _ = conn.outbox.try_send(Outbound::Packet(despawn.clone()));
         }
+        info!(%name, "left");
+    }
+}
+
+/// Drop every chunk reference held by `entity`, unloading any column whose last
+/// viewer this player was. Called from the exclusive disconnect/despawn paths
+/// (here and `survival::respawn_player`'s old-set release) so the incremental
+/// evictor's refcounts stay balanced. Reads `LoadedChunks` first (immutable),
+/// then releases against `ChunkRefs` — the two-phase borrow keeps the world
+/// clock available for stamping any dirty chunk the release must save.
+pub(super) fn release_loaded_chunks(world: &mut World, entity: Entity) {
+    let Some(chunks) = world
+        .get::<LoadedChunks>(entity)
+        .map(|lc| lc.loaded.iter().copied().collect::<Vec<_>>())
+    else {
+        return;
+    };
+    let game_time = world.resource::<super::world_tick::WorldTime>().game_time;
+    let mut refs = world.resource_mut::<super::chunking::ChunkRefs>();
+    for c in chunks {
+        refs.release(c, game_time);
     }
 }
 

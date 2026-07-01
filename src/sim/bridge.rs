@@ -10,11 +10,17 @@ use uuid::Uuid;
 /// net → sim. One shared channel, its sender cloned per connection.
 pub enum ToSim {
     /// A connection reached Play. Carries the per-connection outbox so the sim
-    /// can talk back, and the identity established during login.
+    /// can talk back, the identity established during login, and the client's
+    /// requested view distance from the Configuration-phase `ClientInformation`
+    /// (vanilla builds the `ServerPlayer` with this value via `updateOptions`,
+    /// so it is known before the first chunk is sent).
     Joined {
         id: Uuid,
         name: String,
         outbox: OutboxTx,
+        /// `ClientInformation.viewDistance` — the client's render distance.
+        /// `getPlayerViewDistance` clamps it to `[2, serverViewDistance]`.
+        view_distance: i32,
     },
     /// The connection's read side ended (clean EOF or decode error) — the
     /// player is gone.
@@ -91,10 +97,33 @@ pub enum Serverbound {
     },
     KeepAlive(i64),
     AcceptTeleport(i32),
+    /// `ServerboundClientInformationPacket` — the client resending its settings
+    /// mid-session. Vanilla `ServerPlayer.updateOptions` copies `viewDistance`
+    /// into `requestedViewDistance`, which changes the effective radius
+    /// (`getPlayerViewDistance = clamp(requestedViewDistance, 2,
+    /// serverViewDistance)`) and re-diffs the tracked chunks. Only the view
+    /// distance is surfaced; the other options (language, chat visibility, skin
+    /// customisation, main hand, …) are decoded and dropped.
+    ClientInformation {
+        view_distance: i32,
+    },
+    /// `ServerboundChunkBatchReceivedPacket` — the client acknowledges a chunk
+    /// batch and reports the rate it can sustain (`desiredChunksPerTick`, a
+    /// single float). Feeds the per-player `ChunkSender` throttle
+    /// (`PlayerChunkSender.onChunkBatchReceivedByClient`).
+    ChunkBatchReceived {
+        desired_chunks_per_tick: f32,
+    },
     /// `ServerboundSwingPacket` — an arm swing. `hand` is the `InteractionHand`
     /// ordinal (0 = main hand, 1 = off hand).
     Swing {
         hand: i32,
+    },
+    /// `ServerboundAttackPacket` — the player left-clicked to attack an entity.
+    /// Carries only the target's network entity id. In 26.2 attacks were split
+    /// out of `Interact`, which now covers just right-click/use interactions.
+    Attack {
+        entity_id: i32,
     },
     /// `ServerboundPlayerCommandPacket` — a player state action. `action` is the
     /// `Action` enum ordinal (26.2: 0 STOP_SLEEPING, 1 START_SPRINTING,

@@ -56,30 +56,72 @@ pub fn drain_ingress(world: &mut World) {
     }
     for msg in msgs {
         match msg {
-            ToSim::Joined { id, name, outbox } => {
-                player_lifecycle::on_joined(world, id, name, outbox)
-            }
+            ToSim::Joined {
+                id,
+                name,
+                outbox,
+                view_distance,
+            } => player_lifecycle::on_joined(world, id, name, outbox, view_distance),
             ToSim::Left { id } => player_lifecycle::on_left(world, id),
             ToSim::Packet { id, packet } => packet_handlers::on_packet(world, id, packet),
         }
     }
 }
 
-/// Send keep-alives and disconnect anyone who missed the last one.
+/// Force-disconnect players whose outbox overflowed on an ordering-critical
+/// clientbound packet (flagged by [`Conn::send_reliable`]). Silently dropping a
+/// `set_chunk_center` / `forget_chunk` / chunk-batch frame corrupts the client's
+/// view irrecoverably; vanilla treats an unrecoverable connection overload as a
+/// disconnect, not silent corruption, so we kick the lagging player cleanly.
+///
+/// Exclusive because it despawns entities and fans a removal packet across every
+/// remaining connection. Reuses the normal [`player_lifecycle::despawn_player`]
+/// teardown, so chunk-eviction refcounts (`ChunkRefs::release`) and the entity
+/// despawn run exactly once — the same balanced path a clean `Left` takes. Like
+/// the keep-alive `drop_player` path, `id` is removed from `PlayerIndex` first,
+/// so the eventual `ToSim::Left` (raised when the write task observes the dropped
+/// outbox sender) finds nothing and `on_left` no-ops — no double release.
+pub fn drop_lagging_players(world: &mut World) {
+    let doomed: Vec<(Entity, Uuid)> = {
+        let mut q = world.query::<(Entity, &PlayerId, &Conn)>();
+        q.iter(world)
+            .filter(|(_, _, conn)| conn.disconnect_requested())
+            .map(|(entity, pid, _)| (entity, pid.0))
+            .collect()
+    };
+    for (entity, uuid) in doomed {
+        warn!(%uuid, "client fell too far behind (outbox full on ordering-critical packet); disconnecting");
+        // Best-effort prompt close; if the outbox is full this fails and dropping
+        // the sender (in `despawn`) is what actually ends the write task.
+        if let Some(conn) = world.get::<Conn>(entity) {
+            let _ = conn.outbox.try_send(Outbound::Close);
+        }
+        world.resource_mut::<PlayerIndex>().0.remove(&uuid);
+        player_lifecycle::despawn_player(world, entity, uuid);
+    }
+}
+
+/// Send keep-alives and flag anyone who missed the last one for disconnect.
+///
+/// A timeout (or an overflowed keep-alive send) no longer tears the player down
+/// inline; it flags the connection with [`Conn::request_disconnect`] and lets the
+/// exclusive [`drop_lagging_players`] — which runs immediately after this system
+/// in the same tick — perform the unified teardown. That routes through
+/// [`player_lifecycle::despawn_player`], which saves the player's data, releases
+/// chunk references, and broadcasts the player-info-remove + remove-entities to
+/// every other client, exactly as a clean disconnect does.
 pub fn keepalive(
     tick: Res<Tick>,
-    mut index: ResMut<PlayerIndex>,
-    mut commands: Commands,
-    mut players: Query<(Entity, &PlayerId, &Conn, &mut KeepAlive)>,
+    mut players: Query<(&PlayerId, &Conn, &mut KeepAlive)>,
 ) {
     let now = tick.0;
-    for (entity, pid, conn, mut ka) in players.iter_mut() {
+    for (pid, conn, mut ka) in players.iter_mut() {
         if now.saturating_sub(ka.last_tick) < KEEPALIVE_TICKS {
             continue;
         }
         if ka.awaiting {
             warn!(uuid = %pid.0, "keep-alive timeout");
-            drop_player(&mut commands, &mut index, entity, pid.0, conn);
+            conn.request_disconnect();
             continue;
         }
         ka.id = ka.id.wrapping_add(1);
@@ -90,20 +132,7 @@ pub fn keepalive(
             .try_send(Outbound::Packet(packets::keep_alive(ka.id)))
             .is_err()
         {
-            drop_player(&mut commands, &mut index, entity, pid.0, conn);
+            conn.request_disconnect();
         }
     }
-}
-
-/// Ask a player's write task to close, then despawn the entity and forget it.
-fn drop_player(
-    commands: &mut Commands,
-    index: &mut PlayerIndex,
-    entity: Entity,
-    uuid: Uuid,
-    conn: &Conn,
-) {
-    let _ = conn.outbox.try_send(Outbound::Close);
-    index.0.remove(&uuid);
-    commands.entity(entity).despawn();
 }

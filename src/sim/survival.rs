@@ -598,21 +598,68 @@ pub fn respawn_player(world: &mut World, entity: Entity) {
     // `stream_chunks`, believing the columns are still loaded, sends nothing and
     // the player respawns into an empty world.
     send_to(world, entity, packets::respawn(game_type, 0));
-    let radius = world.resource::<Config>().join_params().view_distance;
+    // `getPlayerViewDistance` clamp, same as the join/streaming paths: honour the
+    // player's requested distance, capped by the server's. The component is attached
+    // at join, so the fallback default is only defensive.
+    let server_view_distance = world.resource::<Config>().0.properties.view_distance();
+    let radius = world
+        .get::<RequestedViewDistance>(entity)
+        .copied()
+        .unwrap_or(RequestedViewDistance(RequestedViewDistance::DEFAULT))
+        .clamped(server_view_distance);
     let center = ((sx.floor() as i32) >> 4, (sz.floor() as i32) >> 4);
     send_to(
         world,
         entity,
         packets::game_event(packets::GAME_EVENT_LEVEL_CHUNKS_LOAD_START, 0.0),
     );
-    send_to(world, entity, packets::set_chunk_center(center.0, center.1));
-    let mut loaded = std::collections::HashSet::new();
+    // Ordering-critical on the respawn re-stream, same as `stream_chunks`: a
+    // dropped SetChunkCacheCenter here strands the whole re-sent spawn region.
+    if let Some(conn) = world.get::<Conn>(entity) {
+        conn.send_reliable(packets::set_chunk_center(center.0, center.1));
+    }
+    // Collect the new spawn region nearest-first — it is *queued* through the
+    // player's chunk sender (like the join path), not blasted, so the respawn re-
+    // stream is paced by the same batch/ack throttle. The `Respawn` packet made the
+    // client drop its level, so every column is re-sent.
+    let mut ordered: Vec<(i32, i32)> = Vec::new();
     for cx in (center.0 - radius - 1)..=(center.0 + radius + 1) {
         for cz in (center.1 - radius - 1)..=(center.1 + radius + 1) {
             if super::chunking::in_view(center, cx, cz, radius) {
-                send_to(world, entity, packets::level_chunk(cx, cz));
-                loaded.insert((cx, cz));
+                ordered.push((cx, cz));
             }
+        }
+    }
+    ordered.sort_by_key(|&(cx, cz)| {
+        let dx = (cx - center.0) as i64;
+        let dz = (cz - center.1) as i64;
+        dx * dx + dz * dz
+    });
+    let loaded: std::collections::HashSet<(i32, i32)> = ordered.iter().copied().collect();
+    // Reset the chunk sender to a fresh `PlayerChunkSender` (vanilla creates a new
+    // `ServerPlayer`, hence a new sender, on respawn) and re-queue the spawn region.
+    if let Some(mut sender) = world.get_mut::<ChunkSender>(entity) {
+        *sender = ChunkSender::new();
+        for &c in &ordered {
+            sender.mark_pending(c);
+        }
+    }
+    // Rebalance chunk references for the swapped view: acquire the new spawn
+    // region *first*, then release the old set, so a column present in both never
+    // transiently falls to zero (and so never needlessly unloads+regenerates).
+    // Columns only the old set held drop to zero here and unload this tick.
+    let old: Vec<(i32, i32)> = world
+        .get::<LoadedChunks>(entity)
+        .map(|lc| lc.loaded.iter().copied().collect())
+        .unwrap_or_default();
+    let game_time = world.resource::<super::world_tick::WorldTime>().game_time;
+    {
+        let mut refs = world.resource_mut::<super::chunking::ChunkRefs>();
+        for &c in &loaded {
+            refs.acquire(c);
+        }
+        for c in old {
+            refs.release(c, game_time);
         }
     }
     if let Some(mut lc) = world.get_mut::<LoadedChunks>(entity) {
@@ -855,7 +902,7 @@ mod tests {
         let entity = world
             .spawn((
                 Profile { name: "tester".into(), entity_id: 7 },
-                Conn { outbox: tx },
+                Conn::new(tx),
                 Health::new(health),
                 FoodData::default(),
             ))

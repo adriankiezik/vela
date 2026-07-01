@@ -112,6 +112,44 @@ impl GameMode {
     }
 }
 
+/// The client's requested view distance, mirroring `ServerPlayer.requestedViewDistance`
+/// (MC 26.2). The client advertises this as the `viewDistance` byte of
+/// `ClientInformation`; the effective streaming radius is `ChunkMap.getPlayerViewDistance`
+/// = `Mth.clamp(requestedViewDistance, 2, serverViewDistance)`, so a client asking for a
+/// *smaller* render distance is honoured, but it can never exceed the server's.
+///
+/// Vanilla constructs the `ServerPlayer` *with* the `ClientInformation` received during
+/// the Configuration phase (`ServerPlayer.<init>` → `updateOptions`), so this field
+/// holds the real client value before any chunk is sent; its `= 2` default is never
+/// actually observed by the chunk-tracking code.
+///
+/// Vela mirrors this: `net::connection` captures the Configuration-phase
+/// `ClientInformation.viewDistance` and carries it across the bridge on
+/// `ToSim::Joined`, so this component is seeded to the real client request at join.
+/// A mid-session `ClientInformation` resend updates it (see
+/// `packet_handlers::on_packet`), which re-diffs the player's tracked chunks via
+/// `chunking::apply_view_distance_change`.
+#[derive(Component, Clone, Copy)]
+pub struct RequestedViewDistance(pub i32);
+
+impl RequestedViewDistance {
+    /// `ServerPlayer.requestedViewDistance`'s initial value (a not-yet-received
+    /// request clamps to the floor of 2).
+    pub const DEFAULT: i32 = 2;
+
+    /// `ChunkMap.getPlayerViewDistance`: `Mth.clamp(requestedViewDistance, 2,
+    /// serverViewDistance)`. Transcribed as vanilla's `Mth.clamp(int)` (`value < min ?
+    /// min : min(value, max)`) rather than `i32::clamp`, which would panic — and pick a
+    /// different result — were `serverViewDistance` ever below the floor of 2.
+    pub fn clamped(self, server_view_distance: i32) -> i32 {
+        if self.0 < 2 {
+            2
+        } else {
+            self.0.min(server_view_distance)
+        }
+    }
+}
+
 /// The set of chunk columns currently streamed to a player, plus the chunk
 /// center the set was last computed around. Mirrors the per-player slice of
 /// vanilla's `ChunkMap`/`PlayerChunkSender` bookkeeping: the streaming system
@@ -127,11 +165,209 @@ pub struct LoadedChunks {
     pub loaded: HashSet<(i32, i32)>,
 }
 
+/// Per-player chunk-send throttle, mirroring vanilla
+/// `net.minecraft.server.network.PlayerChunkSender` (MC 26.2). Every column's
+/// bytes are streamed *only* through this pacer so a fast-travelling player can't
+/// flood the client's decode queue (unbounded streaming balloons the client heap
+/// decoding a multi-thousand-chunk backlog): columns entering view are *marked
+/// pending* here, then drained a bounded number per tick under a quota that only
+/// advances as the client acknowledges the batches it has received.
+///
+/// Field / constant parity with `PlayerChunkSender`:
+/// * `MIN_CHUNKS_PER_TICK = 0.01`, `MAX_CHUNKS_PER_TICK = 64.0`,
+///   `START_CHUNKS_PER_TICK = 9.0`, `MAX_UNACKNOWLEDGED_BATCHES = 10`.
+/// * `desired_chunks_per_tick` (`desiredChunksPerTick`, init 9.0),
+///   `batch_quota` (`batchQuota`), `unacknowledged_batches`
+///   (`unacknowledgedBatches`), `max_unacknowledged_batches`
+///   (`maxUnacknowledgedBatches`, init 1 — raised to 10 on the first ack, so only
+///   one batch is ever outstanding until the client proves it can keep up).
+///
+/// Documented deviation: vanilla keeps `pendingChunks` as an unordered `LongSet`
+/// and re-sorts it by distance to the player's *current* chunk position on every
+/// `collectChunksToSend`. Vela instead keeps `pending` as a `Vec` already ordered
+/// nearest-first at enqueue time (the `collectChunksToSend` distance sort is done
+/// once by `chunk_diff` / the join-and-respawn seed) and drains from the front.
+/// For a steadily-moving player the enqueue-time and drain-time orderings agree;
+/// the only difference is a slightly staler ordering for chunks queued several
+/// ticks before they drain — which affects the *order* of the backlog, never
+/// *which* columns are sent. `memoryConnection` is always `false` here (a real
+/// socket), so only the non-memory branch of `collectChunksToSend` is modelled.
+#[derive(Component)]
+pub struct ChunkSender {
+    /// `desiredChunksPerTick` — the client's most recently requested rate.
+    pub desired_chunks_per_tick: f32,
+    /// `batchQuota` — accumulated fractional send budget.
+    pub batch_quota: f32,
+    /// `unacknowledgedBatches` — batches sent but not yet acked by the client.
+    pub unacknowledged_batches: i32,
+    /// `maxUnacknowledgedBatches` — the outstanding-batch cap (1 until first ack).
+    pub max_unacknowledged_batches: i32,
+    /// `pendingChunks` — columns queued to send, nearest-first, drained front-out.
+    pub pending: Vec<(i32, i32)>,
+}
+
+impl ChunkSender {
+    /// `PlayerChunkSender.MIN_CHUNKS_PER_TICK`.
+    pub const MIN_CHUNKS_PER_TICK: f32 = 0.01;
+    /// `PlayerChunkSender.MAX_CHUNKS_PER_TICK`.
+    pub const MAX_CHUNKS_PER_TICK: f32 = 64.0;
+    /// `PlayerChunkSender.START_CHUNKS_PER_TICK` — initial `desiredChunksPerTick`.
+    pub const START_CHUNKS_PER_TICK: f32 = 9.0;
+    /// `PlayerChunkSender.MAX_UNACKNOWLEDGED_BATCHES`.
+    pub const MAX_UNACKNOWLEDGED_BATCHES: i32 = 10;
+
+    /// A fresh sender, matching `new PlayerChunkSender(memoryConnection=false)`:
+    /// quota empty, no batches outstanding, and `maxUnacknowledgedBatches == 1`.
+    pub fn new() -> Self {
+        Self {
+            desired_chunks_per_tick: Self::START_CHUNKS_PER_TICK,
+            batch_quota: 0.0,
+            unacknowledged_batches: 0,
+            max_unacknowledged_batches: 1,
+            pending: Vec::new(),
+        }
+    }
+
+    /// `markChunkPendingToSend`: queue a column for sending. Callers push in
+    /// nearest-first order and only for columns *newly* entering the loaded set,
+    /// so `pending` stays duplicate-free without a membership scan (the loaded set
+    /// is the dedup gate — see `stream_chunks`).
+    pub fn mark_pending(&mut self, coord: (i32, i32)) {
+        self.pending.push(coord);
+    }
+
+    /// `dropChunk`'s pending half: remove a column that left view before it was
+    /// sent. Returns whether it was still pending — vanilla sends a
+    /// `ForgetLevelChunk` only when it was *not* (the client already has it).
+    pub fn drop_pending(&mut self, coord: (i32, i32)) -> bool {
+        if let Some(i) = self.pending.iter().position(|&c| c == coord) {
+            self.pending.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `onChunkBatchReceivedByClient`: the client acknowledged a batch. Decrement
+    /// the outstanding count (floored at 0), clamp the requested rate (NaN →
+    /// `MIN_CHUNKS_PER_TICK`), reset the quota to 1 when fully caught up, and raise
+    /// the outstanding-batch cap to its steady-state maximum.
+    pub fn on_ack(&mut self, desired_chunks_per_tick: f32) {
+        self.unacknowledged_batches -= 1;
+        if self.unacknowledged_batches < 0 {
+            self.unacknowledged_batches = 0;
+        }
+        self.desired_chunks_per_tick = if desired_chunks_per_tick.is_nan() {
+            Self::MIN_CHUNKS_PER_TICK
+        } else {
+            desired_chunks_per_tick.clamp(Self::MIN_CHUNKS_PER_TICK, Self::MAX_CHUNKS_PER_TICK)
+        };
+        if self.unacknowledged_batches == 0 {
+            self.batch_quota = 1.0;
+        }
+        self.max_unacknowledged_batches = Self::MAX_UNACKNOWLEDGED_BATCHES;
+    }
+
+    /// `sendNextChunks`' quota arithmetic and `collectChunksToSend`'s selection:
+    /// return the columns to send this tick (nearest-first, drained from
+    /// `pending`), or an empty vec when the gate is closed (too many
+    /// unacknowledged batches, quota below one, or nothing pending). On a
+    /// non-empty return the batch is already accounted — the outstanding count is
+    /// incremented and the quota debited by the batch size — exactly as vanilla
+    /// does after emitting the start/finished frames.
+    pub fn next_batch(&mut self) -> Vec<(i32, i32)> {
+        // `if (this.unacknowledgedBatches < this.maxUnacknowledgedBatches)`.
+        if self.unacknowledged_batches >= self.max_unacknowledged_batches {
+            return Vec::new();
+        }
+        // `batchQuota = min(batchQuota + desiredChunksPerTick, max(1.0, desired))`.
+        let max_batch_size = self.desired_chunks_per_tick.max(1.0);
+        self.batch_quota = (self.batch_quota + self.desired_chunks_per_tick).min(max_batch_size);
+        // `if (!(this.batchQuota < 1.0F))` and `if (!this.pendingChunks.isEmpty())`.
+        if self.batch_quota < 1.0 || self.pending.is_empty() {
+            return Vec::new();
+        }
+        // `collectChunksToSend`: up to `Mth.floor(batchQuota)` nearest columns.
+        let count = (self.batch_quota.floor() as usize).min(self.pending.len());
+        if count == 0 {
+            return Vec::new();
+        }
+        let batch: Vec<(i32, i32)> = self.pending.drain(0..count).collect();
+        self.unacknowledged_batches += 1;
+        self.batch_quota -= batch.len() as f32;
+        batch
+    }
+}
+
+impl Default for ChunkSender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The egress side of a player's connection — how the sim talks back. Cheap to
-/// hold: a `tokio` mpsc sender.
+/// hold: a `tokio` mpsc sender plus a "disconnect requested" flag.
+///
+/// The outbox is a *bounded, lossy* channel (`OUTBOX_CAP`): a saturated outbox
+/// means the client can't keep up. Best-effort `try_send` is fine for
+/// idempotent, self-correcting packets (an entity movement delta the next
+/// absolute sync will fix), but silently dropping an *ordering-critical*,
+/// state-establishing packet — `set_chunk_center`, `forget_chunk`, or a chunk
+/// batch frame — desyncs the client's view center irrecoverably (the "Ignoring
+/// chunk since it's not in the view range" spam). Vanilla never silently drops
+/// these: the connection applies TCP backpressure and, on genuine overload,
+/// closes. A desynced client is worse than a disconnected one.
+///
+/// So [`Conn::send_reliable`] flags this connection for a clean forced
+/// disconnect (a "fell too far behind" kick) on overflow instead of dropping.
+/// The flag lives here — behind an `AtomicBool` so it can be raised through the
+/// shared `&Conn` the streaming `Query` yields, without needing `Commands` at
+/// every call site — and an exclusive system ([`super::systems::drop_lagging_players`])
+/// drains it next, reusing the normal despawn/close teardown so chunk-eviction
+/// refcounts stay balanced.
 #[derive(Component)]
 pub struct Conn {
     pub outbox: OutboxTx,
+    /// Raised by [`Conn::send_reliable`] when an ordering-critical send overflows
+    /// the bounded outbox; drained by the disconnect system.
+    disconnect: AtomicBool,
+}
+
+impl Conn {
+    /// Wrap a per-connection outbox sender, initially not flagged for disconnect.
+    pub fn new(outbox: OutboxTx) -> Self {
+        Self {
+            outbox,
+            disconnect: AtomicBool::new(false),
+        }
+    }
+
+    /// Send an *ordering-critical* packet. On outbox overflow, flag this
+    /// connection for a forced disconnect rather than corrupting the client with
+    /// a silent drop. Returns whether it was enqueued (`false` == overflow,
+    /// player now marked for disconnect). Use for `set_chunk_center`,
+    /// `forget_chunk`, and the chunk-batch frames.
+    pub fn send_reliable(&self, bytes: bytes::Bytes) -> bool {
+        if self.outbox.try_send(super::bridge::Outbound::Packet(bytes)).is_ok() {
+            true
+        } else {
+            self.disconnect.store(true, Ordering::Relaxed);
+            false
+        }
+    }
+
+    /// Whether a reliable send has overflowed and this player should be dropped.
+    pub fn disconnect_requested(&self) -> bool {
+        self.disconnect.load(Ordering::Relaxed)
+    }
+
+    /// Explicitly flag this connection for a forced disconnect, routing it through
+    /// the same [`super::systems::drop_lagging_players`] teardown that an overflowed
+    /// `send_reliable` uses. Used by the keep-alive timeout so that path saves player
+    /// data and broadcasts the player-removal exactly like a clean disconnect.
+    pub fn request_disconnect(&self) {
+        self.disconnect.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Per-player keep-alive bookkeeping.
@@ -202,5 +438,137 @@ impl Config {
             online_mode: p.online_mode(),
             game_type: p.gamemode(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkSender, Conn};
+    use bytes::Bytes;
+
+    /// A reliable send into a full outbox flags the connection for disconnect;
+    /// a reliable send with room does not. This is the core of Fix B: an
+    /// ordering-critical packet must never be silently dropped — overflow becomes
+    /// a clean forced disconnect instead. Exercised without a live socket by
+    /// saturating a tiny bounded channel.
+    #[test]
+    fn reliable_send_flags_disconnect_only_on_overflow() {
+        // Capacity-1 outbox; keep the receiver alive so sends fail on *fullness*,
+        // not on a closed channel.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let conn = Conn::new(tx);
+        assert!(!conn.disconnect_requested(), "starts clean");
+
+        // First reliable send fits (fills the single slot) — no disconnect.
+        assert!(conn.send_reliable(Bytes::from_static(b"a")));
+        assert!(!conn.disconnect_requested(), "send with room does not flag");
+
+        // Outbox now full: the next reliable send overflows and flags the player.
+        assert!(!conn.send_reliable(Bytes::from_static(b"b")));
+        assert!(
+            conn.disconnect_requested(),
+            "overflow on an ordering-critical packet marks for disconnect"
+        );
+    }
+
+    /// The flag latches: once raised it stays raised (the exclusive drop system
+    /// reads it next tick), and a later successful send never clears it.
+    #[test]
+    fn disconnect_flag_latches() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let conn = Conn::new(tx);
+        assert!(conn.send_reliable(Bytes::from_static(b"a"))); // fills slot
+        assert!(!conn.send_reliable(Bytes::from_static(b"b"))); // overflow → flag
+        assert!(conn.disconnect_requested());
+        // Draining a slot and sending again succeeds but must not un-flag.
+        rx.try_recv().expect("one queued");
+        assert!(conn.send_reliable(Bytes::from_static(b"c")));
+        assert!(conn.disconnect_requested(), "flag is sticky once raised");
+    }
+
+    /// A fresh sender warms up like vanilla: `maxUnacknowledgedBatches == 1`, so
+    /// exactly one batch of `floor(min(0 + 9, max(1, 9))) = 9` chunks goes out,
+    /// then the gate closes until the client acks. This is the flood brake.
+    #[test]
+    fn first_tick_sends_one_batch_then_blocks_until_ack() {
+        let mut s = ChunkSender::new();
+        for i in 0..100 {
+            s.mark_pending((i, 0));
+        }
+        // Tick 1: 9 chunks (START_CHUNKS_PER_TICK), one batch outstanding.
+        let b = s.next_batch();
+        assert_eq!(b.len(), 9);
+        assert_eq!(s.unacknowledged_batches, 1);
+        assert_eq!(s.pending.len(), 91);
+        // Tick 2..: gated — unacknowledged (1) is not below max (1).
+        assert!(s.next_batch().is_empty());
+        assert!(s.next_batch().is_empty());
+        assert_eq!(s.pending.len(), 91);
+    }
+
+    /// After the first ack the cap rises to `MAX_UNACKNOWLEDGED_BATCHES = 10`, so
+    /// up to ten batches can be outstanding at once before the gate closes again.
+    #[test]
+    fn ack_raises_cap_and_drains_over_multiple_ticks() {
+        let mut s = ChunkSender::new();
+        for i in 0..1000 {
+            s.mark_pending((i, 0));
+        }
+        // Warm-up batch, then ack (client reports it can take 9/tick).
+        assert_eq!(s.next_batch().len(), 9);
+        s.on_ack(9.0);
+        assert_eq!(s.unacknowledged_batches, 0);
+        assert_eq!(s.max_unacknowledged_batches, ChunkSender::MAX_UNACKNOWLEDGED_BATCHES);
+        assert_eq!(s.batch_quota, 1.0); // reset on full catch-up
+
+        // With no acks, at most ten further batches may go out before the gate
+        // shuts, each bounded by the per-tick quota.
+        let mut batches = 0;
+        loop {
+            let b = s.next_batch();
+            if b.is_empty() {
+                break;
+            }
+            batches += 1;
+            assert!(batches <= ChunkSender::MAX_UNACKNOWLEDGED_BATCHES);
+        }
+        assert_eq!(batches, ChunkSender::MAX_UNACKNOWLEDGED_BATCHES);
+        assert_eq!(s.unacknowledged_batches, ChunkSender::MAX_UNACKNOWLEDGED_BATCHES);
+        // Acking one frees exactly one more batch.
+        s.on_ack(9.0);
+        assert_eq!(s.unacknowledged_batches, 9);
+        assert!(!s.next_batch().is_empty());
+    }
+
+    /// `dropChunk`: a column that leaves view while still pending is removed from
+    /// the queue and never sent; `drop_pending` reports whether it was pending.
+    #[test]
+    fn drop_pending_removes_queued_chunk() {
+        let mut s = ChunkSender::new();
+        s.mark_pending((1, 1));
+        s.mark_pending((2, 2));
+        s.mark_pending((3, 3));
+        assert!(s.drop_pending((2, 2)), "was queued");
+        assert!(!s.drop_pending((9, 9)), "never queued");
+        assert_eq!(s.pending, vec![(1, 1), (3, 3)]);
+    }
+
+    /// `onChunkBatchReceivedByClient` decrements the outstanding count, never
+    /// below zero, and clamps the client's requested rate into
+    /// `[MIN, MAX]_CHUNKS_PER_TICK` (NaN maps to MIN).
+    #[test]
+    fn ack_decrements_and_clamps() {
+        let mut s = ChunkSender::new();
+        s.unacknowledged_batches = 2;
+        s.on_ack(1000.0);
+        assert_eq!(s.unacknowledged_batches, 1);
+        assert_eq!(s.desired_chunks_per_tick, ChunkSender::MAX_CHUNKS_PER_TICK);
+        s.on_ack(-5.0);
+        assert_eq!(s.unacknowledged_batches, 0);
+        assert_eq!(s.desired_chunks_per_tick, ChunkSender::MIN_CHUNKS_PER_TICK);
+        // Never underflows below zero.
+        s.on_ack(f32::NAN);
+        assert_eq!(s.unacknowledged_batches, 0);
+        assert_eq!(s.desired_chunks_per_tick, ChunkSender::MIN_CHUNKS_PER_TICK);
     }
 }

@@ -27,6 +27,12 @@ const CB_PLAY_ANIMATE: i32 = 2;
 // SECTION_BLOCKS_UPDATE (line 217 → 84).
 const CB_PLAY_BLOCK_CHANGED_ACK: i32 = 4;
 const CB_PLAY_BLOCK_UPDATE: i32 = 8;
+// Chunk-batch flow-control packets (clientbound registration order, bundle
+// delimiter = index 0): after CHANGE_DIFFICULTY (line 143 → 10) come
+// CHUNK_BATCH_FINISHED (line 144 → 11) then CHUNK_BATCH_START (line 145 → 12) —
+// note the alphabetical order registers *finished* before *start*.
+const CB_PLAY_CHUNK_BATCH_FINISHED: i32 = 11;
+const CB_PLAY_CHUNK_BATCH_START: i32 = 12;
 const CB_PLAY_ENTITY_POSITION_SYNC: i32 = 35;
 const CB_PLAY_FORGET_LEVEL_CHUNK: i32 = 37;
 const CB_PLAY_GAME_EVENT: i32 = 38;
@@ -224,6 +230,25 @@ pub fn set_time(game_time: i64, clocks: &[ClockUpdate]) -> Bytes {
         p.write_f32(c.rate); // ClockNetworkState.rate
     }
     frame(CB_PLAY_SET_TIME, &p.buf)
+}
+
+/// `ClientboundChunkBatchStartPacket` — marks the start of a chunk batch. Empty
+/// body (`ClientboundChunkBatchStartPacket.INSTANCE`); on receipt the client
+/// begins timing how long the batch that follows takes to decode, which feeds the
+/// `desiredChunksPerTick` it reports back (see `chunk_batch_finished`).
+pub fn chunk_batch_start() -> Bytes {
+    frame(CB_PLAY_CHUNK_BATCH_START, &[])
+}
+
+/// `ClientboundChunkBatchFinishedPacket` — marks the end of a chunk batch,
+/// carrying the number of `level_chunk`s it contained as a single VarInt
+/// (`ClientboundChunkBatchFinishedPacket(batchSize)`). The client replies with a
+/// `ServerboundChunkBatchReceived` carrying the rate it can sustain, releasing
+/// the server's next batch (vanilla `PlayerChunkSender`'s ack throttle).
+pub fn chunk_batch_finished(batch_size: i32) -> Bytes {
+    let mut p = PacketWriter::new();
+    p.write_varint(batch_size);
+    frame(CB_PLAY_CHUNK_BATCH_FINISHED, &p.buf)
 }
 
 pub fn set_chunk_center(x: i32, z: i32) -> Bytes {
@@ -848,6 +873,26 @@ mod tests {
         let e1 = r.read_varlong().unwrap();
         assert_eq!(e1 >> 12, 9);
         assert_eq!(e1 & 0xFFF, 15 << 8);
+    }
+
+    #[test]
+    fn chunk_batch_start_layout() {
+        // Empty body; the id must be the registration-order index (12).
+        let (id, mut r) = unframe(chunk_batch_start());
+        assert_eq!(id, CB_PLAY_CHUNK_BATCH_START);
+        assert_eq!(id, 12);
+        assert!(r.read_u8().is_err(), "start packet has no body");
+    }
+
+    #[test]
+    fn chunk_batch_finished_layout() {
+        // One VarInt batch size; id is the registration-order index (11), which
+        // registers *before* start despite the numerically-higher-seeming name.
+        let (id, mut r) = unframe(chunk_batch_finished(9));
+        assert_eq!(id, CB_PLAY_CHUNK_BATCH_FINISHED);
+        // Registers before START despite the name (alphabetical: FINISHED < START).
+        assert_eq!(id, 11);
+        assert_eq!(r.read_varint().unwrap(), 9); // batchSize
     }
 
     #[test]

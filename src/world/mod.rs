@@ -33,7 +33,9 @@ mod light;
 pub mod storage;
 
 pub use block_item::block_state_for_item;
-pub use chunk_data::{block_state_at, chunk_columns, save_dirty_chunks, set_block};
+pub use chunk_data::{
+    block_state_at, chunk_columns, evict_chunk, evict_unused_chunks, save_dirty_chunks, set_block,
+};
 pub use gen::{seed, set_seed, spawn_column, surface_height, DEFAULT_SEED};
 pub use light::ChunkLight;
 
@@ -41,6 +43,14 @@ pub use light::ChunkLight;
 // than named directly, but stays part of the public API surface.
 #[allow(unused_imports)]
 pub use chunk_data::ChunkColumns;
+
+/// Serializes tests that mutate process-wide world singletons — the global chunk
+/// store and the persistence handle. Those tests flip persistence on/off and
+/// assert on eviction, which is only deterministic when no other such test runs
+/// concurrently (cargo runs tests multithreaded). Hold this across the whole test
+/// body; tests that merely read/generate far-apart chunks don't need it.
+#[cfg(test)]
+pub(crate) static WORLD_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// World floor. Sections stack upward from here; the overworld is 384 blocks
 /// tall, so 24 sections of 16.

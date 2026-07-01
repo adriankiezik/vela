@@ -8,15 +8,27 @@ use crate::sim::bridge::Serverbound;
 
 // Serverbound Play packet ids (registration order, decompiled `GameProtocols`).
 const SB_PLAY_ACCEPT_TELEPORTATION: i32 = 0;
+// Attack is index 1 in SERVERBOUND_TEMPLATE (right after ACCEPT_TELEPORTATION).
+// 26.2 split left-click attacks into their own packet, distinct from Interact.
+const SB_PLAY_ATTACK: i32 = 1;
 const SB_PLAY_CHAT_COMMAND: i32 = 7;
 const SB_PLAY_CHAT_COMMAND_SIGNED: i32 = 8;
 const SB_PLAY_CHAT: i32 = 9;
 // ChatSessionUpdate follows Chat in SERVERBOUND_TEMPLATE (line 71 → 10); it
 // publishes the client's chat session (session id + profile public key).
 const SB_PLAY_CHAT_SESSION_UPDATE: i32 = 10;
+// ChunkBatchReceived (client's batch ack + sustainable rate) is index 11 in
+// SERVERBOUND_TEMPLATE (right after CHAT_SESSION_UPDATE at 10).
+const SB_PLAY_CHUNK_BATCH_RECEIVED: i32 = 11;
 // ClientCommand (respawn request / stats) is index 12 in SERVERBOUND_TEMPLATE
 // (CHUNK_BATCH_RECEIVED at 11, CLIENT_COMMAND at 12).
 const SB_PLAY_CLIENT_COMMAND: i32 = 12;
+// ClientInformation (client settings resend) is index 14 in SERVERBOUND_TEMPLATE,
+// right before CommandSuggestion. Same layout as the Configuration-phase packet
+// (`ClientInformation`): readUtf(16) language, `readByte` viewDistance, chatVisibility
+// enum, chatColors bool, unsignedByte modelCustomisation, mainHand enum,
+// textFilteringEnabled bool, allowsListing bool, particleStatus enum.
+const SB_PLAY_CLIENT_INFORMATION: i32 = 14;
 // CommandSuggestion (tab-completion request) is index 15 in SERVERBOUND_TEMPLATE
 // (ACCEPT_TELEPORTATION..COMMAND_SUGGESTION, with CLIENT_INFORMATION at 14).
 const SB_PLAY_COMMAND_SUGGESTION: i32 = 15;
@@ -65,6 +77,11 @@ pub(super) fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbo
         SB_PLAY_ACCEPT_TELEPORTATION => {
             Some(Serverbound::AcceptTeleport(reader.read_varint().ok()?))
         }
+        // ServerboundChunkBatchReceivedPacket: a single float, the rate the client
+        // can sustain (`desiredChunksPerTick`), acknowledging one chunk batch.
+        SB_PLAY_CHUNK_BATCH_RECEIVED => Some(Serverbound::ChunkBatchReceived {
+            desired_chunks_per_tick: reader.read_f32().ok()?,
+        }),
         SB_PLAY_MOVE_PLAYER_POS => decode_move(reader, true, false),
         SB_PLAY_MOVE_PLAYER_POS_ROT => decode_move(reader, true, true),
         SB_PLAY_MOVE_PLAYER_ROT => decode_move(reader, false, true),
@@ -127,6 +144,10 @@ pub(super) fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbo
         // ordinal via a VarInt (0 = main hand, 1 = off hand).
         SB_PLAY_SWING => Some(Serverbound::Swing {
             hand: reader.read_varint().ok()?,
+        }),
+        // ServerboundAttackPacket: a single VarInt — the attacked entity's id.
+        SB_PLAY_ATTACK => Some(Serverbound::Attack {
+            entity_id: reader.read_varint().ok()?,
         }),
         // ServerboundPlayerCommandPacket: entity id (the sender's own, dropped),
         // then the `Action` ordinal, then a VarInt data argument.
@@ -229,6 +250,19 @@ pub(super) fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbo
         SB_PLAY_CLIENT_COMMAND => Some(Serverbound::ClientCommand {
             action: reader.read_varint().ok()?,
         }),
+        // ServerboundClientInformationPacket (`SB_PLAY_CLIENT_INFORMATION`): a client
+        // resending its settings mid-session. Vanilla `ServerPlayer.updateOptions`
+        // copies `viewDistance` into `requestedViewDistance`; because the effective
+        // radius is `getPlayerViewDistance = clamp(requestedViewDistance, 2,
+        // serverViewDistance)`, a changed view distance must then re-diff the player's
+        // tracked chunks. The body is `language` (String<=16) then the `viewDistance`
+        // byte; the remaining options (chat visibility, skin customisation, main hand,
+        // …) are decoded past but dropped — only the view distance drives server state.
+        SB_PLAY_CLIENT_INFORMATION => {
+            let _language = reader.read_utf(16).ok()?;
+            let view_distance = reader.read_u8().ok()? as i32;
+            Some(Serverbound::ClientInformation { view_distance })
+        }
         _ => None,
     }
 }

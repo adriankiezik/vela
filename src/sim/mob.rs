@@ -26,16 +26,16 @@
 //! * **Speed** is a per-kind blocks/tick constant chosen for a plausible stroll,
 //!   *not* derived from the `MOVEMENT_SPEED` attribute × navigation math (Vela has
 //!   no attribute system yet).
-//! * **Health/damage**: health is modelled and synced, but there is no damage
-//!   source wired in — [`damage`] is a ready seam for the survival/combat
-//!   milestone. Death removes the entity.
+//! * **Health/damage**: health is modelled and synced, and [`damage`] applies the
+//!   vanilla `LivingEntity.hurtServer` i-frame gate (`invulnerableTime`/`lastHurt`).
+//!   There is still no full damage *source* (knockback, attacker-relative hurt
+//!   direction, armour/absorption). Death removes the entity.
 
 use bevy_ecs::prelude::*;
 use bytes::Bytes;
 use rand::Rng;
 
-use super::bridge::{Outbound, OutboxTx};
-use super::components::{Conn, LoadedChunks, Pos, Tick};
+use super::components::{LoadedChunks, Pos, Tick};
 use super::entity::syncher::{DataValue, EntityData};
 use super::entity::{
     remove_entity, spawn_net_entity, EntityMeta, NetEntity, ENTITY_DATA_SHARED_FLAGS,
@@ -60,9 +60,17 @@ const STROLL_RADIUS: f64 = 8.0;
 const STROLL_MAX_TICKS: u32 = 100;
 /// Distance at which the mob is considered to have arrived at its target.
 const ARRIVE_DIST: f64 = 0.7;
-/// A fluttering mob (chicken) never falls faster than this — its wing-flap slow
-/// descent, an approximation of `Chicken`'s reduced fall speed.
-const FLUTTER_MAX_FALL: f64 = 0.1;
+/// `Chicken.aiStep`: while airborne and descending, `deltaMovement.y` is scaled by
+/// this each tick (`movement.multiply(1.0, 0.6, 1.0)`), giving the wing-flap slow
+/// descent — a decaying multiplier, not a hard fall-speed cap.
+const CHICKEN_FALL_MULTIPLIER: f64 = 0.6;
+/// `LivingEntity.hurtServer` invulnerability window: a fresh hit sets
+/// `invulnerableTime` to 20; while it is `> INVULNERABLE_GATE` (the first 10 ticks)
+/// only the excess over `lastHurt` lands. Both are the vanilla constants.
+const INVULNERABLE_TIME: i32 = 20;
+const INVULNERABLE_GATE: i32 = 10;
+/// `LivingEntity.hurtDuration` — the red hurt-flash timer set on a full hit.
+const HURT_DURATION: i32 = 10;
 
 /// The passive-mob kinds Vela spawns. A deliberately small set (the task's
 /// "pig, cow, sheep, chicken at minimum"); more kinds slot in by extending this
@@ -159,6 +167,16 @@ pub struct MobState {
     /// Last-broadcast packed yaw / on-ground, so a change forces the right packet.
     base_yaw: i8,
     base_on_ground: bool,
+    /// `LivingEntity.invulnerableTime` — the i-frame counter, set to 20 on a full
+    /// hit and decremented each tick. While `> INVULNERABLE_GATE`, only damage
+    /// exceeding `last_hurt` lands (see [`damage`]).
+    invulnerable_time: i32,
+    /// `LivingEntity.hurtTime` — the hurt-flash timer, set to `HURT_DURATION` on a
+    /// full hit and decremented each tick. Tracked for parity; not otherwise read.
+    hurt_time: i32,
+    /// `LivingEntity.lastHurt` — the damage of the most recent hit within the
+    /// i-frame window, used to compute the marginal damage of a re-hit.
+    last_hurt: f32,
 }
 
 impl MobState {
@@ -174,6 +192,9 @@ impl MobState {
             base_z: z,
             base_yaw: packets::pack_angle(yaw),
             base_on_ground: false,
+            invulnerable_time: 0,
+            hurt_time: 0,
+            last_hurt: 0.0,
         }
     }
 }
@@ -201,11 +222,47 @@ fn spawn_metadata(kind: MobKind, health: f32, rng: &mut impl Rng) -> EntityData 
     meta.set(LIVING_ENTITY_DATA_HEALTH, DataValue::Float(health));
     if kind == MobKind::Sheep {
         // Low nibble is the DyeColor id (0..=15); high bits (incl. 0x10 sheared)
-        // stay clear. A random natural colour is a nice type-specific touch.
-        let colour = rng.gen_range(0u8..16);
-        meta.set(SHEEP_DATA_WOOL, DataValue::Byte(colour));
+        // stay clear.
+        meta.set(SHEEP_DATA_WOOL, DataValue::Byte(random_sheep_color(rng)));
     }
     meta
+}
+
+/// A naturally-spawned sheep's wool colour, as a `DyeColor` id nibble.
+///
+/// Mirrors `SheepColorSpawnRules.getSheepColor` using the `TEMPERATE_SPAWN_CONFIGURATION`
+/// (overworld default): a weighted pick of BLACK/GRAY/LIGHT_GRAY 5, BROWN 3, and a
+/// WHITE `commonColors` block of 82 — which is itself WHITE 499 / PINK 1. Vanilla
+/// selects the outer weighted list, then the inner one, so the two draws are kept.
+/// DyeColor ids: WHITE=0, PINK=6, GRAY=7, LIGHT_GRAY=8, BROWN=12, BLACK=15.
+///
+/// TODO: biome-specific variance is omitted — `getSheepColorConfiguration` swaps in
+/// `WARM_SPAWN_CONFIGURATION` (BiomeTags.SPAWNS_WARM_VARIANT_FARM_ANIMALS, mostly
+/// BROWN) and `COLD_SPAWN_CONFIGURATION` (SPAWNS_COLD_VARIANT_FARM_ANIMALS, mostly
+/// BLACK). Vela's biome tags aren't wired to the spawn site, so all sheep use the
+/// temperate table.
+fn random_sheep_color(rng: &mut impl Rng) -> u8 {
+    // Outer weighted list (total 100), mirroring the builder's insertion.
+    const BLACK: u8 = 15;
+    const GRAY: u8 = 7;
+    const LIGHT_GRAY: u8 = 8;
+    const BROWN: u8 = 12;
+    match rng.gen_range(0u32..100) {
+        0..=4 => BLACK,        // weight 5
+        5..=9 => GRAY,         // weight 5
+        10..=14 => LIGHT_GRAY, // weight 5
+        15..=17 => BROWN,      // weight 3
+        // weight 82: the WHITE commonColors block — WHITE 499 / PINK 1 (total 500).
+        _ => {
+            const WHITE: u8 = 0;
+            const PINK: u8 = 6;
+            if rng.gen_range(0u32..500) == 499 {
+                PINK
+            } else {
+                WHITE
+            }
+        }
+    }
 }
 
 /// Spawn a passive mob of `kind` at `pos` facing a random yaw, pairing it to every
@@ -233,6 +290,15 @@ pub fn spawn_mob(world: &mut World, kind: MobKind, pos: (f64, f64, f64)) -> i32 
 /// gravity, integrate, and clamp onto a solid block below. Mutates `st`/`pos` in
 /// place and returns whether the mob's facing changed enough to resend.
 fn step_mob(kind: MobKind, st: &mut MobState, pos: &mut Pos, rng: &mut impl Rng) {
+    // --- LivingEntity.tick: decrement the hit timers (mobs are never ServerPlayer,
+    // so invulnerableTime always ticks down here). ---
+    if st.hurt_time > 0 {
+        st.hurt_time -= 1;
+    }
+    if st.invulnerable_time > 0 {
+        st.invulnerable_time -= 1;
+    }
+
     // --- RandomStrollGoal: acquire a target ---
     if st.target.is_none() && rng.gen_ratio(1, STROLL_INTERVAL) {
         let tx = pos.x + rng.gen_range(-STROLL_RADIUS..STROLL_RADIUS);
@@ -266,9 +332,6 @@ fn step_mob(kind: MobKind, st: &mut MobState, pos: &mut Pos, rng: &mut impl Rng)
 
     // --- applyGravity ---
     st.vy -= LIVING_GRAVITY;
-    if kind.flutters() && st.vy < -FLUTTER_MAX_FALL {
-        st.vy = -FLUTTER_MAX_FALL;
-    }
 
     // --- move(deltaMovement): integrate + resolve a downward collision ---
     let nx = pos.x + st.vx;
@@ -294,6 +357,13 @@ fn step_mob(kind: MobKind, st: &mut MobState, pos: &mut Pos, rng: &mut impl Rng)
     // Vertical air drag; horizontal velocity is re-derived from the target each
     // tick, so no residual horizontal drag is needed.
     st.vy *= AIR_DRAG;
+
+    // --- Chicken.aiStep: `if (!onGround && deltaMovement.y < 0.0)` scale the
+    // downward velocity by 0.6, applied after move/drag — a decaying flutter, not a
+    // hard cap. ---
+    if kind.flutters() && !on_ground && st.vy < 0.0 {
+        st.vy *= CHICKEN_FALL_MULTIPLIER;
+    }
 }
 
 /// The mob behavior system: wander AI, physics, and movement broadcast for every
@@ -312,15 +382,14 @@ pub fn mob_tick(world: &mut World) {
         world.entity_mut(e).insert(MobState::new(x, y, z, yaw));
     }
 
-    let mut emissions: Vec<((i32, i32), Bytes)> = Vec::new();
+    let mut emissions: Vec<(Entity, Bytes)> = Vec::new();
 
     {
         let mut rng = rand::thread_rng();
-        let mut q = world.query::<(&NetEntity, &Mob, &mut Pos, &mut MobState)>();
-        for (net, mob, mut pos, mut st) in q.iter_mut(world) {
+        let mut q = world.query::<(Entity, &NetEntity, &Mob, &mut Pos, &mut MobState)>();
+        for (entity, net, mob, mut pos, mut st) in q.iter_mut(world) {
             step_mob(mob.kind, &mut st, &mut pos, &mut rng);
 
-            let chunk = chunk_of(pos.x, pos.z);
             let yaw_n = packets::pack_angle(pos.yaw);
 
             // Position delta from the last-sent base (vanilla VecDeltaCodec).
@@ -339,7 +408,7 @@ pub fn mob_tick(world: &mut World) {
                 // A relative delta won't do (too large, or the on-ground flag
                 // flipped): resync absolutely.
                 emissions.push((
-                    chunk,
+                    entity,
                     packets::entity_position_sync(
                         net.id, pos.x, pos.y, pos.z, pos.yaw, pos.pitch, pos.on_ground,
                     ),
@@ -349,10 +418,10 @@ pub fn mob_tick(world: &mut World) {
                 st.base_z = pos.z;
                 st.base_yaw = yaw_n;
                 st.base_on_ground = pos.on_ground;
-                emissions.push((chunk, packets::rotate_head(net.id, yaw_n)));
+                emissions.push((entity, packets::rotate_head(net.id, yaw_n)));
             } else if moved {
                 emissions.push((
-                    chunk,
+                    entity,
                     packets::move_entity_pos_rot(
                         net.id,
                         dx as i16,
@@ -368,14 +437,14 @@ pub fn mob_tick(world: &mut World) {
                 st.base_z = pos.z;
                 if turned {
                     st.base_yaw = yaw_n;
-                    emissions.push((chunk, packets::rotate_head(net.id, yaw_n)));
+                    emissions.push((entity, packets::rotate_head(net.id, yaw_n)));
                 }
             } else if turned {
                 emissions.push((
-                    chunk,
+                    entity,
                     packets::move_entity_rot(net.id, yaw_n, pos.pitch as i8, pos.on_ground),
                 ));
-                emissions.push((chunk, packets::rotate_head(net.id, yaw_n)));
+                emissions.push((entity, packets::rotate_head(net.id, yaw_n)));
                 st.base_yaw = yaw_n;
             }
         }
@@ -384,25 +453,13 @@ pub fn mob_tick(world: &mut World) {
     flush_emissions(world, &emissions);
 }
 
-/// Fan queued per-chunk packets out to every player whose loaded-chunk set covers
-/// the source column — the same delivery the item/entity paths use.
-fn flush_emissions(world: &mut World, emissions: &[((i32, i32), Bytes)]) {
-    if emissions.is_empty() {
-        return;
-    }
-    let conns: Vec<(std::collections::HashSet<(i32, i32)>, OutboxTx)> = {
-        let mut q = world.query::<(&LoadedChunks, &Conn)>();
-        q.iter(world)
-            .map(|(l, c)| (l.loaded.clone(), c.outbox.clone()))
-            .collect()
-    };
-    for (chunk, pkt) in emissions {
-        for (loaded, outbox) in &conns {
-            if loaded.contains(chunk) {
-                let _ = outbox.try_send(Outbound::Packet(pkt.clone()));
-            }
-        }
-    }
+/// Fan queued per-entity packets out to each source entity's tracking set,
+/// mirroring `ServerEntity.sendToTrackingPlayers` — the same delivery the generic
+/// entity path uses (see [`super::entity::fan_to_seen`]). Keying by the source ECS
+/// entity (not its chunk) is what keeps movement fan-out identical to the spawn
+/// pairing: a player is fed a mob iff the mob is spawned on their client.
+fn flush_emissions(world: &mut World, emissions: &[(Entity, Bytes)]) {
+    super::entity::fan_to_seen(world, emissions);
 }
 
 // --- Natural spawning --------------------------------------------------------
@@ -417,6 +474,14 @@ const MOB_CAP: usize = 15;
 /// Min/max horizontal distance from a player to place a natural spawn.
 const SPAWN_MIN_DIST: f64 = 8.0;
 const SPAWN_MAX_DIST: f64 = 24.0;
+/// Vanilla passive-animal pack size. Every overworld farm animal (pig/cow/sheep/
+/// chicken) carries `minCount == maxCount == 4` in its biome `SpawnerData`, so a
+/// group is 4 (`NaturalSpawner.spawnCategoryForPosition`:
+/// `max = minCount + random.nextInt(1 + maxCount - minCount)`).
+const PACK_SIZE: usize = 4;
+/// The per-member scatter of a pack (`x += nextInt(6) - nextInt(6)`), from the same
+/// `spawnCategoryForPosition` inner loop.
+const PACK_SPREAD: i32 = 6;
 
 /// A player snapshot for the spawner: position and the columns they have loaded
 /// (so a spawn is only placed where a viewer will actually see it).
@@ -426,11 +491,41 @@ struct PlayerSnap {
     loaded: std::collections::HashSet<(i32, i32)>,
 }
 
-/// A simple natural spawner: every [`SPAWN_ATTEMPT_INTERVAL`] ticks, if the world
-/// holds fewer than [`MOB_CAP`] mobs and at least one player is online, place one
-/// random passive mob on the surface a short distance from a random player — but
-/// only where that column is already loaded (so the spawn has viewers and stands
-/// on real terrain). Registered before `mob_tick` in the schedule.
+/// The spawn floor `y` at column `(bx, bz)` if a passive animal may stand there,
+/// else `None`. Mirrors the block half of `Animal.checkAnimalSpawnRules`: the block
+/// below must be in the `ANIMALS_SPAWNABLE_ON` tag — which for MC 26.2 is exactly
+/// `minecraft:grass_block` (`data/minecraft/tags/block/animals_spawnable_on.json`).
+/// Vela reads the surface block directly, which also rejects ocean/sand/beach
+/// columns for free (their surface block is sand/gravel, not grass).
+///
+/// TODO(light): the other half of `checkAnimalSpawnRules` is
+/// `isBrightEnoughToSpawn` → `getRawBrightness(pos, 0) > 8`. Vela's per-chunk
+/// [`crate::world::ChunkLight`] has no world-position brightness accessor exposed
+/// here, so the light gate is omitted. It is moot at a `surface + 1` open-sky
+/// column (sky light is 15 there), but would matter for cave/overhang spawns Vela
+/// does not attempt yet.
+fn animal_spawn_floor(bx: i32, bz: i32) -> Option<i32> {
+    let surface = crate::world::surface_height(bx, bz);
+    let grass =
+        crate::registry::block_state::default_state_of("minecraft:grass_block").map(crate::ids::BlockState)?;
+    (crate::world::block_state_at(bx, surface, bz) == grass).then_some(surface + 1)
+}
+
+/// A natural spawner: every [`SPAWN_ATTEMPT_INTERVAL`] ticks, if the world holds
+/// fewer than [`MOB_CAP`] mobs and at least one player is online, pick a ring
+/// position a short distance from a random player and try to spawn a *pack* of one
+/// passive kind there — mirroring `NaturalSpawner.spawnCategoryForPosition`'s inner
+/// scatter loop (up to [`PACK_SIZE`] members, each offset by `±nextInt(PACK_SPREAD)`
+/// from the anchor and validated independently). Each member must land on a loaded
+/// column standing on a `grass_block` (see [`animal_spawn_floor`]). Registered
+/// before `mob_tick` in the schedule.
+///
+/// TODO(caps/biome): vanilla gates spawns by [`MobCategory`] per-player-chunk caps
+/// (`NaturalSpawner.SpawnState`) and draws types from the biome's
+/// `MobSpawnSettings` weighted list. Vela has neither the per-category accounting
+/// nor biome spawn lists plumbed to this site, so it keeps a single global
+/// [`MOB_CAP`] and a uniform pick over [`MobKind::ALL`]. Faking per-category caps or
+/// biome weights without that data would be wrong, so they are left out.
 pub fn mob_spawn(world: &mut World) {
     let tick = world.resource::<Tick>().0;
     if !tick.is_multiple_of(SPAWN_ATTEMPT_INTERVAL) {
@@ -454,43 +549,91 @@ pub fn mob_spawn(world: &mut World) {
 
     let mut rng = rand::thread_rng();
     let anchor = &players[rng.gen_range(0..players.len())];
-    // Random point in a ring around the player.
+    // Random point in a ring around the player — the pack's anchor block.
     let angle = rng.gen_range(0.0f64..std::f64::consts::TAU);
     let dist = rng.gen_range(SPAWN_MIN_DIST..SPAWN_MAX_DIST);
-    let x = anchor.x + angle.cos() * dist;
-    let z = anchor.z + angle.sin() * dist;
-    if !anchor.loaded.contains(&chunk_of(x, z)) {
-        return; // no viewer has this column loaded — skip this attempt.
-    }
-    let y = (crate::world::surface_height(x.floor() as i32, z.floor() as i32) + 1) as f64;
+    let mut bx = (anchor.x + angle.cos() * dist).floor() as i32;
+    let mut bz = (anchor.z + angle.sin() * dist).floor() as i32;
 
-    // Centre the mob on the block it spawns over, like vanilla's `+ 0.5` offset.
-    let pos = (x.floor() + 0.5, y, z.floor() + 0.5);
+    // One kind per pack, like vanilla's single `SpawnerData` per group.
     let kind = MobKind::ALL[rng.gen_range(0..MobKind::ALL.len())];
-    let id = spawn_mob(world, kind, pos);
-    tracing::debug!(?kind, id, x = pos.0, y = pos.1, z = pos.2, "spawned passive mob");
+    let loaded = &anchor.loaded;
+    let mut placed = 0usize;
+
+    for _ in 0..PACK_SIZE {
+        // Scatter this member: `x += nextInt(6) - nextInt(6)`.
+        bx += rng.gen_range(0..PACK_SPREAD) - rng.gen_range(0..PACK_SPREAD);
+        bz += rng.gen_range(0..PACK_SPREAD) - rng.gen_range(0..PACK_SPREAD);
+
+        if mob_count + placed >= MOB_CAP {
+            break;
+        }
+        if !loaded.contains(&chunk_of(bx as f64, bz as f64)) {
+            continue; // no viewer has this column loaded — skip this member.
+        }
+        let Some(floor_y) = animal_spawn_floor(bx, bz) else {
+            continue; // block below isn't grass — not a valid animal spawn.
+        };
+
+        // Centre the mob on the block it spawns over, like vanilla's `+ 0.5` offset.
+        let pos = (bx as f64 + 0.5, floor_y as f64, bz as f64 + 0.5);
+        let id = spawn_mob(world, kind, pos);
+        placed += 1;
+        tracing::debug!(?kind, id, x = pos.0, y = pos.1, z = pos.2, "spawned passive mob");
+    }
 }
 
 // --- Damage seam (for the survival/combat milestone) -------------------------
-/// Apply `amount` damage to a mob, syncing the new health to viewers and returning
-/// `true` if the blow was fatal (the caller should then [`remove_entity`] it, which
-/// this does). A clean seam for the combat milestone: there is no damage *source*
-/// (attacker, knockback, i-frames, `HurtAnimation`) yet — only the health field
-/// and its metadata sync, which is the part the mob model owns.
-#[allow(dead_code)]
+/// Apply `amount` damage to a mob, syncing the new health to viewers, playing the
+/// hurt-animation flash, and returning `true` if the blow was fatal (in which case
+/// it also [`remove_entity`]s the corpse). The player→mob half of combat calls
+/// this from `packet_handlers::on_attack`.
+///
+/// Replicates `LivingEntity.hurtServer`'s i-frame gate 1:1 (minus the damage-source
+/// tags / blocking / knockback Vela has no model for): a fresh hit sets
+/// `invulnerableTime` to 20 and `lastHurt` to the amount; while `invulnerableTime`
+/// is still in the first 10 ticks (`> 10`) a re-hit only lands its excess over
+/// `lastHurt` (`amount - lastHurt`), and is cancelled entirely if `amount <=
+/// lastHurt`. `invulnerableTime`/`hurtTime` decrement each mob tick (see
+/// [`step_mob`], mirroring `LivingEntity.tick`). A full hit plays the flash
+/// (`broadcastDamageEvent`); a partial re-hit reduces health silently, matching
+/// vanilla's `tookFullDamage == false` path.
 pub fn damage(world: &mut World, entity: Entity, amount: f32) -> bool {
-    let (net_id, chunk, dead, new_health) = {
+    // `if (damage < 0.0F) damage = 0.0F;`
+    let amount = amount.max(0.0);
+
+    // i-frame gate (LivingEntity.hurtServer). Returns the damage that actually
+    // lands and whether this was a full hit (flash + timer reset). Mobs are seeded
+    // with MobState by `spawn_mob`; a missing one is treated as a fresh full hit.
+    let (applied, full_hit) = match world.get_mut::<MobState>(entity) {
+        Some(mut st) => {
+            if st.invulnerable_time > INVULNERABLE_GATE {
+                if amount <= st.last_hurt {
+                    return false; // within i-frames and no stronger than the last hit
+                }
+                let marginal = amount - st.last_hurt;
+                st.last_hurt = amount;
+                (marginal, false)
+            } else {
+                st.last_hurt = amount;
+                st.invulnerable_time = INVULNERABLE_TIME;
+                st.hurt_time = HURT_DURATION;
+                (amount, true)
+            }
+        }
+        None => (amount, true),
+    };
+
+    let (net_id, dead, new_health) = {
         let Some(mut health) = world.get_mut::<Health>(entity) else {
             return false;
         };
-        health.current = (health.current - amount).max(0.0);
+        health.current = (health.current - applied).max(0.0);
         let dead = health.current <= 0.0;
         let new_health = health.current;
-        let net_id = world.get::<NetEntity>(entity).map(|n| n.id);
-        let chunk = world.get::<Pos>(entity).map(|p| chunk_of(p.x, p.z));
-        match (net_id, chunk) {
-            (Some(id), Some(c)) => (id, c, dead, new_health),
-            _ => return false,
+        match world.get::<NetEntity>(entity).map(|n| n.id) {
+            Some(id) => (id, dead, new_health),
+            None => return false,
         }
     };
 
@@ -503,7 +646,14 @@ pub fn damage(world: &mut World, entity: Entity, amount: f32) -> bool {
         let meta = world.get::<EntityMeta>(entity).expect("mob has EntityMeta");
         super::entity::packets::set_entity_data(net_id, &meta.0)
     };
-    flush_emissions(world, &[(chunk, data)]);
+    // Full hits play the red hurt-animation flash (yaw 0.0 — no attacker-relative
+    // lean yet); a partial re-hit within i-frames updates health silently.
+    if full_hit {
+        let hurt = super::entity::packets::hurt_animation(net_id, 0.0);
+        flush_emissions(world, &[(entity, data), (entity, hurt)]);
+    } else {
+        flush_emissions(world, &[(entity, data)]);
+    }
 
     if dead {
         remove_entity(world, entity);
@@ -515,7 +665,8 @@ pub fn damage(world: &mut World, entity: Entity, amount: f32) -> bool {
 mod tests {
     use super::*;
     use crate::protocol::buffer::PacketReader;
-    use crate::sim::components::NextEntityId;
+    use crate::sim::bridge::Outbound;
+    use crate::sim::components::{ChunkSender, Conn, NextEntityId};
     // The generic net-entity spawn/metadata packets live in the entity submodule
     // (8-arg `add_entity`, `EntityData`-taking `set_entity_data`), distinct from
     // the player-specific builders in `super::packets`.
@@ -540,11 +691,15 @@ mod tests {
     fn spawn_viewer(world: &mut World, chunks: &[(i32, i32)]) -> mpsc::Receiver<Outbound> {
         let (tx, rx) = mpsc::channel(256);
         world.spawn((
-            Conn { outbox: tx },
+            Conn::new(tx),
             LoadedChunks {
                 center: (0, 0),
                 loaded: chunks.iter().copied().collect::<HashSet<_>>(),
             },
+            // Real players always carry a ChunkSender (see `stream_chunks`); the
+            // entity-tracking snapshot now requires it. Empty `pending` means every
+            // loaded column counts as tracked, matching this fixture's intent.
+            ChunkSender::new(),
             // Give the viewer a position so the natural spawner can key off it.
             Pos { x: 0.0, y: 64.0, z: 0.0, yaw: 0.0, pitch: 0.0, on_ground: true },
         ));

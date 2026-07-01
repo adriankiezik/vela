@@ -135,6 +135,69 @@ pub fn save_chunk(
     region.write_chunk(lx, lz, &body)
 }
 
+/// Close every cached region file whose region holds no chunk in `keep_chunks`
+/// (the live working set), returning the number closed. Each open `RegionFile`
+/// pins a ~10 KB header/bitmap **and an OS file handle**; without this the cache
+/// grows one entry per region ever touched as a player travels, leaking handles.
+/// A region is closed by dropping it from the map — pending writes already went
+/// straight to the file (`std::fs::File` is unbuffered), so we `flush` (fsync)
+/// first only for durability. The next touch of that region reopens it lazily.
+pub fn evict_regions_except(keep_chunks: &std::collections::HashSet<(i32, i32)>) -> usize {
+    let mut guard = storage().lock().expect("storage mutex poisoned");
+    let Some(storage) = guard.as_mut() else {
+        return 0;
+    };
+    let needed: std::collections::HashSet<(i32, i32)> = keep_chunks
+        .iter()
+        .map(|&(cx, cz)| (cx >> 5, cz >> 5))
+        .collect();
+    evict_regions_from(&mut storage.regions, &needed)
+}
+
+/// The region-eviction core, factored out of the global-storage wrapper so it can
+/// be unit-tested against a local map. Retains regions in `needed` and closes the
+/// rest (fsyncing each first for durability). Returns the number closed.
+fn evict_regions_from(
+    regions: &mut HashMap<(i32, i32), RegionFile>,
+    needed: &std::collections::HashSet<(i32, i32)>,
+) -> usize {
+    let before = regions.len();
+    regions.retain(|key, region| {
+        if needed.contains(key) {
+            return true;
+        }
+        if let Err(e) = region.flush() {
+            warn!(rx = key.0, rz = key.1, error = %e, "failed to flush region file before closing");
+        }
+        false
+    });
+    before - regions.len()
+}
+
+/// Close the cached region file for `(rx, rz)`, fsyncing it first for durability,
+/// if it is currently open. Called by [`super::evict_chunk`] when the region's
+/// last resident chunk is evicted, so the open-file-handle cache stays bounded on
+/// the incremental unload path (the single-region counterpart to
+/// [`evict_regions_except`]). A no-op — returning `false` — when persistence is
+/// off or the region isn't cached. The next touch of the region reopens it
+/// lazily. Returns whether a handle was closed.
+pub fn close_region(rx: i32, rz: i32) -> bool {
+    let mut guard = storage().lock().expect("storage mutex poisoned");
+    let Some(storage) = guard.as_mut() else {
+        return false;
+    };
+    // Dropping the `RegionFile` closes it; pending writes already went straight to
+    // the file (`std::fs::File` is unbuffered), so we `flush` (fsync) only for
+    // durability before it goes away.
+    if let Some(mut region) = storage.regions.remove(&(rx, rz)) {
+        if let Err(e) = region.flush() {
+            warn!(rx, rz, error = %e, "failed to flush region file before closing");
+        }
+        return true;
+    }
+    false
+}
+
 /// Flush all open region files to the OS (called on periodic save / shutdown).
 pub fn flush() {
     let mut guard = storage().lock().expect("storage mutex poisoned");
@@ -231,12 +294,92 @@ fn decode_chunk(cx: i32, cz: i32, bytes: &[u8]) -> Option<Vec<BlockState>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn region_eviction_closes_unreferenced_regions() {
+        use std::collections::HashSet;
+        // Build a *local* region map from temp files so this never touches the
+        // process-wide storage handle (no lock, no race). Two regions open;
+        // keeping a chunk only in region (0,0) must close region (2,2).
+        let dir = std::env::temp_dir().join(format!(
+            "vela-region-evict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut regions: HashMap<(i32, i32), RegionFile> = HashMap::new();
+        regions.insert((0, 0), RegionFile::open(&dir.join("r.0.0.mca")).unwrap());
+        regions.insert((2, 2), RegionFile::open(&dir.join("r.2.2.mca")).unwrap());
+
+        // Keep chunk (5,5) → region (0,0); region (2,2) has no kept chunk.
+        let needed: HashSet<(i32, i32)> = [(0, 0)].into_iter().collect();
+        let closed = evict_regions_from(&mut regions, &needed);
+
+        assert_eq!(closed, 1, "the unreferenced region is closed");
+        assert!(regions.contains_key(&(0, 0)), "the referenced region stays open");
+        assert!(!regions.contains_key(&(2, 2)), "the unreferenced region is dropped");
+
+        // Confirm the wrapper derives regions from chunk coords: chunk (5,5) → (0,0).
+        assert_eq!((5i32 >> 5, 5i32 >> 5), (0, 0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `close_region` closes exactly the named region's cached handle on the
+    /// incremental unload path (called when a region's last resident chunk is
+    /// evicted), leaving other regions open. Installs a temp global handle under
+    /// the world-state lock, then restores it.
+    #[test]
+    fn close_region_closes_only_the_named_region() {
+        let _guard = crate::world::WORLD_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "vela-close-region-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("region")).unwrap();
+
+        // Install a temp storage handle with two regions open.
+        {
+            let mut guard = storage().lock().expect("storage mutex poisoned");
+            let mut regions: HashMap<(i32, i32), RegionFile> = HashMap::new();
+            regions.insert((0, 0), RegionFile::open(&root.join("region/r.0.0.mca")).unwrap());
+            regions.insert((3, 4), RegionFile::open(&root.join("region/r.3.4.mca")).unwrap());
+            *guard = Some(Storage { root: root.clone(), regions });
+        }
+
+        assert!(close_region(3, 4), "an open region is closed and reports true");
+        assert!(!close_region(3, 4), "closing an already-closed region is a no-op");
+        {
+            let guard = storage().lock().expect("storage mutex poisoned");
+            let s = guard.as_ref().unwrap();
+            assert!(s.regions.contains_key(&(0, 0)), "the other region stays open");
+            assert!(!s.regions.contains_key(&(3, 4)), "the named region is closed");
+        }
+
+        // Persistence off: nothing to close.
+        {
+            let mut guard = storage().lock().expect("storage mutex poisoned");
+            *guard = None;
+        }
+        assert!(!close_region(0, 0), "no-op when persistence is disabled");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// End-to-end: init a temp world, save an edited chunk, drop the region
     /// cache, and reload it — the decoded grid must match what we saved.
     #[test]
     fn chunk_survives_a_region_round_trip() {
         // Use a unique temp cwd-relative level name so the global handle points at
         // an isolated directory. We restore the previous handle afterwards.
+        let _guard = crate::world::WORLD_STATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let name = format!(
             "vela-world-test-{}-{}",
             std::process::id(),

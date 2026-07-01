@@ -36,6 +36,9 @@ const OUTBOX_CAP: usize = 1024;
 /// `framing::compress` before it hits the socket, and the read task inflates
 /// inbound frames via `read_frame`. This keeps the compression transform wholly
 /// inside `net`.
+// Each argument is a distinct per-connection handle threaded from the login/config
+// handshake into Play; bundling them into a struct would only add indirection.
+#[allow(clippy::too_many_arguments)]
 pub async fn play(
     rd: NetReadHalf,
     wr: NetWriteHalf,
@@ -44,6 +47,7 @@ pub async fn play(
     name: String,
     to_sim: mpsc::Sender<ToSim>,
     compression: Option<i32>,
+    view_distance: i32,
 ) -> io::Result<()> {
     let (out_tx, out_rx) = mpsc::channel::<Outbound>(OUTBOX_CAP);
 
@@ -54,6 +58,7 @@ pub async fn play(
             id: uuid,
             name: name.clone(),
             outbox: out_tx,
+            view_distance,
         })
         .await
         .is_err()
