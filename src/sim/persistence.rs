@@ -12,6 +12,8 @@
 //! (`chunk_data`): a chunk loads from its region file on first touch and dirty
 //! chunks are written by [`crate::world::save_dirty_chunks`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bevy_ecs::prelude::*;
 use tracing::{info, warn};
 
@@ -63,6 +65,12 @@ pub fn boot(world: &mut World) {
     }
 }
 
+/// Ticks elapsed since the last autosave. Tracked here (rather than gating on
+/// `game_time % INTERVAL`) so the save fires strictly every `AUTOSAVE_INTERVAL`
+/// elapsed ticks — never at boot (`game_time == 0`) and never every tick if the
+/// world clock is frozen (e.g. `doDaylightCycle`/paused time).
+static TICKS_SINCE_SAVE: AtomicU64 = AtomicU64::new(0);
+
 /// Periodic save: flush dirty chunks and rewrite `level.dat`, gated on the
 /// autosave interval. Safe to call every tick — it self-gates and no-ops when
 /// persistence is disabled.
@@ -70,10 +78,11 @@ pub fn autosave(world: &mut World) {
     if !storage::is_enabled() {
         return;
     }
-    let game_time = world.resource::<WorldTime>().game_time;
-    if game_time % AUTOSAVE_INTERVAL as i64 != 0 {
+    if TICKS_SINCE_SAVE.fetch_add(1, Ordering::Relaxed) + 1 < AUTOSAVE_INTERVAL {
         return;
     }
+    TICKS_SINCE_SAVE.store(0, Ordering::Relaxed);
+    let game_time = world.resource::<WorldTime>().game_time;
     crate::world::save_dirty_chunks(game_time);
     save_level_dat(world);
     info!(game_time, "autosaved world");

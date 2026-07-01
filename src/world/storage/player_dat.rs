@@ -79,20 +79,40 @@ impl PlayerData {
         })
     }
 
-    /// Write to `dir/<uuid>.dat` as gzip-compressed NBT.
+    /// Write to `dir/<uuid>.dat` as gzip-compressed NBT, using the atomic
+    /// safe-replace pattern (temp + fsync + rename, keeping `<uuid>.dat_old`)
+    /// so a crash mid-write cannot corrupt the player's live data. Matches
+    /// vanilla `PlayerDataStorage.save`.
     pub fn save(&self, dir: &Path, uuid: Uuid) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
         let mut body = BytesMut::new();
         nbt::write_named(&mut body, "", &self.to_nbt());
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(&body)?;
-        std::fs::write(player_path(dir, uuid), enc.finish()?)
+        super::safe_replace(&player_path(dir, uuid), &enc.finish()?)
     }
 
     /// Read `dir/<uuid>.dat`. `None` if the player has no saved data yet; an
-    /// `Err` for an unreadable/corrupt file.
+    /// `Err` for an unreadable/corrupt file. Falls back to the `<uuid>.dat_old`
+    /// safe-replace backup if the primary file is missing or fails to decode,
+    /// matching vanilla `PlayerDataStorage.load`.
     pub fn load(dir: &Path, uuid: Uuid) -> io::Result<Option<Self>> {
-        let gz = match std::fs::read(player_path(dir, uuid)) {
+        let primary = player_path(dir, uuid);
+        match Self::load_file(&primary) {
+            Ok(Some(data)) => Ok(Some(data)),
+            // Primary absent or corrupt: try the `_old` fallback before giving up.
+            Ok(None) | Err(_) => {
+                let mut old = primary.into_os_string();
+                old.push("_old");
+                Self::load_file(Path::new(&old))
+            }
+        }
+    }
+
+    /// Read one gzip-NBT player file. `None` if absent; an `Err` for an
+    /// unreadable/corrupt file.
+    fn load_file(path: &Path) -> io::Result<Option<Self>> {
+        let gz = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),

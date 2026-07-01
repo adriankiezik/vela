@@ -25,7 +25,8 @@ pub mod player_dat;
 mod region;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use tracing::{warn, error};
@@ -108,30 +109,29 @@ pub fn load_chunk(cx: i32, cz: i32) -> Option<Vec<BlockState>> {
     }
 }
 
-/// Serialize and write chunk `(cx, cz)` to its region file. A no-op when
-/// persistence is off. Errors are logged, not propagated — a failed save must
-/// not crash the tick.
+/// Serialize and write chunk `(cx, cz)` to its region file. `Ok(())` when
+/// persistence is off (nothing to do). Propagates region-open and write errors
+/// so the caller can keep the chunk dirty and retry on the next save — a failed
+/// write must never silently drop the edit.
 pub fn save_chunk(
     cx: i32,
     cz: i32,
     heights: &[i32; super::COLUMNS],
     edits: &HashMap<u32, BlockState>,
     game_time: i64,
-) {
+) -> io::Result<()> {
     let mut guard = storage().lock().expect("storage mutex poisoned");
     let Some(storage) = guard.as_mut() else {
-        return;
+        return Ok(());
     };
     let tag = chunk_nbt::to_nbt(cx, cz, heights, edits, game_time);
     let mut body = bytes::BytesMut::new();
     crate::protocol::nbt::write_named(&mut body, "", &tag);
     let (lx, lz) = local(cx, cz);
-    let Some(region) = storage.region(cx, cz) else {
-        return;
-    };
-    if let Err(e) = region.write_chunk(lx, lz, &body) {
-        warn!(cx, cz, error = %e, "failed to write chunk to region");
-    }
+    let region = storage.region(cx, cz).ok_or_else(|| {
+        io::Error::other(format!("failed to open region for chunk ({cx}, {cz})"))
+    })?;
+    region.write_chunk(lx, lz, &body)
 }
 
 /// Flush all open region files to the OS (called on periodic save / shutdown).
@@ -169,6 +169,41 @@ impl Storage {
         }
         self.regions.get_mut(&key)
     }
+}
+
+/// Atomically replace `path`'s contents with `bytes`, keeping the previous
+/// version as `<path>_old`. Mirrors vanilla's safe-write pattern
+/// (`LevelStorageSource`/`PlayerDataStorage`): write to a `<path>.tmp` sibling,
+/// fsync it, roll the current file aside to `<path>_old`, then rename the temp
+/// over the target. On any interruption the old file survives as the `_old`
+/// fallback rather than leaving a half-written target.
+fn safe_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = with_suffix(path, ".tmp");
+    let old = with_suffix(path, "_old");
+
+    // Write the new contents to the temp file and force them to disk before we
+    // touch the live target.
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+
+    // Roll the current file (if any) aside as the `_old` fallback, then move the
+    // freshly-synced temp into place.
+    if path.exists() {
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(path, &old)?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Append a suffix to the final path component (`foo.dat` + `_old` -> `foo.dat_old`).
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 /// The chunk's local coordinates within its region (`chunk & 31`).
@@ -233,7 +268,7 @@ mod tests {
         };
         edits.insert(key(2, 120, 3), BlockState(1)); // stone
         edits.insert(key(2, 121, 3), BlockState(10)); // dirt
-        save_chunk(cx, cz, &heights, &edits, 7);
+        save_chunk(cx, cz, &heights, &edits, 7).expect("save");
 
         // Drop the region cache so the reload opens the file fresh from disk.
         {

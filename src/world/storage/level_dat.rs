@@ -144,14 +144,16 @@ impl LevelData {
         })
     }
 
-    /// Write to `path` as gzip-compressed, empty-named-root NBT.
+    /// Write to `path` as gzip-compressed, empty-named-root NBT, using the
+    /// atomic safe-replace pattern (temp + fsync + rename, keeping `<path>_old`)
+    /// so a crash mid-write cannot corrupt the live `level.dat`.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut body = BytesMut::new();
         nbt::write_named(&mut body, "", &self.to_nbt());
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(&body)?;
         let gz = enc.finish()?;
-        std::fs::write(path, gz)
+        super::safe_replace(path, &gz)
     }
 
     /// Read from `path`, decompressing gzip and parsing the NBT. Returns `None`

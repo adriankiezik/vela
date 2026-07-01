@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use tracing::warn;
+
 use crate::ids::BlockState;
 
 use super::encoding::encode_blob;
@@ -238,8 +240,15 @@ pub fn save_dirty_chunks(game_time: i64) {
     let mut guard = store().lock().expect("chunk store mutex poisoned");
     for ((cx, cz), chunk) in guard.iter_mut() {
         if chunk.dirty {
-            super::storage::save_chunk(*cx, *cz, &chunk.heights, &chunk.edits, game_time);
-            chunk.dirty = false;
+            match super::storage::save_chunk(*cx, *cz, &chunk.heights, &chunk.edits, game_time) {
+                // Only clear the dirty flag once the write succeeds; on failure
+                // leave it set so the next autosave retries rather than dropping
+                // the edit.
+                Ok(()) => chunk.dirty = false,
+                Err(e) => {
+                    warn!(cx, cz, error = %e, "failed to save chunk; will retry next autosave");
+                }
+            }
         }
     }
     drop(guard);

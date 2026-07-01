@@ -7,11 +7,16 @@
 pub(super) fn pack_bits(values: &[u64], bits: u32) -> Vec<u64> {
     let per_long = (64 / bits) as usize;
     let long_count = values.len().div_ceil(per_long);
+    // Mask each value to `bits` before OR-ing it in, matching vanilla
+    // `SimpleBitStorage` (`values[...] & this.mask`) so out-of-range bits can
+    // never bleed into the neighbouring slot. Defensive: current callers are all
+    // in range.
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
     let mut longs = vec![0u64; long_count];
     for (i, &v) in values.iter().enumerate() {
         let long = i / per_long;
         let offset = (i % per_long) as u32 * bits;
-        longs[long] |= v << offset;
+        longs[long] |= (v & mask) << offset;
     }
     longs
 }

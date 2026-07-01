@@ -195,9 +195,11 @@ impl RegionFile {
         self.locations[index(local_x, local_z)] != 0
     }
 
-    /// Flush buffered writes to the OS.
+    /// Force all buffered writes and metadata to the physical disk (`fsync`).
+    /// `File::flush` is a no-op for `std::fs::File`, so we call `sync_all` to get
+    /// a real durability barrier at save/shutdown time.
     pub fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.file.sync_all()
     }
 
     /// Write the 8192-byte header (locations then timestamps) back to disk.
