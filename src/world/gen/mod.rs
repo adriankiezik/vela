@@ -78,7 +78,12 @@ fn field_seed(salt: u32) -> u32 {
 
 /// The terrain surface height (topmost solid block y) for a world column.
 /// Deterministic in `(wx, wz)` and continuous, so adjacent chunks line up.
+/// In parity mode this reads the pipeline's `OCEAN_FLOOR_WG` instead, so
+/// spawn placement and mob logic see the real generated terrain.
 pub fn surface_height(wx: i32, wz: i32) -> i32 {
+    if parity_enabled() {
+        return pipeline::surface_height(wx, wz);
+    }
     let hs = field_seed(HEIGHT_SALT);
     let cont = noise::fbm2(wx as f64 / 400.0, wz as f64 / 400.0, hs, 4);
     let hills = noise::fbm2(wx as f64 / 120.0, wz as f64 / 120.0, field_seed(HILL_SALT), 3);
@@ -116,6 +121,11 @@ pub struct GenChunk {
     /// light engine read O(1) instead of re-evaluating the noise per pass. Empty
     /// for the test-only `simple` chunk, which computes columns arithmetically.
     grid: Vec<BlockState>,
+    /// Parity mode only: per-column *surface* biome as a parameter-list fill
+    /// value (see [`pipeline::biome_network_id_of`]); when set, it overrides
+    /// the legacy `biomes` for the wire/disk palettes. 2-D projection of the
+    /// pipeline's 3-D quart biomes — cave biomes aren't client-visible yet.
+    parity_biomes: Option<Box<[u16; COLUMNS]>>,
     /// `WORLD_SURFACE` / `MOTION_BLOCKING` first-empty y per column (fast path for
     /// the unedited heightmap).
     ws_top: [i32; COLUMNS],
@@ -133,9 +143,25 @@ fn grid_index(lx: i32, world_y: i32, lz: i32) -> usize {
     ((world_y - MIN_Y) as usize) * COLUMNS + (lz * 16 + lx) as usize
 }
 
+/// Whether the live path runs the vanilla-parity pipeline instead of the
+/// legacy generator — opt-in via `VELA_PARITY_WORLDGEN=1` while the parity
+/// stack is still growing (carvers P7, features P8: parity worlds currently
+/// have no trees/ores-features/decorations). The two generators produce
+/// unrelated terrain for the same seed, so switch only on a fresh world dir
+/// (a saved chunk diffs against whichever baseline regenerates).
+fn parity_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VELA_PARITY_WORLDGEN").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 impl GenChunk {
     /// Generate the baseline for chunk `(cx, cz)`.
     pub fn generate(cx: i32, cz: i32) -> Self {
+        if parity_enabled() {
+            return Self::generate_parity(cx, cz);
+        }
         let mut heights = [0i32; COLUMNS];
         let mut biomes = [Biome::Plains; COLUMNS];
         for lz in 0..16i32 {
@@ -182,6 +208,37 @@ impl GenChunk {
         let mut this = Self {
             heights,
             biomes,
+            parity_biomes: None,
+            grid,
+            ws_top: [MIN_Y; COLUMNS],
+            mb_top: [MIN_Y; COLUMNS],
+            simple: false,
+        };
+        this.compute_tops();
+        this
+    }
+
+    /// The vanilla-parity baseline: one FULL chunk from the staged pipeline
+    /// (biomes → noise → surface; carvers/features pending P7/P8), mapped
+    /// from parity blocks to real block-state ids. `FilledChunk` and the
+    /// baseline grid share the same `(y − MIN_Y) · 256 + lz·16 + lx` layout,
+    /// so the mapping is a straight per-cell translation.
+    fn generate_parity(cx: i32, cz: i32) -> Self {
+        let parity = pipeline::generate_full(cx, cz);
+        assert_eq!(parity.blocks.min_y, MIN_Y, "parity generator height must match the world");
+        assert_eq!(parity.blocks.height, MAX_Y_EXCL - MIN_Y);
+        let grid: Vec<BlockState> =
+            parity.blocks.blocks.iter().map(|&b| pipeline::block_state_of(b)).collect();
+        let mut heights = [0i32; COLUMNS];
+        for (col, h) in heights.iter_mut().enumerate() {
+            // OCEAN_FLOOR_WG (fluids excluded) matches the legacy "topmost
+            // solid block" meaning of `heights`/`surface_height`.
+            *h = (parity.blocks.ocean_floor_wg[col] - 1).max(MIN_Y);
+        }
+        let mut this = Self {
+            heights,
+            biomes: [Biome::Plains; COLUMNS], // shadowed by `parity_biomes`
+            parity_biomes: Some(Box::new(parity.surface_biomes)),
             grid,
             ws_top: [MIN_Y; COLUMNS],
             mb_top: [MIN_Y; COLUMNS],
@@ -198,6 +255,7 @@ impl GenChunk {
         let mut this = Self {
             heights: [height; COLUMNS],
             biomes: [Biome::Plains; COLUMNS],
+            parity_biomes: None,
             grid: Vec::new(),
             ws_top: [MIN_Y; COLUMNS],
             mb_top: [MIN_Y; COLUMNS],
@@ -248,12 +306,20 @@ impl GenChunk {
 
     /// The network biome id at a column (for the biome `PalettedContainer`).
     pub fn biome_id(&self, lx: i32, lz: i32) -> u32 {
-        self.biomes[(lz * 16 + lx) as usize].network_id()
+        let col = (lz * 16 + lx) as usize;
+        match &self.parity_biomes {
+            Some(fills) => pipeline::biome_network_id_of(fills[col]),
+            None => self.biomes[col].network_id(),
+        }
     }
 
     /// The biome registry id string at a column (for the disk biome palette).
     pub fn biome_name(&self, lx: i32, lz: i32) -> &'static str {
-        self.biomes[(lz * 16 + lx) as usize].name()
+        let col = (lz * 16 + lx) as usize;
+        match &self.parity_biomes {
+            Some(fills) => pipeline::biome_name_of(fills[col]),
+            None => self.biomes[col].name(),
+        }
     }
 
     /// `WORLD_SURFACE` first-empty y for an unedited column.
@@ -326,7 +392,12 @@ pub fn spawn_column() -> (i32, i32) {
                     continue;
                 }
                 let (x, z) = (dx * 8, dz * 8);
-                if surface_height(x, z) > SEA_LEVEL && biome_at(x, z) != Biome::Ocean {
+                // In parity mode a solid surface above sea level already
+                // implies dry land; the legacy biome check reads the legacy
+                // climate field and would be meaningless there.
+                if surface_height(x, z) > SEA_LEVEL
+                    && (parity_enabled() || biome_at(x, z) != Biome::Ocean)
+                {
                     return (x, z);
                 }
             }

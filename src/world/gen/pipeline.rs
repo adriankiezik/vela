@@ -587,6 +587,149 @@ impl ChunkPipeline {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The live path (behind VELA_PARITY_WORLDGEN)
+// ---------------------------------------------------------------------------
+
+/// One chunk extracted from the pipeline for the live world: the surfaced
+/// blocks plus the per-column *surface* biome (the parameter-list fill value
+/// at each column's top-block quart). The 2-D projection is a wire-side
+/// simplification — Vela's chunk encoder still sends one biome per column, so
+/// cave biomes aren't visible client-side yet; the stored 3-D quarts remain
+/// in the pipeline for worldgen itself.
+pub struct ParityChunk {
+    pub blocks: FilledChunk,
+    pub surface_biomes: [u16; 256],
+}
+
+/// A `Send` wrapper for the mutex-guarded global pipeline. The parity engine
+/// uses `Rc` internally (single-threaded by design), which makes
+/// `ChunkPipeline: !Send`; moving the *whole* pipeline between threads is
+/// still sound because every `Rc` clone lives inside it — nothing handed out
+/// of this module carries one (`ParityChunk` is plain data, the mapping
+/// tables hold leaked strs and ids) — so no reference count is ever touched
+/// from two threads. All access goes through the `Mutex`.
+struct SendPipeline(ChunkPipeline);
+// SAFETY: see above — the pipeline's Rc graph is fully owned by the value,
+// never aliased outside the mutex guard.
+unsafe impl Send for SendPipeline {}
+
+impl std::ops::Deref for SendPipeline {
+    type Target = ChunkPipeline;
+    fn deref(&self) -> &ChunkPipeline {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SendPipeline {
+    fn deref_mut(&mut self) -> &mut ChunkPipeline {
+        &mut self.0
+    }
+}
+
+/// The process-wide pipeline the live generator draws from, seeded once from
+/// the world seed (like the legacy generator's `RUNTIME_SEED`).
+fn global() -> &'static std::sync::Mutex<SendPipeline> {
+    static PIPELINE: OnceLock<std::sync::Mutex<SendPipeline>> = OnceLock::new();
+    PIPELINE.get_or_init(|| {
+        std::sync::Mutex::new(SendPipeline(ChunkPipeline::new_overworld(super::seed() as i64)))
+    })
+}
+
+/// Above this many resident proto-chunks, trim the trail: keep only the
+/// neighborhood of the chunk just consumed. Dropped protos regenerate
+/// deterministically if revisited; this only bounds memory (a surfaced proto
+/// is ~100 KiB), it never changes output.
+const PROTO_CACHE_LIMIT: usize = 2048;
+const PROTO_KEEP_RADIUS: i32 = 16;
+
+/// Generate chunk `(cx, cz)` to FULL through the pipeline and extract it.
+/// The consumed proto leaves the cache (its data moves into the returned
+/// `ParityChunk`); partially generated neighbors stay resident so the
+/// dependency pyramid amortizes as the player moves.
+pub fn generate_full(cx: i32, cz: i32) -> ParityChunk {
+    let mut pipeline = global().lock().expect("parity pipeline mutex poisoned");
+    pipeline.advance(cx, cz, ChunkStatus::Full);
+    let proto = pipeline.chunks.remove(&(cx, cz)).expect("chunk just advanced");
+    let blocks = proto.blocks.expect("FULL chunk has blocks");
+    let sections = proto.biome_sections.expect("FULL chunk has biomes");
+
+    let min_section_y = blocks.min_y >> 4;
+    let quart_min_y = blocks.min_y >> 2;
+    let quart_max_y = (blocks.min_y + blocks.height - 1) >> 2;
+    let mut surface_biomes = [0u16; 256];
+    for lz in 0..16i32 {
+        for lx in 0..16i32 {
+            let col = (lz * 16 + lx) as usize;
+            let top = (blocks.world_surface_wg[col] - 1).max(blocks.min_y);
+            let (qx, qz) = ((cx * 16 + lx) >> 2, (cz * 16 + lz) >> 2);
+            let qy = (top >> 2).clamp(quart_min_y, quart_max_y);
+            let section = &sections[((qy >> 2) - min_section_y) as usize];
+            surface_biomes[col] = section[((((qy & 3) * 4) + (qz & 3)) * 4 + (qx & 3)) as usize];
+        }
+    }
+
+    if pipeline.chunks.len() > PROTO_CACHE_LIMIT {
+        pipeline
+            .chunks
+            .retain(|pos, _| chessboard_distance(*pos, (cx, cz)) <= PROTO_KEEP_RADIUS);
+    }
+    ParityChunk { blocks, surface_biomes }
+}
+
+/// The terrain surface height (topmost solid block y) at a world column,
+/// parity edition: `OCEAN_FLOOR_WG` (fluids excluded, like the legacy
+/// height field) read from the pipeline after surfacing the owning chunk.
+/// Cached by the proto cache, so repeated probes in one area are cheap.
+pub fn surface_height(wx: i32, wz: i32) -> i32 {
+    let mut pipeline = global().lock().expect("parity pipeline mutex poisoned");
+    let (cx, cz) = (wx >> 4, wz >> 4);
+    pipeline.advance(cx, cz, ChunkStatus::Surface);
+    let blocks = pipeline.chunks[&(cx, cz)].blocks.as_ref().expect("surfaced chunk has blocks");
+    blocks.ocean_floor_wg[((wz & 15) * 16 + (wx & 15)) as usize] - 1
+}
+
+/// The real block-state id for a parity block, resolved once per variant from
+/// the block registry (unresolvable names fall back to stone, keeping
+/// generation total — same policy as the legacy palette in `blocks.rs`).
+pub fn block_state_of(block: ParityBlock) -> crate::ids::BlockState {
+    static TABLE: OnceLock<[crate::ids::BlockState; ParityBlock::ALL.len()]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        ParityBlock::ALL.map(|b| {
+            let fallback = if b == ParityBlock::Air { 0 } else { 1 };
+            crate::ids::BlockState(
+                crate::registry::block_state::default_state_of(b.block_name()).unwrap_or(fallback),
+            )
+        })
+    })[block as usize]
+}
+
+/// Per parameter-list fill value: the biome's registry name (leaked once —
+/// the set is the 55 parameter-list biomes) and its synced network id.
+fn biome_table() -> &'static Vec<(&'static str, u32)> {
+    static TABLE: OnceLock<Vec<(&'static str, u32)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let pipeline = global().lock().expect("parity pipeline mutex poisoned");
+        (0..pipeline.generator.source.biome_count())
+            .map(|i| {
+                let name: &'static str =
+                    Box::leak(pipeline.generator.source.biome_name(i as u16).to_owned().into());
+                (name, super::biome::network_id(name))
+            })
+            .collect()
+    })
+}
+
+/// The `minecraft:` biome id for a stored fill value (disk biome palettes).
+pub fn biome_name_of(fill: u16) -> &'static str {
+    biome_table()[fill as usize].0
+}
+
+/// The synced-registry network index for a stored fill value (wire palettes).
+pub fn biome_network_id_of(fill: u16) -> u32 {
+    biome_table()[fill as usize].1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +809,43 @@ mod tests {
         assert_eq!(p.step_to(Full).accumulated_radius_of(Full), 0);
         assert_eq!(p.step_to(Features).direct_dependencies.radius_of(Carvers), 1);
         assert_eq!(p.step_to(Features).direct_dependencies.radius_of(StructureStarts), 8);
+    }
+
+    /// Every parity block resolves to a distinct real block-state id (a
+    /// missing registry name would collapse onto the stone/air fallback and
+    /// collide), and every parameter-list biome resolves to a distinct synced
+    /// network id (a missing biome would collapse onto index 0).
+    #[test]
+    fn live_mapping_tables_resolve() {
+        let mut block_ids: Vec<_> = ParityBlock::ALL.iter().map(|&b| block_state_of(b)).collect();
+        block_ids.sort_by_key(|s| s.0);
+        block_ids.dedup();
+        assert_eq!(block_ids.len(), ParityBlock::ALL.len(), "parity block mapping collided");
+        assert_eq!(block_state_of(ParityBlock::Air).0, 0);
+
+        let count = global().lock().unwrap().generator.source.biome_count();
+        let mut biome_ids: Vec<_> = (0..count as u16).map(biome_network_id_of).collect();
+        biome_ids.sort_unstable();
+        biome_ids.dedup();
+        assert_eq!(biome_ids.len(), count, "parity biome mapping collided");
+        for fill in 0..count as u16 {
+            assert!(biome_name_of(fill).starts_with("minecraft:"));
+        }
+    }
+
+    /// The live extraction path: a FULL chunk leaves the cache with blocks
+    /// and a plausible per-column surface biome, and the parity
+    /// `surface_height` matches the extracted heightmap.
+    #[test]
+    fn live_generate_full_smoke() {
+        let height = surface_height(8, 8); // surfaces the chunk via the global pipeline
+        let chunk = generate_full(0, 0);
+        assert_eq!(chunk.blocks.ocean_floor_wg[(8 * 16 + 8) as usize] - 1, height);
+        assert_eq!(chunk.blocks.block(0, chunk.blocks.min_y, 0), ParityBlock::Bedrock);
+        let top = chunk.blocks.min_y + chunk.blocks.height - 1;
+        assert_eq!(chunk.blocks.block(8, top, 8), ParityBlock::Air);
+        let count = global().lock().unwrap().generator.source.biome_count() as u16;
+        assert!(chunk.surface_biomes.iter().all(|&f| f < count));
     }
 
     #[test]

@@ -1544,6 +1544,91 @@ pub enum ParityBlock {
 }
 
 impl ParityBlock {
+    /// Every parity block, in discriminant order (index `b as usize`).
+    pub const ALL: [ParityBlock; 37] = [
+        ParityBlock::Air,
+        ParityBlock::Stone,
+        ParityBlock::Water,
+        ParityBlock::Lava,
+        ParityBlock::Granite,
+        ParityBlock::CopperOre,
+        ParityBlock::RawCopperBlock,
+        ParityBlock::Tuff,
+        ParityBlock::DeepslateIronOre,
+        ParityBlock::RawIronBlock,
+        ParityBlock::Bedrock,
+        ParityBlock::Deepslate,
+        ParityBlock::GrassBlock,
+        ParityBlock::Dirt,
+        ParityBlock::CoarseDirt,
+        ParityBlock::Podzol,
+        ParityBlock::Mycelium,
+        ParityBlock::Mud,
+        ParityBlock::Sand,
+        ParityBlock::Sandstone,
+        ParityBlock::RedSand,
+        ParityBlock::RedSandstone,
+        ParityBlock::Gravel,
+        ParityBlock::Calcite,
+        ParityBlock::Cinnabar,
+        ParityBlock::Sulfur,
+        ParityBlock::SnowBlock,
+        ParityBlock::PowderSnow,
+        ParityBlock::Ice,
+        ParityBlock::PackedIce,
+        ParityBlock::Terracotta,
+        ParityBlock::WhiteTerracotta,
+        ParityBlock::OrangeTerracotta,
+        ParityBlock::YellowTerracotta,
+        ParityBlock::BrownTerracotta,
+        ParityBlock::RedTerracotta,
+        ParityBlock::LightGrayTerracotta,
+    ];
+
+    /// The `minecraft:` block id this parity block resolves to in the real
+    /// block registry (the live-path mapping back to wire block states).
+    pub fn block_name(self) -> &'static str {
+        match self {
+            ParityBlock::Air => "minecraft:air",
+            ParityBlock::Stone => "minecraft:stone",
+            ParityBlock::Water => "minecraft:water",
+            ParityBlock::Lava => "minecraft:lava",
+            ParityBlock::Granite => "minecraft:granite",
+            ParityBlock::CopperOre => "minecraft:copper_ore",
+            ParityBlock::RawCopperBlock => "minecraft:raw_copper_block",
+            ParityBlock::Tuff => "minecraft:tuff",
+            ParityBlock::DeepslateIronOre => "minecraft:deepslate_iron_ore",
+            ParityBlock::RawIronBlock => "minecraft:raw_iron_block",
+            ParityBlock::Bedrock => "minecraft:bedrock",
+            ParityBlock::Deepslate => "minecraft:deepslate",
+            ParityBlock::GrassBlock => "minecraft:grass_block",
+            ParityBlock::Dirt => "minecraft:dirt",
+            ParityBlock::CoarseDirt => "minecraft:coarse_dirt",
+            ParityBlock::Podzol => "minecraft:podzol",
+            ParityBlock::Mycelium => "minecraft:mycelium",
+            ParityBlock::Mud => "minecraft:mud",
+            ParityBlock::Sand => "minecraft:sand",
+            ParityBlock::Sandstone => "minecraft:sandstone",
+            ParityBlock::RedSand => "minecraft:red_sand",
+            ParityBlock::RedSandstone => "minecraft:red_sandstone",
+            ParityBlock::Gravel => "minecraft:gravel",
+            ParityBlock::Calcite => "minecraft:calcite",
+            ParityBlock::Cinnabar => "minecraft:cinnabar",
+            ParityBlock::Sulfur => "minecraft:sulfur",
+            ParityBlock::SnowBlock => "minecraft:snow_block",
+            ParityBlock::PowderSnow => "minecraft:powder_snow",
+            ParityBlock::Ice => "minecraft:ice",
+            ParityBlock::PackedIce => "minecraft:packed_ice",
+            ParityBlock::Terracotta => "minecraft:terracotta",
+            ParityBlock::WhiteTerracotta => "minecraft:white_terracotta",
+            ParityBlock::OrangeTerracotta => "minecraft:orange_terracotta",
+            ParityBlock::YellowTerracotta => "minecraft:yellow_terracotta",
+            ParityBlock::BrownTerracotta => "minecraft:brown_terracotta",
+            ParityBlock::RedTerracotta => "minecraft:red_terracotta",
+            ParityBlock::LightGrayTerracotta => "minecraft:light_gray_terracotta",
+        }
+    }
+
     /// The `minecraft:` block id → parity block, for the surface-rule JSON's
     /// `result_state` entries.
     pub fn from_name(name: &str) -> Option<ParityBlock> {
