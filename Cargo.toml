@@ -42,3 +42,10 @@ thiserror = "2"
 [profile.release]
 opt-level = 3
 lto = true
+
+# The worldgen suite (Perlin/noise/density loops, full-chunk golden fixtures) is
+# numeric-heavy and runs unbearably slow at the default debug `opt-level = 0`.
+# Optimizing the test profile cuts the suite's wall time by roughly an order of
+# magnitude for a modest one-time compile cost; debug-info is kept for backtraces.
+[profile.test]
+opt-level = 2
