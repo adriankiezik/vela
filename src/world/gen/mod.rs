@@ -14,6 +14,7 @@
 
 mod biome;
 mod blocks;
+pub mod carvers;
 pub mod climate;
 pub mod density;
 mod feature;

@@ -16,11 +16,12 @@
 //! (aquifers/ore veins included), SURFACE applies the surface rules over the
 //! biomes *stored* in the 3×3 neighborhood (exactly vanilla, which reads
 //! neighbor chunks at ≥ BIOMES through the region rather than resampling).
-//! STRUCTURE_STARTS / STRUCTURE_REFERENCES (P9), CARVERS (P7) and FEATURES
-//! (P8) are vanilla-shaped no-ops for now — for terrain output that is *exact*
-//! wherever no structure/carver/feature would touch, and the pipeline is the
-//! architecture those layers plug into. Light/spawn statuses are also no-ops:
-//! Vela computes light at encode time and spawns mobs in the sim.
+//! CARVERS runs `applyCarvers` (P7, `super::carvers`) over the center chunk.
+//! STRUCTURE_STARTS / STRUCTURE_REFERENCES (P9) and FEATURES (P8) are
+//! vanilla-shaped no-ops for now — for terrain output that is *exact* wherever
+//! no structure/feature would touch, and the pipeline is the architecture those
+//! layers plug into. Light/spawn statuses are also no-ops: Vela computes light
+//! at encode time and spawns mobs in the sim.
 //!
 //! Vanilla's LOADING_PYRAMID (chunks read from disk re-run only light tasks)
 //! collapses here to: only `minecraft:full` chunks are loaded from disk;
@@ -476,12 +477,18 @@ impl WorldGenRegion<'_> {
 /// the same measure-zero tie-break vanilla already leaves per-thread.
 pub struct ChunkPipeline {
     pub generator: SurfacedGenerator,
+    /// The world seed — `applyCarvers` re-seeds off `seed + carverIndex`.
+    seed: i64,
     chunks: HashMap<(i32, i32), ProtoChunk>,
 }
 
 impl ChunkPipeline {
     pub fn new_overworld(seed: i64) -> Self {
-        Self { generator: SurfacedGenerator::new_overworld(seed), chunks: HashMap::new() }
+        Self {
+            generator: SurfacedGenerator::new_overworld(seed),
+            seed,
+            chunks: HashMap::new(),
+        }
     }
 
     /// The proto-chunk at `pos`, if it has been touched.
@@ -572,10 +579,25 @@ impl ChunkPipeline {
                 let blocks = chunk.blocks.as_mut().expect("SURFACE runs after NOISE");
                 self.generator.surface.build_surface(blocks, &mut noise_chunk, &baked, pos.0, pos.1);
             }
-            // P9 (structure starts/references), P7 (carvers), P8 (features):
-            // no-op contributions are exactly vanilla wherever those systems
-            // would not have touched the chunk. Light and spawn live outside
-            // the worldgen parity layer (encode-time light, sim spawning).
+            // `generateCarvers` → `applyCarvers`. Carve the center chunk in
+            // place from every start-chunk carver in its 17×17 neighborhood
+            // (write radius 0). The blocks are taken out so the generator (read
+            // for the biome source + aquifer) and the mutated chunk don't alias.
+            ChunkStatus::Carvers => {
+                let mut blocks = self
+                    .chunks
+                    .get_mut(&pos)
+                    .expect("proto chunk resident")
+                    .blocks
+                    .take()
+                    .expect("CARVERS runs after NOISE/SURFACE");
+                super::carvers::apply_carvers(&self.generator, self.seed, pos, &mut blocks);
+                self.chunks.get_mut(&pos).expect("proto chunk resident").blocks = Some(blocks);
+            }
+            // P9 (structure starts/references) and P8 (features): no-op
+            // contributions are exactly vanilla wherever those systems would not
+            // have touched the chunk. Light and spawn live outside the worldgen
+            // parity layer (encode-time light, sim spawning).
             _ => {}
         }
     }
@@ -654,13 +676,14 @@ fn with_pipeline<R>(f: impl FnOnce(&mut ChunkPipeline) -> R) -> R {
 const PROTO_CACHE_LIMIT: usize = 320;
 const PROTO_KEEP_RADIUS: i32 = 8;
 
-/// The status the live path generates to. SURFACE is the last stage that
-/// mutates blocks today — everything between it and FULL (carvers, features,
-/// light, spawn) is a no-op, but their *dependencies* are not: targeting
-/// FULL drags a 5×5 neighborhood through noise+surface per consumed chunk
-/// for byte-identical output (~5× the wall-clock, measured 164 ms vs 36 ms
-/// per chunk in release). Bump toward FULL as P7–P9 land and those stages
-/// start doing work.
+/// The status the live path generates to. Held at SURFACE for now: CARVERS
+/// (P7) does mutate blocks, but wiring caves into the *live* world is left as a
+/// deliberate follow-up (it wants the WG heightmaps refreshed post-carve for
+/// `surface_height`/spawn, and the grass-top-material deferral noted in
+/// `super::carvers` closed) — the same conservative posture P6 took for the
+/// whole live flip. Advancing to CARVERS costs little extra (its only non-no-op
+/// dependency is the center chunk's own SURFACE), so bump this to `Carvers`
+/// once those two items land, then toward FULL as P8/P9 arrive.
 const LIVE_TARGET: ChunkStatus = ChunkStatus::Surface;
 
 /// Generate chunk `(cx, cz)` through the pipeline (to [`LIVE_TARGET`]) and
@@ -900,6 +923,73 @@ mod tests {
             assert_eq!(blocks.ocean_floor_wg, expected.ocean_floor_wg);
             assert_eq!(blocks.world_surface_wg, expected.world_surface_wg);
         }
+    }
+
+    /// CARVERS (P7): advancing past SURFACE carves the terrain, deterministically,
+    /// and only ever opens carver-replaceable blocks into air/water/lava. There
+    /// is no JVM harness here, so this is a self-consistency check rather than a
+    /// golden diff: carving must (a) reproduce byte-for-byte across independent
+    /// instances, (b) leave the bedrock floor intact, (c) never touch the
+    /// protected top 7 blocks of the build height, and (d) actually change the
+    /// terrain somewhere across a small region.
+    #[test]
+    fn carvers_carve_terrain_deterministically() {
+        let seed = 8000;
+        let single = SurfacedGenerator::new_overworld(seed);
+        let mut a = ChunkPipeline::new_overworld(seed);
+        let mut b = ChunkPipeline::new_overworld(seed);
+        // Warm b with an unrelated chunk so its biome-source last-result state
+        // and proto cache differ when it reaches the targets.
+        b.advance(-9, 4, Carvers);
+
+        let mut total_carved = 0usize;
+        for (cx, cz) in [(0, 0), (1, 0), (0, 1), (3, -2)] {
+            let surface = single.generate_chunk(cx, cz);
+
+            let carved = {
+                let p = a.advance(cx, cz, Carvers);
+                p.blocks.clone().unwrap()
+            };
+            let carved_b = {
+                let p = b.advance(cx, cz, Carvers);
+                p.blocks.clone().unwrap()
+            };
+            assert_eq!(carved.blocks, carved_b.blocks, "carvers nondeterministic at ({cx},{cz})");
+
+            // Bedrock floor survives; the top of the build height is protected.
+            assert_eq!(carved.block(0, carved.min_y, 0), ParityBlock::Bedrock);
+            let top = carved.min_y + carved.height - 1;
+            for lz in 0..16 {
+                for lx in 0..16 {
+                    for dy in 0..7 {
+                        assert_eq!(
+                            carved.block(lx, top - dy, lz),
+                            surface.block(lx, top - dy, lz),
+                            "carved into the protected top band at ({cx},{cz})",
+                        );
+                    }
+                }
+            }
+
+            // Every changed block is an aquifer carve state (air/water/lava).
+            for (s, c) in surface.blocks.iter().zip(carved.blocks.iter()) {
+                if s != c {
+                    total_carved += 1;
+                    assert!(
+                        matches!(c, ParityBlock::Air | ParityBlock::Water | ParityBlock::Lava),
+                        "carve produced a non-air/water/lava block: {c:?}",
+                    );
+                }
+            }
+
+            // Idempotent: re-advancing to CARVERS does not carve again.
+            let again = {
+                let p = a.advance(cx, cz, Carvers);
+                p.blocks.clone().unwrap()
+            };
+            assert_eq!(again.blocks, carved.blocks, "CARVERS not idempotent at ({cx},{cz})");
+        }
+        assert!(total_carved > 0, "carvers changed nothing across the sample region");
     }
 
     /// Independent pipeline instances of the same seed produce byte-identical

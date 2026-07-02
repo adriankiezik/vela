@@ -2441,7 +2441,7 @@ impl NoiseChunk {
         let density = full.compute(Ctx::Cursor, &mut self.st);
         let substance = if self.aquifer.is_some() {
             let mut aq = self.aquifer.take().expect("aquifer");
-            let s = self.aquifer_compute_substance(&mut aq, density);
+            let s = self.aquifer_compute_substance(&mut aq, Ctx::Cursor, density);
             self.aquifer = Some(aq);
             s
         } else {
@@ -2477,20 +2477,46 @@ impl NoiseChunk {
         }
     }
 
+    /// `getCarveState` — the carver's per-block resolution
+    /// (`WorldCarver.getCarveState`): lava below the configured lava level,
+    /// otherwise the aquifer substance at a `SinglePointContext` with density
+    /// `0.0`. `None` means "leave the block solid" (vanilla returns `null`,
+    /// which makes `carveBlock` a no-op). Aquifers are always enabled in the
+    /// overworld; the disabled fallback mirrors `Aquifer.createDisabled`.
+    pub fn carve_state(&mut self, x: i32, y: i32, z: i32, lava_level: i32) -> Option<ParityBlock> {
+        if y <= lava_level {
+            return Some(ParityBlock::Lava);
+        }
+        let ctx = Ctx::Point { x, y, z };
+        if self.aquifer.is_some() {
+            let mut aq = self.aquifer.take().expect("aquifer");
+            let s = self.aquifer_compute_substance(&mut aq, ctx, 0.0);
+            self.aquifer = Some(aq);
+            s
+        } else {
+            // `Aquifer.createDisabled.computeSubstance(ctx, 0.0)`: density 0.0
+            // is not `> 0.0`, so it yields the global fluid at `y`.
+            Some(self.global_fluid(y).at(y))
+        }
+    }
+
     /// `NoiseBasedAquifer.computeSubstance` (minus the
     /// `shouldScheduleFluidUpdate` bookkeeping, which never affects the block
-    /// output). Always called at the fill cursor.
+    /// output). The `ctx` is the fill cursor during `doFill` and a
+    /// `SinglePointContext` during carving — it fixes both the sampled position
+    /// and the context the barrier noise is evaluated at, matching vanilla.
     fn aquifer_compute_substance(
         &mut self,
         aq: &mut AquiferState,
+        ctx: Ctx,
         density: f64,
     ) -> Option<ParityBlock> {
         if density > 0.0 {
             return None;
         }
-        let pos_x = self.st.cell_start_block_x + self.st.in_cell_x;
-        let pos_y = self.st.cell_start_block_y + self.st.in_cell_y;
-        let pos_z = self.st.cell_start_block_z + self.st.in_cell_z;
+        let pos_x = ctx.block_x(&self.st);
+        let pos_y = ctx.block_y(&self.st);
+        let pos_z = ctx.block_z(&self.st);
         let global_fluid = self.global_fluid(pos_y);
         if pos_y > aq.skip_sampling_above_y {
             return Some(global_fluid.at(pos_y));
@@ -2556,7 +2582,7 @@ impl NoiseChunk {
         let mut barrier_noise_value = f64::NAN;
         let status2 = self.aquifer_status(aq, closest_index[1]);
         let barrier12 =
-            similarity12 * self.calculate_pressure(&mut barrier_noise_value, pos_y, status1, status2);
+            similarity12 * self.calculate_pressure(&mut barrier_noise_value, ctx, pos_y, status1, status2);
         if density + barrier12 > 0.0 {
             return None;
         }
@@ -2565,7 +2591,7 @@ impl NoiseChunk {
         if similarity13 > 0.0 {
             let barrier13 = similarity12
                 * similarity13
-                * self.calculate_pressure(&mut barrier_noise_value, pos_y, status1, status3);
+                * self.calculate_pressure(&mut barrier_noise_value, ctx, pos_y, status1, status3);
             if density + barrier13 > 0.0 {
                 return None;
             }
@@ -2574,7 +2600,7 @@ impl NoiseChunk {
         if similarity23 > 0.0 {
             let barrier23 = similarity12
                 * similarity23
-                * self.calculate_pressure(&mut barrier_noise_value, pos_y, status2, status3);
+                * self.calculate_pressure(&mut barrier_noise_value, ctx, pos_y, status2, status3);
             if density + barrier23 > 0.0 {
                 return None;
             }
@@ -2583,10 +2609,12 @@ impl NoiseChunk {
     }
 
     /// `NoiseBasedAquifer.calculatePressure`. The barrier noise is sampled
-    /// lazily at the fill cursor (the context vanilla passes through).
+    /// lazily at the context vanilla passes through (the fill cursor during
+    /// `doFill`, a `SinglePointContext` during carving).
     fn calculate_pressure(
         &mut self,
         barrier_noise_value: &mut f64,
+        ctx: Ctx,
         pos_y: i32,
         status1: FluidStatus,
         status2: FluidStatus,
@@ -2619,7 +2647,7 @@ impl NoiseChunk {
         let noise_value = if (-2.0..=2.0).contains(&gradient) {
             if barrier_noise_value.is_nan() {
                 let barrier = self.barrier.clone();
-                let v = barrier.compute(Ctx::Cursor, &mut self.st);
+                let v = barrier.compute(ctx, &mut self.st);
                 *barrier_noise_value = v;
                 v
             } else {
@@ -2848,6 +2876,7 @@ impl NoiseChunk {
 /// `((y - min_y) * 16 + z) * 16 + x`; heightmaps hold vanilla's
 /// "first available" convention (highest matching block + 1, else `min_y`)
 /// indexed `z * 16 + x`.
+#[derive(Clone)]
 pub struct FilledChunk {
     pub min_y: i32,
     pub height: i32,
