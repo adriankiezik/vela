@@ -97,6 +97,12 @@ pub enum Serverbound {
     },
     KeepAlive(i64),
     AcceptTeleport(i32),
+    /// `ServerboundPlayerLoadedPacket` — an empty packet the client sends once it
+    /// has loaded the level around the player (its `LevelLoadTracker` reached
+    /// `ClientLevelReady`). Clears the player's `ClientLoaded` gate, ending the
+    /// post-join/respawn invulnerability window (`ServerGamePacketListenerImpl`
+    /// `handleAcceptPlayerLoad` → `markClientLoaded`).
+    PlayerLoaded,
     /// `ServerboundClientInformationPacket` — the client resending its settings
     /// mid-session. Vanilla `ServerPlayer.updateOptions` copies `viewDistance`
     /// into `requestedViewDistance`, which changes the effective radius

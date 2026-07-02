@@ -33,10 +33,29 @@ pub fn start_server(addr: &str) -> Server {
     )
 }
 
+/// Like [`start_server`] but runs the vanilla-parity worldgen pipeline
+/// (`VELA_PARITY_WORLDGEN=1`). Parity chunks cost ~40 ms each to generate, so this
+/// is the realistic slow-generation path where a cold region streams over many
+/// ticks — the setting the respawn tests need to prove terrain is delivered
+/// *promptly* rather than after a long "Loading terrain" wait.
+pub fn start_server_parity(addr: &str) -> Server {
+    start_server_configured(
+        addr,
+        "network-compression-threshold=-1\nonline-mode=false\nview-distance=2\nsimulation-distance=2\n",
+        &[("VELA_PARITY_WORLDGEN", "1")],
+    )
+}
+
 /// Like [`start_server`] but with caller-supplied `server.properties` contents,
 /// for tests that need a non-default config (e.g. the natural-spawner test needs
 /// a view distance big enough for a non-zero CREATURE mobcap).
 pub fn start_server_with_properties(addr: &str, properties: &str) -> Server {
+    start_server_configured(addr, properties, &[])
+}
+
+/// The shared server launcher: caller-supplied `server.properties` plus extra
+/// environment variables (on top of the always-set IDE bypass).
+pub fn start_server_configured(addr: &str, properties: &str, env: &[(&str, &str)]) -> Server {
     // Run each server in its own temp directory so the generated config files
     // (server.properties, ops.json, …) don't litter the checkout, and set the
     // IDE bypass so the EULA gate auto-agrees — mirroring how vanilla's own
@@ -66,10 +85,15 @@ pub fn start_server_with_properties(addr: &str, properties: &str) -> Server {
     } else {
         (Stdio::null(), Stdio::null())
     };
-    let child = Command::new(env!("CARGO_BIN_EXE_vela"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vela"));
+    command
         .arg(addr)
         .current_dir(&workdir)
-        .env("VELA_RUNNING_IN_IDE", "1")
+        .env("VELA_RUNNING_IN_IDE", "1");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let child = command
         .stdout(out)
         .stderr(err)
         .spawn()

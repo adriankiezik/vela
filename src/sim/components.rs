@@ -368,6 +368,84 @@ impl Default for ChunkSender {
     }
 }
 
+/// The player's "has the client loaded the level around me yet" gate, mirroring
+/// `ServerGamePacketListenerImpl.hasClientLoaded` (`waitingForRespawn` +
+/// `clientLoadedTimeoutTimer`). Set unloaded on join and on respawn; cleared to
+/// loaded when the client sends `ServerboundPlayerLoadedPacket`, or after
+/// [`Self::TIMEOUT_TICKS`] as a backstop for a client that never sends it.
+///
+/// While unloaded the player is invulnerable to environmental damage (vanilla
+/// `ServerPlayer.isInvulnerableTo` returns true for `!hasClientLoaded()`), so a
+/// slow chunk load after join/respawn can't drop the client into the void before
+/// the terrain under it has arrived — the vanilla client keeps its `LocalPlayer`
+/// frozen over the same window and only releases it once its own chunk is present
+/// (or its 30 s safety timeout fires).
+#[derive(Component)]
+pub struct ClientLoaded {
+    /// Whether the client has confirmed (or the backstop has assumed) the level
+    /// around the player is loaded.
+    pub loaded: bool,
+    /// Ticks elapsed since the gate was last reset, driving the backstop timeout.
+    pub ticks_since_reset: u32,
+}
+
+impl ClientLoaded {
+    /// `restartClientLoadTimerAfterRespawn` sets `clientLoadedTimeoutTimer = 60`:
+    /// the server assumes the client loaded after this many ticks even without the
+    /// `PlayerLoaded` ack, so a silent client is never permanently invulnerable.
+    pub const TIMEOUT_TICKS: u32 = 60;
+
+    /// A freshly-reset gate: unloaded, timer at zero. Used at join and respawn.
+    pub fn waiting() -> Self {
+        Self {
+            loaded: false,
+            ticks_since_reset: 0,
+        }
+    }
+
+    /// Advance the backstop timer one tick and report whether the client now
+    /// counts as loaded (`tickClientLoadTimeout` + `hasClientLoaded`). Idempotent
+    /// once loaded — the `PlayerLoaded` packet sets `loaded` directly and short-
+    /// circuits the timer.
+    pub fn tick(&mut self) -> bool {
+        if !self.loaded {
+            self.ticks_since_reset += 1;
+            if self.ticks_since_reset >= Self::TIMEOUT_TICKS {
+                self.loaded = true;
+            }
+        }
+        self.loaded
+    }
+}
+
+#[cfg(test)]
+mod client_loaded_tests {
+    use super::ClientLoaded;
+
+    #[test]
+    fn backstop_marks_loaded_after_timeout() {
+        let mut gate = ClientLoaded::waiting();
+        assert!(!gate.loaded, "starts unloaded");
+        // Not loaded for the first TIMEOUT_TICKS-1 ticks.
+        for _ in 0..ClientLoaded::TIMEOUT_TICKS - 1 {
+            assert!(!gate.tick(), "still waiting before the backstop fires");
+        }
+        // The TIMEOUT_TICKS-th tick flips it.
+        assert!(gate.tick(), "backstop marks loaded once the timer expires");
+        assert!(gate.tick(), "stays loaded afterwards");
+    }
+
+    #[test]
+    fn player_loaded_packet_short_circuits_the_timer() {
+        let mut gate = ClientLoaded::waiting();
+        gate.tick(); // one tick elapsed
+        gate.loaded = true; // as the PlayerLoaded handler sets it
+        // Already loaded: ticking neither un-sets it nor advances anything.
+        assert!(gate.tick());
+        assert_eq!(gate.ticks_since_reset, 1, "timer frozen once loaded");
+    }
+}
+
 /// The egress side of a player's connection — how the sim talks back. Cheap to
 /// hold: a `tokio` mpsc sender plus a "disconnect requested" flag.
 ///

@@ -319,13 +319,24 @@ pub fn survival_tick(world: &mut World) {
                 h.invulnerable_time -= 1;
             }
         }
+        // Advance the client-load gate: while the client hasn't confirmed it
+        // loaded the level around the player, tick the backstop timer and assume
+        // loaded once it expires (`tickClientLoadTimeout` → `hasClientLoaded`).
+        let client_loaded = world
+            .get_mut::<ClientLoaded>(entity)
+            .is_none_or(|mut gate| gate.tick());
+
         // A dead player is inert until it respawns.
         if world.get::<Health>(entity).is_none_or(|h| h.dead) {
             continue;
         }
 
-        // Void damage.
-        if world.get::<Pos>(entity).is_some_and(|p| p.y < void_y) {
+        // Void damage — suppressed until the client has loaded the level around the
+        // player (`ServerPlayer.isInvulnerableTo` while `!hasClientLoaded()`). The
+        // vanilla client freezes its `LocalPlayer` over the same window, so a player
+        // that respawns into a not-yet-streamed region never free-falls into the
+        // void before its own chunk arrives.
+        if client_loaded && world.get::<Pos>(entity).is_some_and(|p| p.y < void_y) {
             hurt(world, entity, DamageKind::Void, VOID_DAMAGE, difficulty, show_death);
             if world.get::<Health>(entity).is_none_or(|h| h.dead) {
                 continue;
@@ -564,10 +575,20 @@ pub fn respawn_player(world: &mut World, entity: Entity) {
     if let Some(mut food) = world.get_mut::<FoodData>(entity) {
         *food = FoodData::default();
     }
+    // Re-open the client-load gate (`restartClientLoadTimerAfterRespawn`): the
+    // Respawn packet below makes the client drop its level and wait for chunks, so
+    // the player is invulnerable to the void until the client re-confirms load.
+    if let Some(mut gate) = world.get_mut::<ClientLoaded>(entity) {
+        *gate = ClientLoaded::waiting();
+    }
 
-    // Spawn is the top of the origin column, matching the join sequence.
-    let (sx, sz) = (0.0f64, 0.0f64);
-    let sy = (crate::world::surface_height(0, 0) + 1) as f64;
+    // Respawn at the same solid, dry column the join path picks (`world_spawn()`,
+    // memoised) rather than the fixed origin, which may be ocean/void under the
+    // biome-height field. The surface block sits at that height with air above, so
+    // stand the player one block higher.
+    let (wx, wz) = crate::world::world_spawn();
+    let (sx, sz) = (wx as f64, wz as f64);
+    let sy = (crate::world::surface_height(wx, wz) + 1) as f64;
     if let Some(mut pos) = world.get_mut::<Pos>(entity) {
         pos.x = sx;
         pos.y = sy;
@@ -643,6 +664,19 @@ pub fn respawn_player(world: &mut World, entity: Entity) {
         for &c in &ordered {
             sender.mark_pending(c);
         }
+    }
+    // Fast-deliver the columns directly under the player: build their wire data
+    // *synchronously* now, rather than waiting on the background prefetch pool.
+    // `send_queued_chunks` is readiness-gated, so a freshly-respawned player whose
+    // spawn region was evicted (they died far away) would otherwise wait many ticks
+    // for the pool to regenerate the parity terrain — long enough for the vanilla
+    // client's 30 s load timeout to fire and drop them into the void. Warming the
+    // 3×3 under the player (the section the client must compile before it reports
+    // `PlayerLoaded`) makes them a cache hit in the very first post-respawn batch,
+    // so terrain arrives in ~1 tick with no preloading kept between respawns. The
+    // rest of the view still streams lazily through the pool.
+    for &(cx, cz) in ordered.iter().take(RESPAWN_SYNC_WARM_COLUMNS) {
+        let _ = crate::world::chunk_columns(cx, cz);
     }
     // Rebalance chunk references for the swapped view: acquire the new spawn
     // region *first*, then release the old set, so a column present in both never
@@ -743,6 +777,12 @@ pub fn send_initial_health(world: &mut World, entity: Entity) {
 /// The respawn teleport id the client echoes back via `AcceptTeleportation`.
 /// Distinct from the join teleport (1) purely for log clarity.
 const RESPAWN_TELEPORT_ID: i32 = 2;
+
+/// How many nearest columns [`respawn_player`] warms synchronously so they ship in
+/// the first post-respawn chunk batch. The 3×3 under the player is the minimum the
+/// vanilla client needs to compile the player's own render section (neighbour
+/// blocks drive face culling) and report `PlayerLoaded`.
+const RESPAWN_SYNC_WARM_COLUMNS: usize = 9;
 
 /// Send a framed packet to a single player's own connection.
 fn send_to(world: &World, entity: Entity, bytes: bytes::Bytes) {

@@ -333,8 +333,12 @@ pub(super) fn on_joined(
             },
             inventory,
             game_mode,
-            health,
-            food,
+            // The survival trio is grouped into a nested bundle so the outer spawn
+            // tuple stays within bevy's 15-element `Bundle` impl limit. `ClientLoaded`
+            // starts unloaded: the player is invulnerable to the void until the
+            // client confirms it has loaded the spawn region (or the backstop timer
+            // fires), matching vanilla's post-join load gate.
+            (health, food, ClientLoaded::waiting()),
         ))
         .id();
     world.resource_mut::<PlayerIndex>().0.insert(id, entity);

@@ -97,6 +97,15 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
         Serverbound::AcceptTeleport(tp) => {
             debug!(teleport_id = tp, "teleport confirmed");
         }
+        // The client finished loading the level around the player. Clear the load
+        // gate (vanilla `markClientLoaded`), which ends the invulnerability window
+        // opened at join/respawn — the player's own chunk is now on the client, so
+        // it will settle on the ground rather than free-fall through the void.
+        Serverbound::PlayerLoaded => {
+            if let Some(mut gate) = world.get_mut::<ClientLoaded>(entity) {
+                gate.loaded = true;
+            }
+        }
         // The client resent its settings mid-session. Vanilla `updateOptions`
         // copies `viewDistance` into `requestedViewDistance`; when it changes, the
         // effective radius (`getPlayerViewDistance`) changes, so re-diff the

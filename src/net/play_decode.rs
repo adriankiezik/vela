@@ -48,6 +48,9 @@ const SB_PLAY_PLAYER_COMMAND: i32 = 42;
 // PlayerInput follows PlayerCommand in SERVERBOUND_TEMPLATE (line 104 → 43); it
 // carries the `Input` flags byte that reports crouch in 26.2.
 const SB_PLAY_PLAYER_INPUT: i32 = 43;
+// PlayerLoaded follows PlayerInput in SERVERBOUND_TEMPLATE (line 105 → 44); an
+// empty packet the client sends once it has loaded the level around the player.
+const SB_PLAY_PLAYER_LOADED: i32 = 44;
 const SB_PLAY_SWING: i32 = 63;
 // UseItemOn (block place) follows TestInstanceBlockAction in SERVERBOUND_TEMPLATE
 // (line 127 → 66).
@@ -77,6 +80,9 @@ pub(super) fn decode_play(id: i32, reader: &mut PacketReader) -> Option<Serverbo
         SB_PLAY_ACCEPT_TELEPORTATION => {
             Some(Serverbound::AcceptTeleport(reader.read_varint().ok()?))
         }
+        // ServerboundPlayerLoadedPacket: empty body — the client has loaded the
+        // level around the player, ending the post-join/respawn load gate.
+        SB_PLAY_PLAYER_LOADED => Some(Serverbound::PlayerLoaded),
         // ServerboundChunkBatchReceivedPacket: a single float, the rate the client
         // can sustain (`desiredChunksPerTick`), acknowledging one chunk batch.
         SB_PLAY_CHUNK_BATCH_RECEIVED => Some(Serverbound::ChunkBatchReceived {
