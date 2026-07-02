@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+use bytes::Bytes;
 use tracing::warn;
 
 use crate::ids::BlockState;
@@ -40,6 +41,17 @@ pub struct ChunkColumns {
     /// together with the block blob so an edit that invalidates one re-lights the
     /// other. See [`super::light`].
     pub light: super::light::ChunkLight,
+    /// The fully framed `ClientboundLevelChunkWithLightPacket` bytes for this
+    /// column, serialized once (lazily, off the sim thread by the prefetch pool
+    /// or on first send) and handed to every viewer as a refcount clone. The
+    /// packet body is a pure function of `(cx, cz)` and this column's
+    /// blob/heightmaps/light — no per-connection or per-send-varying field (no
+    /// sequence number, no player state) — so one frame is byte-identical for
+    /// every recipient. Populated by [`crate::sim::packets::level_chunk`] via
+    /// `get_or_init`. Lives *inside* `ChunkColumns`, so it is discarded together
+    /// with the rest of the wire cache the instant an edit sets `wire = None`
+    /// (the whole `Arc<ChunkColumns>` is dropped and rebuilt).
+    pub level_chunk_frame: OnceLock<Bytes>,
 }
 
 /// A chunk's mutable state: its generated baseline heights, a sparse map of
@@ -157,6 +169,7 @@ impl ChunkData {
                 blob: encode_blob(&self.gen, &self.edits),
                 heightmaps: compute_heightmaps(&self.gen, &self.edits),
                 light: super::light::compute_light(&self.gen, &self.edits),
+                level_chunk_frame: OnceLock::new(),
             }));
         }
         Arc::clone(self.wire.as_ref().expect("wire just built"))
@@ -291,13 +304,30 @@ fn with_chunk<R>(cx: i32, cz: i32, f: impl FnOnce(&mut ChunkData) -> R) -> R {
     }
 }
 
-/// Whether chunk `(cx, cz)` is resident with its wire columns already built —
-/// the send path's readiness gate: a batch only ships columns whose
-/// `level_chunk` is a cache hit, leaving cold columns to the prefetch workers
-/// instead of building them on the simulation thread.
-pub fn chunk_wire_ready(cx: i32, cz: i32) -> bool {
+/// Probe wire readiness for a whole window of coordinates under a *single*
+/// store-lock acquisition, returning the subset that is resident with its wire
+/// columns already built. This is the send path's readiness gate: a batch only
+/// ships columns whose `level_chunk` is a cache hit, leaving cold columns to the
+/// prefetch workers instead of building them on the simulation thread.
+///
+/// The send path checks up to ~64 candidates per player per tick (the batch
+/// window plus the prefetch sweep); doing that as 64 separate per-coordinate
+/// probes took (and dropped) the global store mutex 64 times, contending with
+/// block reads and the prefetch workers. One lock, one pass instead.
+///
+/// The snapshot is a point-in-time read: a coordinate that becomes ready *after*
+/// this returns simply isn't in the set this tick and is retried next tick (it
+/// stays in `pending`), so nothing is ever dropped permanently. A coordinate that
+/// was ready here but is edited-invalidated before its `level_chunk` send would
+/// just rebuild synchronously in that send — the identical narrow race the
+/// per-coordinate check already had, with no effect on the bytes produced.
+pub fn chunk_wire_ready_snapshot(coords: &[(i32, i32)]) -> HashSet<(i32, i32)> {
     let guard = store().0.lock().expect("chunk store mutex poisoned");
-    guard.columns.get(&(cx, cz)).is_some_and(|c| c.wire.is_some())
+    coords
+        .iter()
+        .copied()
+        .filter(|&(cx, cz)| guard.columns.get(&(cx, cz)).is_some_and(|c| c.wire.is_some()))
+        .collect()
 }
 
 /// The baked surface height of a *resident* chunk's column — a non-generating
@@ -317,10 +347,14 @@ pub fn resident_surface_height(wx: i32, wz: i32) -> Option<i32> {
 /// `thread_local!` — no shared lock), so worldgen scales across these threads
 /// alongside the disk loads, lighting, and encoding that already overlapped
 /// (and legacy-mode generation, which parallelizes too). Sized from the host's
-/// parallelism, leaving two cores for the sim/net threads and clamped so the
-/// per-worker proto caches stay memory-bounded (see `PROTO_CACHE_LIMIT`).
+/// parallelism, leaving two cores for the sim/net threads. The upper bound is
+/// left uncapped (was 8, a ~33% CPU ceiling on a 24-core host): worldgen is the
+/// bottleneck, so we spend nearly all cores on it. Per-worker proto caches stay
+/// memory-bounded because `PROTO_CACHE_LIMIT` was lowered to compensate for the
+/// larger pool (see its note), and spatial sharding in `prefetch` keeps each
+/// worker's cache serving a contiguous neighborhood.
 fn prefetch_workers() -> usize {
-    std::thread::available_parallelism().map(|n| n.get().saturating_sub(2)).unwrap_or(2).clamp(2, 8)
+    std::thread::available_parallelism().map(|n| n.get().saturating_sub(2)).unwrap_or(2).max(2)
 }
 
 /// Queue columns for background warming: each is generated (if missing) and
@@ -331,21 +365,22 @@ fn prefetch_workers() -> usize {
 /// never leaks. Fire-and-forget: send failures (impossible — the workers
 /// never exit) are ignored.
 pub fn prefetch(coords: impl IntoIterator<Item = (i32, i32)>) {
-    static QUEUE: OnceLock<std::sync::mpsc::Sender<(i32, i32)>> = OnceLock::new();
-    let queue = QUEUE.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<(i32, i32)>();
-        let rx = Arc::new(Mutex::new(rx));
-        for i in 0..prefetch_workers() {
-            let rx = Arc::clone(&rx);
+    static QUEUE: OnceLock<Vec<std::sync::mpsc::Sender<(i32, i32)>>> = OnceLock::new();
+    let senders = QUEUE.get_or_init(|| {
+        let workers = prefetch_workers();
+        let mut senders = Vec::with_capacity(workers);
+        for i in 0..workers {
+            // Per-worker channel (instead of one shared receiver behind a mutex):
+            // dispatch shards coordinates spatially, so a worker owns a stable
+            // region and its thread-local proto cache is never contended.
+            let (tx, rx) = std::sync::mpsc::channel::<(i32, i32)>();
+            senders.push(tx);
             std::thread::Builder::new()
                 .name(format!("chunk-prefetch-{i}"))
                 .spawn(move || loop {
-                    // Holding the receiver lock only while blocked in `recv`:
-                    // the winner takes one coordinate and releases, so the
-                    // pool processes in parallel while dispatch stays FIFO
-                    // (nearest-first, matching the pending queue's order).
-                    let coord = { rx.lock().expect("prefetch receiver poisoned").recv() };
-                    match coord {
+                    // Each worker drains its own queue in FIFO order, preserving
+                    // the nearest-first property within its shard.
+                    match rx.recv() {
                         Ok((cx, cz)) => {
                             let _ = chunk_columns(cx, cz);
                         }
@@ -354,11 +389,32 @@ pub fn prefetch(coords: impl IntoIterator<Item = (i32, i32)>) {
                 })
                 .expect("spawn chunk-prefetch worker");
         }
-        tx
+        senders
     });
-    for coord in coords {
-        let _ = queue.send(coord);
+    for (cx, cz) in coords {
+        let _ = senders[prefetch_shard(cx, cz, senders.len())].send((cx, cz));
     }
+}
+
+/// Route chunk `(cx, cz)` to a prefetch worker by hashing its 4×4-chunk block
+/// coordinate, so spatially-adjacent chunks land on the same worker. Each worker
+/// has a private thread-local pipeline / proto cache, so co-locating a
+/// neighborhood on one worker means the shared 3×3 biome ring, structure-status,
+/// and boundary noise for that region are generated once rather than by up to
+/// N workers. Every coordinate maps deterministically to exactly one worker —
+/// nothing is lost or double-processed — and since the pipeline instances are
+/// independent and deterministic, the mapping has zero parity impact.
+fn prefetch_shard(cx: i32, cz: i32, workers: usize) -> usize {
+    let bx = ((cx >> 2) as i64) as u64;
+    let bz = ((cz >> 2) as i64) as u64;
+    // splitmix64-style mix for a good spread across non-power-of-two counts.
+    let mut h = bx
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(bz.wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    (h % workers as u64) as usize
 }
 
 /// The wire columns for chunk `(cx, cz)`, generating and caching on first
@@ -619,6 +675,7 @@ mod tests {
             blob: encode_blob(&gen, &edits),
             heightmaps: compute_heightmaps(&gen, &edits),
             light: crate::world::light::compute_light(&gen, &edits),
+            level_chunk_frame: OnceLock::new(),
         }
     }
 

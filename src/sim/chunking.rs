@@ -3,7 +3,7 @@
 //! movement is applied. Also exposes the `ChunkTrackingView` membership predicate
 //! used by the join path to seed a newcomer's loaded set.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy_ecs::prelude::*;
 
@@ -12,6 +12,26 @@ use super::packets;
 
 /// A chunk column coordinate `(cx, cz)`, used by the chunk-streaming diff.
 type ChunkCoord = (i32, i32);
+
+/// Coordinates the per-tick cold-window sweep in [`send_queued_chunks`] has
+/// already handed to the background prefetch pool and that have *not yet*
+/// completed (become wire-ready) or fallen out of every player's leading window.
+/// Without this, every tick re-enqueued every still-cold coordinate: a column
+/// that takes ~1 tick to build was requested several times over, and those
+/// duplicates sat ahead of genuinely new coordinates in the workers' FIFO, each
+/// costing a lock acquire + condvar wait for nothing.
+///
+/// The sweep enqueues a coordinate only when it is *newly* cold (not already in
+/// this set), so each coordinate is in the prefetch queue at most once. An entry
+/// is cleared the moment no player still needs the coordinate cold — it either
+/// completed (now wire-ready, so it drops out of the cold set) or left every
+/// leading window — which lets a *legitimate* later re-request (an edit
+/// invalidated the wire, or the column was evicted and re-tracked) re-enqueue it.
+/// Bounded by the union of players' 64-column windows, so it never grows without
+/// limit. Shared across players, so the spawn columns a crowd all wait on are
+/// enqueued once, not once per viewer.
+#[derive(Resource, Default)]
+pub struct PrefetchQueued(HashSet<ChunkCoord>);
 
 /// Per-column player reference count — the sim-side model of vanilla's chunk
 /// ticket graph. In vanilla a column stays loaded while any `TicketType` keeps
@@ -206,7 +226,15 @@ pub fn apply_view_distance_change(world: &mut World, entity: Entity) {
 /// a `ChunkBatchFinished(n)`. The client replies `ServerboundChunkBatchReceived`,
 /// which releases the next batch (see `ChunkSender::on_ack`). This is the throttle
 /// that stops fast travel from flooding the client's chunk-decode backlog.
-pub fn send_queued_chunks(mut players: Query<(&Conn, &mut ChunkSender)>) {
+pub fn send_queued_chunks(
+    mut players: Query<(&Conn, &mut ChunkSender)>,
+    mut queued: ResMut<PrefetchQueued>,
+) {
+    // Union of every player's still-cold leading window this tick. After the
+    // player loop, any coordinate in `queued` that is absent here has either
+    // completed (become wire-ready) or left all leading windows, so its dedup
+    // entry is cleared — letting a legitimate later re-request re-enqueue it.
+    let mut still_cold: HashSet<ChunkCoord> = HashSet::new();
     for (conn, mut sender) in players.iter_mut() {
         // Outbox backpressure — Vela's stand-in for vanilla's TCP-level
         // blocking. The outbox is a bounded queue whose overflow on an
@@ -224,31 +252,45 @@ pub fn send_queued_chunks(mut players: Query<(&Conn, &mut ChunkSender)>) {
             .capacity()
             .saturating_sub(OUTBOX_RESERVE)
             .saturating_sub(2); // ChunkBatchStart + ChunkBatchFinished
+        // Readiness snapshot for the leading window, taken under a SINGLE store
+        // lock acquisition (was up to 64 separate `chunk_wire_ready` calls, each
+        // taking and dropping the global mutex and contending with block reads
+        // and the prefetch workers). The window covers both consumers below: the
+        // batch selector's ready-gate (its candidate window is at most
+        // `MAX_CHUNKS_PER_TICK` = 64 nearest columns) and the cold sweep's
+        // `PREFETCH_WINDOW` = 64. A coordinate that turns ready *after* this
+        // snapshot simply isn't sent this tick and is retried next tick (it stays
+        // pending), so nothing is dropped.
+        const PREFETCH_WINDOW: usize = 64;
+        let window: Vec<ChunkCoord> = sender.pending.iter().take(PREFETCH_WINDOW).copied().collect();
+        let ready = crate::world::chunk_wire_ready_snapshot(&window);
         // Readiness-gated batching: only ship columns whose wire data the
         // background prefetch pool has already built, so `level_chunk` below
         // is a cache hit and the tick never blocks on generation (a parity
-        // chunk costs ~40 ms to generate — most of a tick budget).
-        let batch =
-            sender.next_batch_ready(headroom, |(cx, cz)| crate::world::chunk_wire_ready(cx, cz));
+        // chunk costs ~40 ms to generate — most of a tick budget). The ready-gate
+        // reads the snapshot (a lock-free set lookup) instead of re-locking.
+        let batch = sender.next_batch_ready(headroom, |c| ready.contains(&c));
         // Keep the generation pool ahead of the pacer. With vanilla skip
         // semantics the batcher passes over cold columns near the front of the
         // queue rather than stalling on them, so re-request warming for the cold
         // columns in the leading window — the ones just skipped and the ones the
-        // pacer will reach next. Warm columns are a cache-hit no-op in the pool,
-        // so this dedup-cheap sweep replaces the old head-only re-prefetch, which
-        // pinned the whole stream behind a single still-generating near column.
-        // A cold column here can also mean its wire cache was *invalidated* (an
-        // edit landed after the first prefetch); warming it again recovers.
-        const PREFETCH_WINDOW: usize = 64;
-        let cold: Vec<(i32, i32)> = sender
-            .pending
-            .iter()
-            .take(PREFETCH_WINDOW)
-            .copied()
-            .filter(|&(cx, cz)| !crate::world::chunk_wire_ready(cx, cz))
-            .collect();
-        if !cold.is_empty() {
-            crate::world::prefetch(cold);
+        // pacer will reach next. A cold column here can also mean its wire cache
+        // was *invalidated* (an edit landed after the first prefetch); warming it
+        // again recovers. Each still-cold coordinate is enqueued AT MOST once
+        // (across all players): `PrefetchQueued` suppresses the re-enqueue until
+        // the coordinate completes or leaves every window, so duplicates no
+        // longer pile up ahead of genuinely new coordinates in the workers' FIFO.
+        let mut new_cold: Vec<ChunkCoord> = Vec::new();
+        for &c in &window {
+            if !ready.contains(&c) {
+                still_cold.insert(c);
+                if queued.0.insert(c) {
+                    new_cold.push(c); // not already queued → hand it to the pool once
+                }
+            }
+        }
+        if !new_cold.is_empty() {
+            crate::world::prefetch(new_cold);
         }
         if batch.is_empty() {
             continue;
@@ -263,6 +305,13 @@ pub fn send_queued_chunks(mut players: Query<(&Conn, &mut ChunkSender)>) {
         }
         conn.send_reliable(packets::chunk_batch_finished(batch.len() as i32));
     }
+    // Clear dedup entries for coordinates no player still needs cold this tick —
+    // they either completed (are now wire-ready) or left every leading window.
+    // Dropping them is what lets a legitimate later re-request re-enqueue the
+    // coordinate (e.g. after an edit invalidates its wire, or the column is
+    // evicted and re-tracked), so no needed chunk is ever permanently withheld
+    // from the pool. This also caps `queued` at the union of the live windows.
+    queued.0.retain(|c| still_cold.contains(c));
 }
 
 /// Cadence (in ticks) of the [`evict_untracked_chunks`] backstop. This is *not*

@@ -174,9 +174,12 @@ pub(super) fn compute_light(
 ) -> ChunkLight {
     // One state lookup per cell: the whole flood reads dampening from here
     // (`opacity = max(1, dampening)`) and sky seeding keys off `dampening == 0`.
-    let dampening = dampening_grid(gen, edits);
+    // The same pass also yields each column's highest occluder (`col_ceiling`),
+    // which lets sky light skip the uniformly-lit open air above the terrain.
+    let (dampening, col_ceiling) = dampening_grid(gen, edits);
+    let (sky, bright_from_section) = compute_sky(&dampening, &col_ceiling);
     ChunkLight {
-        sky: pack_layers(&compute_sky(&dampening)),
+        sky: pack_sky(&sky, bright_from_section),
         block: pack_layers(&compute_block(gen, edits, &dampening)),
     }
 }
@@ -185,48 +188,88 @@ pub(super) fn compute_light(
 /// volume in a single pass. Opacity is `max(1, dampening)` and sky seeding needs
 /// the transparent (`dampening == 0`) columns, so both derive from this one grid
 /// rather than re-fetching each cell's block state.
-fn dampening_grid(gen: &GenChunk, edits: &HashMap<u32, BlockState>) -> Vec<u8> {
+///
+/// The `gy` loop is the **outermost** so array writes stride by 1 — `idx` packs
+/// as `(vy*16 + lz)*16 + lx`, so a fixed `gy` with `lz`/`lx` inner walks the grid
+/// sequentially (cache-friendly) instead of jumping 256 cells per step.
+///
+/// Alongside the grid it returns each column's `col_ceiling`: the highest world-y
+/// carrying any dampening (opaque/translucent) block — i.e. its highest occluder.
+/// Every cell strictly above `col_ceiling` is fully transparent and so a direct
+/// sky source; this is the edit-aware equivalent of `GenChunk::world_surface_top`
+/// (`ws_top`) and stays correct when edits add/remove blocks the heightmap misses.
+/// `LIGHT_Y_MIN - 1` sentinels a fully transparent column (all sky source).
+fn dampening_grid(
+    gen: &GenChunk,
+    edits: &HashMap<u32, BlockState>,
+) -> (Vec<u8>, [i32; COLUMNS]) {
     let mut grid = vec![0u8; VOLUME];
-    for lz in 0..16 {
-        for lx in 0..16 {
-            for gy in LIGHT_Y_MIN..LIGHT_Y_MAX {
-                grid[idx(lx, gy, lz)] = light_dampening(state_for_light(gen, edits, lx, gy, lz));
+    let mut col_ceiling = [LIGHT_Y_MIN - 1; COLUMNS];
+    for gy in LIGHT_Y_MIN..LIGHT_Y_MAX {
+        for lz in 0..16i32 {
+            for lx in 0..16i32 {
+                let d = light_dampening(state_for_light(gen, edits, lx, gy, lz));
+                grid[idx(lx, gy, lz)] = d;
+                if d > 0 {
+                    // `gy` ascends, so the last write per column is its highest occluder.
+                    col_ceiling[(lz * 16 + lx) as usize] = gy;
+                }
             }
         }
     }
-    grid
+    (grid, col_ceiling)
 }
 
 /// Sky light: seed every column's sky-source cells (at/above `lowestSourceY`) to
 /// 15, then flood the shadow with a decreasing BFS.
-fn compute_sky(dampening: &[u8]) -> Vec<u8> {
+///
+/// Returns the filled light grid plus `bright_from_section`: the first light
+/// section index that is entirely above the tallest occluder. Those top sections
+/// are uniform sky-source 15 (no frontier, nothing to flood), so the grid is left
+/// unfilled there and [`pack_sky`] serves them from a shared full-bright layer.
+fn compute_sky(dampening: &[u8], col_ceiling: &[i32]) -> (Vec<u8>, usize) {
     let mut light = vec![0u8; VOLUME];
 
-    // Direct skylight: scan each column top-down at level 15 while cells are
-    // fully transparent; the first cell with any dampening ends the source column
-    // (`ChunkSkyLightSources` / `isSourceLevel`). All Vela blocks are fully
-    // opaque, so this is exactly "air above the surface is lit".
-    for lz in 0..16 {
-        for lx in 0..16 {
-            for gy in (LIGHT_Y_MIN..LIGHT_Y_MAX).rev() {
-                let i = idx(lx, gy, lz);
-                if dampening[i] == 0 {
-                    light[i] = MAX_LEVEL;
-                } else {
-                    break;
-                }
+    // Tallest / shortest column occluder across the chunk. Everything strictly
+    // above `global_max_top` is open sky in *every* column (uniform source 15);
+    // no source exists at or below `global_min_top`.
+    let global_max_top = col_ceiling.iter().copied().max().unwrap_or(LIGHT_Y_MIN - 1);
+    let global_min_top = col_ceiling.iter().copied().min().unwrap_or(LIGHT_Y_MIN - 1);
+
+    // Sections whose base lies above `global_max_top` are uniformly full-bright.
+    let bright_from_section = ((global_max_top - LIGHT_Y_MIN) / 16 + 1) as usize;
+    let bright_from_gy = LIGHT_Y_MIN + bright_from_section as i32 * 16;
+
+    // Direct skylight (`ChunkSkyLightSources` / `isSourceLevel`): every cell
+    // strictly above a column's occluder is a level-15 source. We only need the
+    // grid filled up to the base of the shared region — the one sentinel row at
+    // `bright_from_gy` keeps the flood/frontier from mis-reading the skipped
+    // uniform cells above it as dark. (Clamped to stay in-bounds; when there is no
+    // shared region this fills the whole open column exactly as before.)
+    let fill_top = bright_from_gy.min(LIGHT_Y_MAX - 1);
+    for lz in 0..16i32 {
+        for lx in 0..16i32 {
+            let ceil = col_ceiling[(lz * 16 + lx) as usize];
+            let lo = (ceil + 1).max(LIGHT_Y_MIN);
+            for gy in lo..=fill_top {
+                light[idx(lx, gy, lz)] = MAX_LEVEL;
             }
         }
     }
 
     // Seed the BFS from source cells on the shadow frontier only — a source that
-    // borders a transparent-but-dark cell. Interior sky (open air with lit
-    // neighbours) needs no propagation, so terrain with no overhangs enqueues
-    // nothing and the flood is a no-op.
+    // borders a transparent-but-dark cell. Such a source must (a) be a source, so
+    // it sits strictly above its own column's occluder, hence `gy > global_min_top`;
+    // and (b) border a darker cell, which is impossible once every neighbour is
+    // itself a source, i.e. above `global_max_top`. So all frontier candidates lie
+    // in the band `(global_min_top, global_max_top]` — scan only that, not the
+    // whole ~65k-cell volume. Flat/no-overhang terrain makes the band empty.
+    let band_lo = (global_min_top + 1).max(LIGHT_Y_MIN);
+    let band_hi = global_max_top;
     let mut queue: VecDeque<usize> = VecDeque::new();
-    for lz in 0..16 {
-        for lx in 0..16 {
-            for gy in LIGHT_Y_MIN..LIGHT_Y_MAX {
+    for gy in band_lo..=band_hi {
+        for lz in 0..16i32 {
+            for lx in 0..16i32 {
                 let i = idx(lx, gy, lz);
                 if light[i] == MAX_LEVEL && borders_dark_pervious(&light, dampening, lx, gy, lz) {
                     queue.push_back(i);
@@ -235,7 +278,7 @@ fn compute_sky(dampening: &[u8]) -> Vec<u8> {
         }
     }
     flood(&mut light, dampening, &mut queue);
-    light
+    (light, bright_from_section)
 }
 
 /// Block light: seed each emitting block with its emission level, then flood.
@@ -316,34 +359,58 @@ fn flood(light: &mut [u8], dampening: &[u8], queue: &mut VecDeque<usize>) {
     }
 }
 
-/// Slice a filled [`VOLUME`] light grid into per-section `DataLayer`s. A section
-/// that is entirely zero becomes `None` (empty); otherwise its 4096 nibbles are
-/// packed into 2048 bytes at `y<<8 | z<<4 | x` (`DataLayer.getIndex`).
+/// A section's worth of nibbles, all `15` — the packed form of uniformly open
+/// sky. Shared across chunks so full-bright sections need only a cheap copy rather
+/// than nibble-packing 4096 identical cells each time.
+const FULL_BRIGHT_LAYER: [u8; DATA_LAYER_SIZE] = [0xFF; DATA_LAYER_SIZE];
+
+/// Pack one section of a filled [`VOLUME`] light grid into a `DataLayer`. Returns
+/// `None` for an all-zero section (empty); otherwise its 4096 nibbles are packed
+/// into 2048 bytes at `y<<8 | z<<4 | x` (`DataLayer.getIndex`).
+fn pack_section(light: &[u8], section: usize) -> Option<Vec<u8>> {
+    let base_gy = LIGHT_Y_MIN + (section as i32) * 16;
+    let mut bytes = vec![0u8; DATA_LAYER_SIZE];
+    let mut any = false;
+    for ly in 0..16i32 {
+        let gy = base_gy + ly;
+        for lz in 0..16i32 {
+            for lx in 0..16i32 {
+                let value = light[idx(lx, gy, lz)];
+                if value == 0 {
+                    continue;
+                }
+                any = true;
+                let cell = ((ly << 8) | (lz << 4) | lx) as usize;
+                // Even cell → low nibble, odd cell → high nibble.
+                bytes[cell >> 1] |= value << (4 * (cell & 1));
+            }
+        }
+    }
+    if any {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
+/// Slice a filled [`VOLUME`] light grid into per-section `DataLayer`s.
 fn pack_layers(light: &[u8]) -> Vec<Option<Vec<u8>>> {
     (0..LIGHT_SECTION_COUNT)
+        .map(|section| pack_section(light, section))
+        .collect()
+}
+
+/// Like [`pack_layers`], but sections at or above `bright_from_section` are known
+/// to be uniformly open sky (source 15) — [`compute_sky`] never fills the grid
+/// there. Serve those from the shared [`FULL_BRIGHT_LAYER`] (identical bytes to
+/// nibble-packing all-15) instead of scanning 4096 cells per chunk.
+fn pack_sky(light: &[u8], bright_from_section: usize) -> Vec<Option<Vec<u8>>> {
+    (0..LIGHT_SECTION_COUNT)
         .map(|section| {
-            let base_gy = LIGHT_Y_MIN + (section as i32) * 16;
-            let mut bytes = vec![0u8; DATA_LAYER_SIZE];
-            let mut any = false;
-            for ly in 0..16i32 {
-                let gy = base_gy + ly;
-                for lz in 0..16i32 {
-                    for lx in 0..16i32 {
-                        let value = light[idx(lx, gy, lz)];
-                        if value == 0 {
-                            continue;
-                        }
-                        any = true;
-                        let cell = ((ly << 8) | (lz << 4) | lx) as usize;
-                        // Even cell → low nibble, odd cell → high nibble.
-                        bytes[cell >> 1] |= value << (4 * (cell & 1));
-                    }
-                }
-            }
-            if any {
-                Some(bytes)
+            if section >= bright_from_section {
+                Some(FULL_BRIGHT_LAYER.to_vec())
             } else {
-                None
+                pack_section(light, section)
             }
         })
         .collect()
@@ -378,12 +445,20 @@ mod tests {
     fn open_column_is_fully_sky_lit_above_surface_and_dark_below() {
         let gen = GenChunk::flat(63);
         let edits = HashMap::new();
-        let sky = compute_sky(&dampening_grid(&gen, &edits));
+        let (dampening, col_ceiling) = dampening_grid(&gen, &edits);
+        let (sky, bright_from_section) = compute_sky(&dampening, &col_ceiling);
         let (lx, lz) = (0, 0);
         let surface = 63; // flat plains: grass at y=63
-        // Air directly above the surface sees the sky: full 15.
+        // Air directly above the surface sees the sky: full 15 (computed band).
         assert_eq!(sky[idx(lx, surface + 1, lz)], 15);
-        assert_eq!(sky[idx(lx, 200, lz)], 15);
+        // High open air lives in the skipped uniform region: the grid is left
+        // unfilled there, but the *packed* output (what the client sees) is 15.
+        let light = compute_light(&gen, &edits);
+        let section = section_of(200);
+        assert!(section >= bright_from_section);
+        let bytes = light.sky[section].as_ref().expect("open-sky section present");
+        let ly = 200 - (LIGHT_Y_MIN + section as i32 * 16);
+        assert_eq!(nibble(bytes, lx, ly, lz), 15);
         // The surface block and everything below it are unlit.
         assert_eq!(sky[idx(lx, surface, lz)], 0);
         assert_eq!(sky[idx(lx, surface - 3, lz)], 0);
@@ -399,7 +474,8 @@ mod tests {
         let roof_y = 150;
         edits.insert(edit_key_for(8, roof_y, 8), states::STONE);
 
-        let sky = compute_sky(&dampening_grid(&gen, &edits));
+        let (dampening, col_ceiling) = dampening_grid(&gen, &edits);
+        let sky = compute_sky(&dampening, &col_ceiling).0;
         // Directly beneath the block: shadowed, one step in from open sky → 14.
         assert_eq!(sky[idx(8, roof_y - 1, 8)], 14);
         // Its neighbours (and open air elsewhere) still see full sky.

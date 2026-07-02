@@ -34,7 +34,7 @@ pub mod storage;
 
 pub use block_item::block_state_for_item;
 pub use chunk_data::{
-    chunk_columns, chunk_wire_ready, evict_chunk, evict_unused_chunks, prefetch,
+    chunk_columns, chunk_wire_ready_snapshot, evict_chunk, evict_unused_chunks, prefetch,
     resident_surface_height, save_dirty_chunks, set_block, try_block_state_at, try_raw_brightness,
 };
 // The generating block/brightness reads: retained as the non-tick-thread seam

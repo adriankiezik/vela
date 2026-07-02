@@ -29,6 +29,7 @@
 // playable; until then only the tests exercise this module.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -924,6 +925,28 @@ pub struct ChunkEvalState {
     c2d: Vec<Cache2DState>,
     once: Vec<CacheOnceState>,
     cell: Vec<Vec<f64>>,
+    /// A LIFO free-list of scratch `f64` buffers, reused by the `fill_array`
+    /// hot path (`Ap2::Add`'s second operand, `CacheOnce`'s first-miss copy) so
+    /// those bulk evaluations are allocation-free after warmup. Buffers are
+    /// borrowed via `scratch_take`/`scratch_give` in strict push/pop nesting;
+    /// a taken buffer is never in the free-list, so it can never alias `out`.
+    scratch_free: Vec<Vec<f64>>,
+}
+
+impl ChunkEvalState {
+    /// Borrow a scratch buffer of exactly `len` (contents overwritten by the
+    /// caller before use, so the fill is value-neutral).
+    fn scratch_take(&mut self, len: usize) -> Vec<f64> {
+        let mut b = self.scratch_free.pop().unwrap_or_default();
+        b.clear();
+        b.resize(len, 0.0);
+        b
+    }
+
+    /// Return a scratch buffer to the free-list for reuse.
+    fn scratch_give(&mut self, b: Vec<f64>) {
+        self.scratch_free.push(b);
+    }
 }
 
 impl ChunkEvalState {
@@ -958,6 +981,7 @@ impl ChunkEvalState {
             c2d: Vec::new(),
             once: Vec::new(),
             cell: Vec::new(),
+            scratch_free: Vec::new(),
         }
     }
 }
@@ -1341,11 +1365,15 @@ impl Dfn {
                 argument1.fill_array(out, provider, st);
                 match kind {
                     Ap2Kind::Add => {
-                        let mut v2 = vec![0.0; out.len()];
+                        // Reusable scratch buffer instead of a fresh alloc per
+                        // call; `fill_array` fully overwrites it, so its prior
+                        // contents are irrelevant (value-identical to `vec!`).
+                        let mut v2 = st.scratch_take(out.len());
                         argument2.fill_array(&mut v2, provider, st);
-                        for (o, v) in out.iter_mut().zip(v2) {
-                            *o += v;
+                        for (o, v) in out.iter_mut().zip(v2.iter()) {
+                            *o += *v;
                         }
+                        st.scratch_give(v2);
                     }
                     Ap2Kind::Mul => {
                         for i in 0..out.len() {
@@ -1431,12 +1459,21 @@ impl Dfn {
                 } else {
                     filler.fill_array(out, provider, st);
                     let counter = st.array_interpolation_counter;
-                    let s = &mut st.once[*slot];
-                    match &mut s.last_array {
+                    // Reuse the slot's existing store when it fits; otherwise
+                    // draw a buffer from the scratch free-list instead of a
+                    // fresh `to_vec` alloc. The stored contents are an exact
+                    // copy of `out` either way.
+                    let mut stored = st.once[*slot].last_array.take();
+                    match &mut stored {
                         Some(a) if a.len() == out.len() => a.copy_from_slice(out),
-                        _ => s.last_array = Some(out.to_vec()),
+                        _ => {
+                            let mut b = st.scratch_take(out.len());
+                            b.copy_from_slice(out);
+                            stored = Some(b);
+                        }
                     }
-                    s.last_array_counter = counter;
+                    st.once[*slot].last_array = stored;
+                    st.once[*slot].last_array_counter = counter;
                 }
             }
             // Everything else is a SimpleFunction (or FlatCache/CacheAllInCell,
@@ -1765,6 +1802,9 @@ pub struct NoiseChunk {
     /// creation (fill) order.
     interp_fillers: Vec<Rc<Dfn>>,
     cell_fillers: Vec<Rc<Dfn>>,
+    /// Wrapped filler behind each `FlatCache` slot, in creation order. Used to
+    /// (re-)prefill the quart-resolution 2D caches for a chunk origin.
+    flat_fillers: Vec<Rc<Dfn>>,
     preliminary_surface: Rc<Dfn>,
     /// `cacheAllInCell(add(finalDensity, beardifier))`.
     full_noise_density: Rc<Dfn>,
@@ -1794,8 +1834,88 @@ struct OreVeinState {
     random: PositionalRandomFactory,
 }
 
+/// The per-thread cached result of `router.mapAll(this::wrap)`.
+///
+/// The wrapped router *graph* — the `Rc<Dfn>` node tree, its constant-folded
+/// min/max bounds, and the estimated spline bounds — is **identical for every
+/// chunk** of a given `RandomState`: `wrap`/`wrap_spline` only depend on the
+/// router structure and the (per-world, not per-chunk) noise instances, never
+/// on the chunk origin. The only chunk-specific state is the per-slot cache
+/// storage in `ChunkEvalState` and the `FlatCache` prefill values.
+///
+/// So we build the graph once per thread (keyed by router identity) and, per
+/// chunk, only allocate fresh slot storage + re-prefill the flat caches. This
+/// skips re-allocating the whole `Rc<Dfn>` tree and re-running the expensive
+/// `Spline::new_multipoint` bound estimation over the large offset/factor/
+/// jaggedness splines on every chunk. Output is bit-identical because the
+/// graph a fresh `wrap()` would produce is structurally the same graph with
+/// the same slot indices (slots are assigned in deterministic wrap order).
+#[derive(Clone)]
+struct RouterTemplate {
+    /// Identity of the source router this template was built from
+    /// (`Rc::as_ptr` of `final_density`). A different `RandomState` (new seed)
+    /// produces a different pointer and forces a rebuild.
+    key: *const Dfn,
+    /// Keeps the source router's `final_density` allocation alive so `key`
+    /// (its address) can never be reused by a different router while cached.
+    _anchor: Rc<Dfn>,
+    // Wrapped output handles (chunk-independent).
+    barrier: Rc<Dfn>,
+    fluid_level_floodedness: Rc<Dfn>,
+    fluid_level_spread: Rc<Dfn>,
+    lava: Rc<Dfn>,
+    erosion: Rc<Dfn>,
+    depth: Rc<Dfn>,
+    preliminary_surface: Rc<Dfn>,
+    full_noise_density: Rc<Dfn>,
+    vein_toggle: Rc<Dfn>,
+    vein_ridged: Rc<Dfn>,
+    vein_gap: Rc<Dfn>,
+    // Slot fillers, in creation order (slot index == position).
+    interp_fillers: Vec<Rc<Dfn>>,
+    cell_fillers: Vec<Rc<Dfn>>,
+    flat_fillers: Vec<Rc<Dfn>>,
+    // Slot-storage metadata needed to build a fresh `ChunkEvalState`.
+    num_c2d: usize,
+    num_once: usize,
+    /// `noise_size_xz + 1` — the side length of every `FlatCache`'s 2D grid.
+    flat_size_xz: i32,
+    /// `cell_width * cell_width * cell_height` — length of every cell cache.
+    cell_slot_len: usize,
+    cell_count_y: i32,
+    cell_count_xz: i32,
+}
+
+thread_local! {
+    /// The wrapped router graph for the router most recently seen on this
+    /// thread. Rebuilt on the first `for_chunk` and whenever the router
+    /// identity changes.
+    static ROUTER_TEMPLATE: RefCell<Option<RouterTemplate>> = const { RefCell::new(None) };
+}
+
 impl NoiseChunk {
+    /// Build the per-chunk `NoiseChunk`. The first call for a given router (per
+    /// thread) does the full `mapAll(wrap)` and caches the resulting graph;
+    /// subsequent calls reuse that graph and only rebuild the chunk-specific
+    /// slot storage + flat-cache prefill.
     pub fn for_chunk(rs: &RandomState, chunk_min_block_x: i32, chunk_min_block_z: i32) -> Self {
+        let key = Rc::as_ptr(&rs.router.final_density);
+        let cached = ROUTER_TEMPLATE.with(|c| {
+            let c = c.borrow();
+            match &*c {
+                Some(t) if t.key == key => Some(t.clone()),
+                _ => None,
+            }
+        });
+        match cached {
+            Some(tmpl) => Self::for_chunk_from_template(rs, chunk_min_block_x, chunk_min_block_z, tmpl),
+            None => Self::for_chunk_full(rs, chunk_min_block_x, chunk_min_block_z),
+        }
+    }
+
+    /// The slow path: full `mapAll(wrap)`. Also captures the wrapped graph into
+    /// the thread-local `ROUTER_TEMPLATE` for reuse by later chunks.
+    fn for_chunk_full(rs: &RandomState, chunk_min_block_x: i32, chunk_min_block_z: i32) -> Self {
         let ns = rs.settings.noise;
         let cell_width = ns.cell_width();
         let cell_height = ns.cell_height();
@@ -1817,6 +1937,7 @@ impl NoiseChunk {
             st,
             interp_fillers: Vec::new(),
             cell_fillers: Vec::new(),
+            flat_fillers: Vec::new(),
             preliminary_surface: Rc::new(Dfn::Constant(0.0)),
             full_noise_density: Rc::new(Dfn::Constant(0.0)),
             preliminary_cache: HashMap::new(),
@@ -1865,9 +1986,141 @@ impl NoiseChunk {
         // to exactly these two new nodes.
         let add = Rc::new(new_ap2(Ap2Kind::Add, final_density, Rc::new(Dfn::Beardifier)));
         nc.full_noise_density = nc.new_cell_cache(add);
+        // Capture the fully-wrapped graph for reuse by later chunks on this
+        // thread (before `vein_*` may be moved into `ore_veins`).
+        let template = RouterTemplate {
+            key: Rc::as_ptr(&rs.router.final_density),
+            _anchor: rs.router.final_density.clone(),
+            barrier: nc.barrier.clone(),
+            fluid_level_floodedness: nc.fluid_level_floodedness.clone(),
+            fluid_level_spread: nc.fluid_level_spread.clone(),
+            lava: nc.lava.clone(),
+            erosion: nc.erosion.clone(),
+            depth: nc.depth.clone(),
+            preliminary_surface: nc.preliminary_surface.clone(),
+            full_noise_density: nc.full_noise_density.clone(),
+            vein_toggle: vein_toggle.clone(),
+            vein_ridged: vein_ridged.clone(),
+            vein_gap: vein_gap.clone(),
+            interp_fillers: nc.interp_fillers.clone(),
+            cell_fillers: nc.cell_fillers.clone(),
+            flat_fillers: nc.flat_fillers.clone(),
+            num_c2d: nc.st.c2d.len(),
+            num_once: nc.st.once.len(),
+            flat_size_xz: nc.st.noise_size_xz + 1,
+            cell_slot_len: (nc.st.cell_width * nc.st.cell_width * nc.st.cell_height) as usize,
+            cell_count_y: nc.st.cell_count_y,
+            cell_count_xz: nc.st.cell_count_xz,
+        };
+        ROUTER_TEMPLATE.with(|c| *c.borrow_mut() = Some(template));
         if rs.settings.ore_veins_enabled {
             nc.ore_veins =
                 Some(OreVeinState { vein_toggle, vein_ridged, vein_gap, random: rs.ore_random });
+        }
+        nc
+    }
+
+    /// The fast path: reuse a cached wrapped graph, rebuilding only the
+    /// chunk-specific slot storage and re-prefilling the flat caches.
+    fn for_chunk_from_template(
+        rs: &RandomState,
+        chunk_min_block_x: i32,
+        chunk_min_block_z: i32,
+        tmpl: RouterTemplate,
+    ) -> Self {
+        let ns = rs.settings.noise;
+        let cell_width = ns.cell_width();
+        let cell_height = ns.cell_height();
+        let cell_count_xz = 16 / cell_width;
+        // Fresh, zeroed slot storage sized exactly as a full `wrap()` would
+        // produce (slot counts/sizes depend only on the router + cell dims,
+        // both chunk-independent). Cache sentinels match `wrap_new`'s inits.
+        let flat_side = (tmpl.flat_size_xz * tmpl.flat_size_xz) as usize;
+        let st = ChunkEvalState {
+            cell_width,
+            cell_height,
+            cell_count_xz,
+            cell_count_y: ns.height.div_euclid(cell_height),
+            cell_noise_min_y: ns.min_y.div_euclid(cell_height),
+            first_cell_x: chunk_min_block_x.div_euclid(cell_width),
+            first_cell_z: chunk_min_block_z.div_euclid(cell_width),
+            first_noise_x: quart_from_block(chunk_min_block_x),
+            first_noise_z: quart_from_block(chunk_min_block_z),
+            noise_size_xz: quart_from_block(cell_count_xz * cell_width),
+            interp: (0..tmpl.interp_fillers.len())
+                .map(|_| InterpState::new(tmpl.cell_count_y, tmpl.cell_count_xz))
+                .collect(),
+            flat: (0..tmpl.flat_fillers.len())
+                .map(|_| FlatState { values: vec![0.0; flat_side], size_xz: tmpl.flat_size_xz })
+                .collect(),
+            c2d: (0..tmpl.num_c2d)
+                .map(|_| Cache2DState { last_pos: INVALID_POS_2D, last_value: 0.0 })
+                .collect(),
+            once: (0..tmpl.num_once)
+                .map(|_| CacheOnceState {
+                    last_counter: 0,
+                    last_array_counter: 0,
+                    last_value: 0.0,
+                    last_array: None,
+                })
+                .collect(),
+            cell: (0..tmpl.cell_fillers.len()).map(|_| vec![0.0; tmpl.cell_slot_len]).collect(),
+            ..ChunkEvalState::standalone()
+        };
+        let mut nc = Self {
+            st,
+            interp_fillers: tmpl.interp_fillers,
+            cell_fillers: tmpl.cell_fillers,
+            flat_fillers: tmpl.flat_fillers,
+            preliminary_surface: tmpl.preliminary_surface,
+            full_noise_density: tmpl.full_noise_density,
+            preliminary_cache: HashMap::new(),
+            sea_level: rs.settings.sea_level,
+            min_y: ns.min_y,
+            height: ns.height,
+            aquifer: None,
+            barrier: tmpl.barrier,
+            fluid_level_floodedness: tmpl.fluid_level_floodedness,
+            fluid_level_spread: tmpl.fluid_level_spread,
+            lava: tmpl.lava,
+            erosion: tmpl.erosion,
+            depth: tmpl.depth,
+            ore_veins: None,
+        };
+        // Re-prefill each `FlatCache` for this chunk origin, in ascending slot
+        // order — i.e. children before parents, exactly as `new_flat_cache`
+        // ran during the original bottom-up wrap, so nested flat caches read
+        // already-prefilled values. Identical to a fresh `wrap()`'s prefill.
+        for slot in 0..nc.flat_fillers.len() {
+            let filler = nc.flat_fillers[slot].clone();
+            let size = nc.st.flat[slot].size_xz;
+            for x in 0..=nc.st.noise_size_xz {
+                let block_x = quart_to_block(nc.st.first_noise_x + x);
+                for z in 0..=nc.st.noise_size_xz {
+                    let block_z = quart_to_block(nc.st.first_noise_z + z);
+                    let v = filler.compute(Ctx::Point { x: block_x, y: 0, z: block_z }, &mut nc.st);
+                    nc.st.flat[slot].values[(x + z * size) as usize] = v;
+                }
+            }
+        }
+        // Aquifer state is chunk-specific (grid origin + surface sampling) and
+        // reads the just-prefilled flat caches, so build it after the prefill.
+        if rs.settings.aquifers_enabled {
+            nc.aquifer = Some(nc.create_aquifer(
+                rs.aquifer_random,
+                chunk_min_block_x,
+                chunk_min_block_z,
+                ns.min_y,
+                ns.height,
+            ));
+        }
+        if rs.settings.ore_veins_enabled {
+            nc.ore_veins = Some(OreVeinState {
+                vein_toggle: tmpl.vein_toggle,
+                vein_ridged: tmpl.vein_ridged,
+                vein_gap: tmpl.vein_gap,
+                random: rs.ore_random,
+            });
         }
         nc
     }
@@ -2071,6 +2324,7 @@ impl NoiseChunk {
         }
         let slot = self.st.flat.len();
         self.st.flat.push(FlatState { values, size_xz });
+        self.flat_fillers.push(filler.clone());
         Rc::new(Dfn::FlatCacheNode { slot, filler })
     }
 

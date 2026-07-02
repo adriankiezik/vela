@@ -15,21 +15,39 @@ pub(super) fn encode_blob(
     gen: &GenChunk,
     edits: &std::collections::HashMap<u32, BlockState>,
 ) -> Vec<u8> {
+    // Biomes are per-COLUMN in this data model: `write_biome_palette` reads only
+    // `gen.biome_id(x, z)` (no vertical variation — see that function's doc), so
+    // the encoded biome container is byte-identical for all 24 vertical sections.
+    // Compute it once and splice the same bytes into each section rather than
+    // rebuilding the palette 24× per chunk.
+    let biome_bytes = {
+        let mut bw = PacketWriter::new();
+        write_biome_palette(gen, &mut bw);
+        bw.buf.to_vec()
+    };
+    // Fast path for the overwhelmingly common prefetch case: a freshly generated
+    // chunk has zero edits, so every cell is its baked baseline and we can skip
+    // the per-cell `edit_key` + HashMap probe (98,304 probes/chunk) entirely.
+    let edit_free = edits.is_empty();
+
     let mut out = PacketWriter::new();
     for section in 0..SECTION_COUNT {
         let base_y = MIN_Y + section * 16;
-        encode_section(base_y, gen, edits, &mut out);
+        encode_section(base_y, gen, edits, edit_free, &biome_bytes, &mut out);
     }
     out.buf.to_vec()
 }
 
 /// Serialize one section: counts, then the block-state and biome containers. The
 /// baseline `gen` supplies the terrain/feature blocks and per-column biomes;
-/// `edits` overrides individual cells.
+/// `edits` overrides individual cells. `edit_free` selects the no-edit fast path,
+/// and `biome_bytes` is the once-per-chunk-precomputed biome container.
 fn encode_section(
     base_y: i32,
     gen: &GenChunk,
     edits: &std::collections::HashMap<u32, BlockState>,
+    edit_free: bool,
+    biome_bytes: &[u8],
     out: &mut PacketWriter,
 ) {
     // Cell index is vanilla's `(y << 8) | (z << 4) | x`.
@@ -39,7 +57,15 @@ fn encode_section(
         let world_y = base_y + ly;
         for lz in 0..16i32 {
             for lx in 0..16i32 {
-                let state = cell_state(gen, edits, lx, world_y, lz);
+                // Byte-identical to `cell_state`: with no edits present that
+                // function always falls through to `gen.base_state`, so reading
+                // the baseline directly here produces exactly the same state —
+                // it just avoids the redundant edit-key hash and empty-map probe.
+                let state = if edit_free {
+                    gen.base_state(lx, world_y, lz)
+                } else {
+                    cell_state(gen, edits, lx, world_y, lz)
+                };
                 if state != states::AIR {
                     non_air += 1;
                 }
@@ -52,7 +78,7 @@ fn encode_section(
     out.write_i16(non_air as i16); // non-empty block count
     out.write_i16(0); // fluid count
     write_block_palette(&cells, out); // block-state container
-    write_biome_palette(gen, out); // biome container (4×4×4 cells)
+    out.write_bytes(biome_bytes); // biome container (identical across sections)
 }
 
 /// Write the section's biome `PalettedContainer`. Biomes here are horizontal-only

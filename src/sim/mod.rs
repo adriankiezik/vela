@@ -57,6 +57,9 @@ pub fn run(
     // Per-column player reference counts drive incremental, reference-counted
     // chunk eviction (a column unloads the tick its last viewer leaves).
     world.init_resource::<chunking::ChunkRefs>();
+    // Dedups the per-tick cold-window prefetch sweep so each still-building column
+    // is queued at most once (see `send_queued_chunks`).
+    world.init_resource::<chunking::PrefetchQueued>();
     // The network half raises this flag on Ctrl+C; the run loop watches it (and
     // the `/stop` command sets it) so an external shutdown saves the world.
     world.insert_resource(Control { stop: false, signal: shutdown });

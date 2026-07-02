@@ -641,12 +641,17 @@ fn with_pipeline<R>(f: impl FnOnce(&mut ChunkPipeline) -> R) -> R {
 ///
 /// The cache is now per worker thread (see [`with_pipeline`]), so the bound is
 /// paid once per prefetch worker: at most `prefetch_workers() × PROTO_CACHE_LIMIT`
-/// protos live at once. The limit is chosen accordingly — 512 protos ≈ 50 MiB
-/// per thread, ~400 MiB across a maxed-out 8-worker pool. `PROTO_KEEP_RADIUS`
-/// keeps a 17×17 (289-proto) working set on each trim, comfortably under the
-/// limit so trims have hysteresis rather than thrashing, while still amortizing
-/// the shared biome/noise rings across a worker's local moves.
-const PROTO_CACHE_LIMIT: usize = 512;
+/// protos live at once. The worker pool is no longer capped at 8 (it now runs
+/// ~`num_cpus - 2`, e.g. 22 on a 24-core host), so the per-worker limit is
+/// lowered to keep aggregate memory bounded: 320 protos ≈ 31 MiB per thread
+/// (~100 KiB each), ~690 MiB across a 22-worker pool — up from ~400 MiB for
+/// far more throughput. `PROTO_KEEP_RADIUS` keeps a 17×17 (289-proto) working
+/// set on each trim, which must stay under the limit so trims have hysteresis
+/// rather than thrashing; 320 sits just above 289 to keep that margin while
+/// holding aggregate memory down. Spatial sharding in `prefetch` keeps each
+/// worker's moves local, so this smaller cache still amortizes the shared
+/// biome/noise rings across a worker's neighborhood.
+const PROTO_CACHE_LIMIT: usize = 320;
 const PROTO_KEEP_RADIUS: i32 = 8;
 
 /// The status the live path generates to. SURFACE is the last stage that

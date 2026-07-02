@@ -150,15 +150,17 @@ fn grid_index(lx: i32, world_y: i32, lz: i32) -> usize {
 }
 
 /// Whether the live path runs the vanilla-parity pipeline instead of the
-/// legacy generator — opt-in via `VELA_PARITY_WORLDGEN=1` while the parity
-/// stack is still growing (carvers P7, features P8: parity worlds currently
-/// have no trees/ores-features/decorations). The two generators produce
-/// unrelated terrain for the same seed, so switch only on a fresh world dir
-/// (a saved chunk diffs against whichever baseline regenerates).
+/// legacy generator. Parity is now the **default**; set `VELA_PARITY_WORLDGEN=0`
+/// to opt back out to the legacy generator. Note the parity stack is still
+/// growing (carvers P7, features P8: parity worlds currently have no
+/// trees/ores-features/decorations). The two generators produce unrelated
+/// terrain for the same seed, so switch only on a fresh world dir (a saved
+/// chunk diffs against whichever baseline regenerates).
 fn parity_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("VELA_PARITY_WORLDGEN").is_ok_and(|v| !v.is_empty() && v != "0")
+        // Default on; only an explicit "0"/empty disables it.
+        std::env::var("VELA_PARITY_WORLDGEN").map_or(true, |v| !v.is_empty() && v != "0")
     })
 }
 

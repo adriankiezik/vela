@@ -640,25 +640,38 @@ pub fn set_entity_data(entity_id: i32, sneaking: bool, sprinting: bool) -> Bytes
 pub fn level_chunk(cx: i32, cz: i32) -> Bytes {
     let columns = crate::world::chunk_columns(cx, cz);
 
-    let mut p = PacketWriter::new();
-    p.write_i32(cx);
-    p.write_i32(cz);
-    // --- ClientboundLevelChunkPacketData ---
-    // Heightmaps: a map of type-id -> packed long[] (ByteBufCodecs.map + LONG_ARRAY).
-    p.write_varint(columns.heightmaps.len() as i32);
-    for (type_id, longs) in &columns.heightmaps {
-        p.write_varint(*type_id);
-        p.write_varint(longs.len() as i32);
-        for &l in longs {
-            p.write_i64(l);
-        }
-    }
-    p.write_varint(columns.blob.len() as i32); // section blob length
-    p.write_bytes(&columns.blob);
-    p.write_varint(0); // block entities: none
-    // --- ClientboundLightUpdatePacketData ---
-    write_light(&mut p, &columns.light);
-    frame(CB_PLAY_LEVEL_CHUNK, &p.buf)
+    // The framed packet is a pure function of `(cx, cz)` and this column's cached
+    // wire data — identical bytes for every recipient (see the invariance note on
+    // `ChunkColumns::level_chunk_frame`) — so serialize it once and hand each
+    // additional viewer a refcount clone. The `OnceLock` lives inside the
+    // `Arc<ChunkColumns>` wire cache, so an edit that invalidates the wire
+    // (`wire = None`) drops this frame with it; the next stream rebuilds both.
+    // `get_or_init` may race across the send + prefetch threads, but every builder
+    // produces the same bytes, so whichever wins is correct.
+    columns
+        .level_chunk_frame
+        .get_or_init(|| {
+            let mut p = PacketWriter::new();
+            p.write_i32(cx);
+            p.write_i32(cz);
+            // --- ClientboundLevelChunkPacketData ---
+            // Heightmaps: a map of type-id -> packed long[] (ByteBufCodecs.map + LONG_ARRAY).
+            p.write_varint(columns.heightmaps.len() as i32);
+            for (type_id, longs) in &columns.heightmaps {
+                p.write_varint(*type_id);
+                p.write_varint(longs.len() as i32);
+                for &l in longs {
+                    p.write_i64(l);
+                }
+            }
+            p.write_varint(columns.blob.len() as i32); // section blob length
+            p.write_bytes(&columns.blob);
+            p.write_varint(0); // block entities: none
+            // --- ClientboundLightUpdatePacketData ---
+            write_light(&mut p, &columns.light);
+            frame(CB_PLAY_LEVEL_CHUNK, &p.buf)
+        })
+        .clone()
 }
 
 /// Serialize a chunk's light into a `ClientboundLightUpdatePacketData` body: four
