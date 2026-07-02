@@ -287,22 +287,29 @@ impl ChunkSender {
     /// always gates on wire readiness).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn next_batch(&mut self) -> Vec<(i32, i32)> {
-        self.next_batch_ready(|_| true)
+        self.next_batch_ready(usize::MAX, |_| true)
     }
 
-    /// [`next_batch`](Self::next_batch) with a readiness gate: the batch takes
-    /// the longest *ready* prefix of the pending queue (stopping at the first
-    /// cold column preserves strict nearest-first delivery). When the head is
-    /// cold nothing is taken and nothing is accounted — the quota keeps
-    /// accumulating and the batch goes out a tick or two later once the
-    /// prefetch workers have warmed it.
+    /// [`next_batch`](Self::next_batch) with a readiness gate and a size cap:
+    /// the batch takes the longest *ready* prefix of the pending queue
+    /// (stopping at the first cold column preserves strict nearest-first
+    /// delivery), at most `limit` columns. When the head is cold or `limit`
+    /// is zero nothing is taken and nothing is accounted — the quota keeps
+    /// accumulating and the batch goes out a tick or two later.
     ///
-    /// Documented deviation: vanilla has no such gate because a chunk only
-    /// becomes sendable after its (asynchronous) generation reached FULL —
-    /// readiness is implied by tracking. Vela tracks columns at enqueue time,
-    /// so the send path checks readiness instead; the observable pacing
-    /// matches (chunks ship as generation completes, ticks never stall).
-    pub fn next_batch_ready(&mut self, ready: impl Fn((i32, i32)) -> bool) -> Vec<(i32, i32)> {
+    /// Documented deviations: vanilla needs neither gate. Readiness is
+    /// implied by its tracking (a chunk only becomes sendable after async
+    /// generation reached FULL); Vela tracks at enqueue time and checks
+    /// readiness at send. The size cap is Vela's stand-in for TCP
+    /// backpressure: vanilla's connection blocks when the socket can't
+    /// drain, while Vela's bounded outbox would otherwise overflow — the
+    /// caller caps the batch to the outbox headroom so the stream waits
+    /// instead of tripping the fell-too-far-behind disconnect.
+    pub fn next_batch_ready(
+        &mut self,
+        limit: usize,
+        ready: impl Fn((i32, i32)) -> bool,
+    ) -> Vec<(i32, i32)> {
         // `if (this.unacknowledgedBatches < this.maxUnacknowledgedBatches)`.
         if self.unacknowledged_batches >= self.max_unacknowledged_batches {
             return Vec::new();
@@ -315,8 +322,8 @@ impl ChunkSender {
             return Vec::new();
         }
         // `collectChunksToSend`: up to `Mth.floor(batchQuota)` nearest columns,
-        // bounded by the ready prefix.
-        let mut count = (self.batch_quota.floor() as usize).min(self.pending.len());
+        // bounded by the ready prefix and the caller's cap.
+        let mut count = (self.batch_quota.floor() as usize).min(self.pending.len()).min(limit);
         count = self.pending[..count]
             .iter()
             .position(|&c| !ready(c))
@@ -594,18 +601,42 @@ mod tests {
             s.mark_pending((i, 0));
         }
         // Head warm, (3,0) cold: only the prefix before it ships.
-        let batch = s.next_batch_ready(|c| c != (3, 0));
+        let batch = s.next_batch_ready(usize::MAX, |c| c != (3, 0));
         assert_eq!(batch, vec![(1, 0), (2, 0)]);
         assert_eq!(s.unacknowledged_batches, 1);
         s.on_ack(9.0);
         // Cold head: nothing ships, nothing is accounted, the queue keeps order.
         let quota_before = s.batch_quota;
-        assert!(s.next_batch_ready(|_| false).is_empty());
+        assert!(s.next_batch_ready(usize::MAX, |_| false).is_empty());
         assert_eq!(s.unacknowledged_batches, 0);
         assert!(s.batch_quota >= quota_before, "no quota debited on a cold head");
         assert_eq!(s.pending, vec![(3, 0), (4, 0), (5, 0)]);
         // Head warmed: the stream resumes in order.
-        assert_eq!(s.next_batch_ready(|_| true), vec![(3, 0), (4, 0), (5, 0)]);
+        assert_eq!(s.next_batch_ready(usize::MAX, |_| true), vec![(3, 0), (4, 0), (5, 0)]);
+    }
+
+    /// The outbox-headroom cap bounds a batch without accounting a skipped
+    /// one: zero headroom takes nothing (and debits nothing), a partial cap
+    /// takes exactly that many, and the remainder ships next time.
+    #[test]
+    fn headroom_cap_bounds_batches() {
+        let mut s = ChunkSender::new();
+        for i in 1..=6 {
+            s.mark_pending((i, 0));
+        }
+        // No headroom: the batch waits; nothing accounted.
+        assert!(s.next_batch_ready(0, |_| true).is_empty());
+        assert_eq!(s.unacknowledged_batches, 0);
+        assert_eq!(s.pending.len(), 6);
+        // Headroom for two: exactly two ship.
+        assert_eq!(s.next_batch_ready(2, |_| true), vec![(1, 0), (2, 0)]);
+        assert_eq!(s.unacknowledged_batches, 1);
+        s.on_ack(9.0);
+        // Full headroom: the rest follows in order.
+        assert_eq!(
+            s.next_batch_ready(usize::MAX, |_| true),
+            vec![(3, 0), (4, 0), (5, 0), (6, 0)]
+        );
     }
 
     /// `onChunkBatchReceivedByClient` decrements the outstanding count, never

@@ -208,11 +208,28 @@ pub fn apply_view_distance_change(world: &mut World, entity: Entity) {
 /// that stops fast travel from flooding the client's chunk-decode backlog.
 pub fn send_queued_chunks(mut players: Query<(&Conn, &mut ChunkSender)>) {
     for (conn, mut sender) in players.iter_mut() {
+        // Outbox backpressure — Vela's stand-in for vanilla's TCP-level
+        // blocking. The outbox is a bounded queue whose overflow on an
+        // ordering-critical packet force-disconnects (see `Conn`), and a
+        // full-rate batch is up to 64 large `level_chunk`s per tick — easily
+        // faster than a socket or a busy client drains. Cap each batch to the
+        // outbox's spare capacity, minus a reserve for everything else the
+        // tick sends reliably (chunk-center/forget frames, join sequences),
+        // and minus the two batch frames. When there's no headroom the batch
+        // simply waits — quota accumulates, nothing is accounted, nothing
+        // overflows.
+        const OUTBOX_RESERVE: usize = 256;
+        let headroom = conn
+            .outbox
+            .capacity()
+            .saturating_sub(OUTBOX_RESERVE)
+            .saturating_sub(2); // ChunkBatchStart + ChunkBatchFinished
         // Readiness-gated batching: only ship columns whose wire data the
         // background prefetch pool has already built, so `level_chunk` below
         // is a cache hit and the tick never blocks on generation (a parity
         // chunk costs ~40 ms to generate — most of a tick budget).
-        let batch = sender.next_batch_ready(|(cx, cz)| crate::world::chunk_wire_ready(cx, cz));
+        let batch =
+            sender.next_batch_ready(headroom, |(cx, cz)| crate::world::chunk_wire_ready(cx, cz));
         if batch.is_empty() {
             // A cold head can also mean its wire cache was *invalidated* (an
             // edit landed after the prefetch). Re-request warming for the
