@@ -337,6 +337,14 @@ pub(super) fn edit_key(lx: i32, y: i32, lz: i32) -> Option<u32> {
     Some(((y - MIN_Y) as u32) * COLUMNS as u32 + (lz as u32) * 16 + lx as u32)
 }
 
+/// Test-only: the default water block-state. Water has `getLightDampening() == 1`
+/// (a translucent occluder), so the light-engine tests use it to build submerged
+/// columns and assert skylight attenuates one level per water block.
+#[cfg(test)]
+pub(in crate::world) fn water_state() -> BlockState {
+    blocks::get().water
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
