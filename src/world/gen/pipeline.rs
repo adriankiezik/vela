@@ -35,13 +35,16 @@
 // Drop this once the live generator drives the pipeline.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use tracing::warn;
 
+use super::climate::MultiNoiseBiomeSource;
 use super::density::{FilledChunk, NoiseChunk, ParityBlock};
-use super::surface_rules::{BakedBiomes, SurfacedGenerator};
+use super::features::{self, FeatureRegistry};
+use super::placement::{DecorationLevel, Heightmap};
+use super::surface_rules::{obfuscate_seed, zoomed_quart, BakedBiomes, SurfacedGenerator};
 
 // ---------------------------------------------------------------------------
 // ChunkStatus
@@ -382,6 +385,9 @@ pub struct WorldGenRegion<'a> {
     /// `NoiseSettings.minY` / `height`, for biome-section indexing.
     min_y: i32,
     height: i32,
+    /// The raw world seed and sea level (P8 decoration seeding / level queries).
+    seed: i64,
+    sea_level: i32,
 }
 
 impl WorldGenRegion<'_> {
@@ -454,6 +460,80 @@ impl WorldGenRegion<'_> {
         let section = &sections[((qy >> 2) - min_section_y) as usize];
         section[((((qy & 3) * 4) + (quart_z & 3)) * 4 + (quart_x & 3)) as usize]
     }
+
+    /// The `FilledChunk` at a chunk position, without the `has_chunk` assertion
+    /// (a chunk outside the read radius, or below NOISE, reads as absent).
+    fn filled(&self, cx: i32, cz: i32) -> Option<&FilledChunk> {
+        self.chunks.get(&(cx, cz)).and_then(|c| c.blocks.as_ref())
+    }
+}
+
+// P8 — the feature/decoration view onto the region. Reads route to the owning
+// chunk's stored blocks / heightmaps; writes honor the FEATURES write radius.
+impl DecorationLevel for WorldGenRegion<'_> {
+    fn get_block(&self, x: i32, y: i32, z: i32) -> ParityBlock {
+        WorldGenRegion::get_block(self, x, y, z)
+    }
+
+    fn set_block(&mut self, x: i32, y: i32, z: i32, state: ParityBlock) -> bool {
+        WorldGenRegion::set_block(self, x, y, z, state)
+    }
+
+    fn get_height(&self, heightmap: Heightmap, x: i32, z: i32) -> i32 {
+        let column = ((z & 15) * 16 + (x & 15)) as usize;
+        let Some(fc) = self.filled(x >> 4, z >> 4) else {
+            return self.min_y;
+        };
+        match heightmap {
+            // The worldgen heightmaps are computed during `doFill`.
+            Heightmap::WorldSurfaceWg => fc.world_surface_wg[column],
+            Heightmap::OceanFloorWg => fc.ocean_floor_wg[column],
+            // The FINAL heightmaps are, in vanilla, primed at FEATURES start and
+            // then maintained by `setBlockState`. For an add-mostly feature pass
+            // that is equivalent to a fresh top-down scan of the current blocks,
+            // which is what we do (no separate heightmap state to maintain).
+            _ => {
+                let mut y = fc.min_y + fc.height - 1;
+                while y >= fc.min_y {
+                    if heightmap.matches(fc.block(x & 15, y, z & 15)) {
+                        return y + 1;
+                    }
+                    y -= 1;
+                }
+                fc.min_y
+            }
+        }
+    }
+
+    fn get_biome_fill(&self, x: i32, y: i32, z: i32) -> u16 {
+        // `WorldGenRegion.getBiome` → BiomeManager fuzzy zoom (`obfuscateSeed`,
+        // fiddled-distance corner pick) over the region's stored quart biomes.
+        let (qx, qy, qz) = zoomed_quart(obfuscate_seed(self.seed), x, y, z);
+        self.get_noise_biome(qx, qy, qz)
+    }
+
+    fn min_y(&self) -> i32 {
+        self.min_y
+    }
+
+    fn gen_depth(&self) -> i32 {
+        self.height
+    }
+
+    fn sea_level(&self) -> i32 {
+        self.sea_level
+    }
+}
+
+/// The process-wide overworld feature registry (parsed once from the vendored
+/// datapack). Keyed on nothing: the overworld biome order is fixed, so the
+/// `FeatureSorter` output is deterministic.
+fn overworld_feature_registry(source: &MultiNoiseBiomeSource) -> &'static FeatureRegistry {
+    static REG: OnceLock<FeatureRegistry> = OnceLock::new();
+    REG.get_or_init(|| {
+        let names = (0..source.biome_count()).map(|i| source.biome_name(i as u16).to_owned()).collect();
+        FeatureRegistry::load(names)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +557,8 @@ impl WorldGenRegion<'_> {
 /// the same measure-zero tie-break vanilla already leaves per-thread.
 pub struct ChunkPipeline {
     pub generator: SurfacedGenerator,
-    /// The world seed — `applyCarvers` re-seeds off `seed + carverIndex`.
+    /// The raw world seed — `applyCarvers` (P7) re-seeds off `seed + carverIndex`,
+    /// and `setDecorationSeed` (P8) needs it.
     seed: i64,
     chunks: HashMap<(i32, i32), ProtoChunk>,
 }
@@ -594,10 +675,54 @@ impl ChunkPipeline {
                 super::carvers::apply_carvers(&self.generator, self.seed, pos, &mut blocks);
                 self.chunks.get_mut(&pos).expect("proto chunk resident").blocks = Some(blocks);
             }
-            // P9 (structure starts/references) and P8 (features): no-op
-            // contributions are exactly vanilla wherever those systems would not
-            // have touched the chunk. Light and spawn live outside the worldgen
-            // parity layer (encode-time light, sim spawning).
+            // `generateFeatures` → `applyBiomeDecoration` (P8). Features of every
+            // biome present in the chunk's 3×3 section neighborhood are unioned
+            // (FeatureSorter global order), seeded per feature, and placed
+            // through a write-radius-1 region.
+            ChunkStatus::Features => {
+                let settings = &self.generator.inner.random_state.settings;
+                let (min_y, height, sea_level, seed) =
+                    (noise.min_y, noise.height, settings.sea_level, self.seed);
+                let registry = overworld_feature_registry(&self.generator.source);
+
+                // `possibleBiomes`: every fill value in the 3×3 neighborhood's
+                // stored biome sections (vanilla unions `getBiomes` over the
+                // ChunkPos.rangeClosed(±1) chunks).
+                let mut possible: HashSet<u16> = HashSet::new();
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        if let Some(chunk) = self.chunks.get(&(pos.0 + dx, pos.1 + dz)) {
+                            if let Some(sections) = &chunk.biome_sections {
+                                for section in sections {
+                                    possible.extend(section.iter().copied());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut region = WorldGenRegion {
+                    chunks: &mut self.chunks,
+                    center: pos,
+                    step,
+                    min_y,
+                    height,
+                    seed,
+                    sea_level,
+                };
+                features::apply_biome_decoration(
+                    registry,
+                    &mut region,
+                    &possible,
+                    seed,
+                    pos.0 * 16,
+                    pos.1 * 16,
+                );
+            }
+            // P9 (structure starts/references): no-op contributions are exactly
+            // vanilla wherever those systems would not have touched the chunk.
+            // Light and spawn live outside the worldgen parity layer (encode-time
+            // light, sim spawning).
             _ => {}
         }
     }
@@ -605,13 +730,18 @@ impl ChunkPipeline {
     /// The generating region for a step at `pos` — what a carver/feature
     /// implementation receives. Exposed for the P7/P8 layers and tests.
     pub fn region_for<'a>(&'a mut self, pos: (i32, i32), step: &'a ChunkStep) -> WorldGenRegion<'a> {
-        let noise = self.generator.inner.random_state.settings.noise;
+        let settings = &self.generator.inner.random_state.settings;
+        let noise = settings.noise;
+        let sea_level = settings.sea_level;
+        let seed = self.seed;
         WorldGenRegion {
             chunks: &mut self.chunks,
             center: pos,
             step,
             min_y: noise.min_y,
             height: noise.height,
+            seed,
+            sea_level,
         }
     }
 }
@@ -783,6 +913,46 @@ pub fn biome_network_id_of(fill: u16) -> u32 {
 mod tests {
     use super::*;
     use ChunkStatus::*;
+
+    /// End-to-end: advancing a chunk to FEATURES runs P8 decoration through the
+    /// real `WorldGenRegion`. Feature ores (e.g. `CoalOre`, distinct from the P3
+    /// vein blocks) appear, and the whole block grid is a deterministic function
+    /// of the seed.
+    #[test]
+    fn features_stage_places_ores_deterministically() {
+        let feature_ore_counts = |seed: i64| -> (usize, Vec<ParityBlock>) {
+            let mut p = ChunkPipeline::new_overworld(seed);
+            p.advance(0, 0, Features);
+            let chunk = p.chunk(0, 0).expect("center chunk");
+            assert_eq!(chunk.status, Features);
+            let fc = chunk.blocks.as_ref().expect("filled");
+            let coal = fc.blocks.iter().filter(|b| **b == ParityBlock::CoalOre).count();
+            (coal, fc.blocks.clone())
+        };
+        let (coal_a, grid_a) = feature_ore_counts(1234);
+        let (coal_b, grid_b) = feature_ore_counts(1234);
+        assert!(coal_a > 0, "the underground_ores step placed coal ore");
+        assert_eq!(coal_a, coal_b, "coal count is deterministic");
+        assert_eq!(grid_a, grid_b, "the whole feature-decorated grid is deterministic");
+
+        let (_, grid_c) = feature_ore_counts(5678);
+        assert_ne!(grid_a, grid_c, "a different seed decorates differently");
+    }
+
+    /// A FEATURES chunk differs from its SURFACE (pre-decoration) state — the
+    /// decoration pass actually wrote blocks into the center chunk.
+    #[test]
+    fn features_modify_the_chunk() {
+        let mut surf = ChunkPipeline::new_overworld(99);
+        surf.advance(0, 0, Surface);
+        let before = surf.chunk(0, 0).unwrap().blocks.as_ref().unwrap().blocks.clone();
+
+        let mut feat = ChunkPipeline::new_overworld(99);
+        feat.advance(0, 0, Features);
+        let after = feat.chunk(0, 0).unwrap().blocks.as_ref().unwrap().blocks.clone();
+
+        assert_ne!(before, after, "decoration changed the center chunk");
+    }
 
     /// The vanilla GENERATION_PYRAMID dependency tables, derived by hand from
     /// `ChunkStep.Builder` (`addRequirement` + `buildAccumulatedDependencies`)

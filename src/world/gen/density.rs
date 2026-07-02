@@ -1578,11 +1578,35 @@ pub enum ParityBlock {
     BrownTerracotta = 34,
     RedTerracotta = 35,
     LightGrayTerracotta = 36,
+    // P8 feature-output blocks. Appended (discriminants ≥ 37) so the P2–P5
+    // fixture digest alphabet (indices 0..=36) is untouched. These are the
+    // blocks the implemented overworld features write: ores + their stone/
+    // deepslate fillers + disk materials + the snow layer; see `features.rs`.
+    Diorite = 37,
+    Andesite = 38,
+    Clay = 39,
+    CoalOre = 40,
+    DeepslateCoalOre = 41,
+    IronOre = 42,
+    GoldOre = 43,
+    DeepslateGoldOre = 44,
+    DeepslateCopperOre = 45,
+    RedstoneOre = 46,
+    DeepslateRedstoneOre = 47,
+    DiamondOre = 48,
+    DeepslateDiamondOre = 49,
+    LapisOre = 50,
+    DeepslateLapisOre = 51,
+    EmeraldOre = 52,
+    DeepslateEmeraldOre = 53,
+    InfestedStone = 54,
+    InfestedDeepslate = 55,
+    Snow = 56,
 }
 
 impl ParityBlock {
     /// Every parity block, in discriminant order (index `b as usize`).
-    pub const ALL: [ParityBlock; 37] = [
+    pub const ALL: [ParityBlock; 57] = [
         ParityBlock::Air,
         ParityBlock::Stone,
         ParityBlock::Water,
@@ -1620,6 +1644,26 @@ impl ParityBlock {
         ParityBlock::BrownTerracotta,
         ParityBlock::RedTerracotta,
         ParityBlock::LightGrayTerracotta,
+        ParityBlock::Diorite,
+        ParityBlock::Andesite,
+        ParityBlock::Clay,
+        ParityBlock::CoalOre,
+        ParityBlock::DeepslateCoalOre,
+        ParityBlock::IronOre,
+        ParityBlock::GoldOre,
+        ParityBlock::DeepslateGoldOre,
+        ParityBlock::DeepslateCopperOre,
+        ParityBlock::RedstoneOre,
+        ParityBlock::DeepslateRedstoneOre,
+        ParityBlock::DiamondOre,
+        ParityBlock::DeepslateDiamondOre,
+        ParityBlock::LapisOre,
+        ParityBlock::DeepslateLapisOre,
+        ParityBlock::EmeraldOre,
+        ParityBlock::DeepslateEmeraldOre,
+        ParityBlock::InfestedStone,
+        ParityBlock::InfestedDeepslate,
+        ParityBlock::Snow,
     ];
 
     /// The `minecraft:` block id this parity block resolves to in the real
@@ -1663,6 +1707,26 @@ impl ParityBlock {
             ParityBlock::BrownTerracotta => "minecraft:brown_terracotta",
             ParityBlock::RedTerracotta => "minecraft:red_terracotta",
             ParityBlock::LightGrayTerracotta => "minecraft:light_gray_terracotta",
+            ParityBlock::Diorite => "minecraft:diorite",
+            ParityBlock::Andesite => "minecraft:andesite",
+            ParityBlock::Clay => "minecraft:clay",
+            ParityBlock::CoalOre => "minecraft:coal_ore",
+            ParityBlock::DeepslateCoalOre => "minecraft:deepslate_coal_ore",
+            ParityBlock::IronOre => "minecraft:iron_ore",
+            ParityBlock::GoldOre => "minecraft:gold_ore",
+            ParityBlock::DeepslateGoldOre => "minecraft:deepslate_gold_ore",
+            ParityBlock::DeepslateCopperOre => "minecraft:deepslate_copper_ore",
+            ParityBlock::RedstoneOre => "minecraft:redstone_ore",
+            ParityBlock::DeepslateRedstoneOre => "minecraft:deepslate_redstone_ore",
+            ParityBlock::DiamondOre => "minecraft:diamond_ore",
+            ParityBlock::DeepslateDiamondOre => "minecraft:deepslate_diamond_ore",
+            ParityBlock::LapisOre => "minecraft:lapis_ore",
+            ParityBlock::DeepslateLapisOre => "minecraft:deepslate_lapis_ore",
+            ParityBlock::EmeraldOre => "minecraft:emerald_ore",
+            ParityBlock::DeepslateEmeraldOre => "minecraft:deepslate_emerald_ore",
+            ParityBlock::InfestedStone => "minecraft:infested_stone",
+            ParityBlock::InfestedDeepslate => "minecraft:infested_deepslate",
+            ParityBlock::Snow => "minecraft:snow",
         }
     }
 
@@ -1701,6 +1765,28 @@ impl ParityBlock {
             "brown_terracotta" => ParityBlock::BrownTerracotta,
             "red_terracotta" => ParityBlock::RedTerracotta,
             "light_gray_terracotta" => ParityBlock::LightGrayTerracotta,
+            "diorite" => ParityBlock::Diorite,
+            "andesite" => ParityBlock::Andesite,
+            "clay" => ParityBlock::Clay,
+            "coal_ore" => ParityBlock::CoalOre,
+            "deepslate_coal_ore" => ParityBlock::DeepslateCoalOre,
+            "iron_ore" => ParityBlock::IronOre,
+            "gold_ore" => ParityBlock::GoldOre,
+            "deepslate_gold_ore" => ParityBlock::DeepslateGoldOre,
+            "copper_ore" => ParityBlock::CopperOre,
+            "deepslate_copper_ore" => ParityBlock::DeepslateCopperOre,
+            "deepslate_iron_ore" => ParityBlock::DeepslateIronOre,
+            "redstone_ore" => ParityBlock::RedstoneOre,
+            "deepslate_redstone_ore" => ParityBlock::DeepslateRedstoneOre,
+            "diamond_ore" => ParityBlock::DiamondOre,
+            "deepslate_diamond_ore" => ParityBlock::DeepslateDiamondOre,
+            "lapis_ore" => ParityBlock::LapisOre,
+            "deepslate_lapis_ore" => ParityBlock::DeepslateLapisOre,
+            "emerald_ore" => ParityBlock::EmeraldOre,
+            "deepslate_emerald_ore" => ParityBlock::DeepslateEmeraldOre,
+            "infested_stone" => ParityBlock::InfestedStone,
+            "infested_deepslate" => ParityBlock::InfestedDeepslate,
+            "snow" => ParityBlock::Snow,
             _ => return None,
         })
     }
@@ -1713,6 +1799,14 @@ impl ParityBlock {
     /// Non-empty `getFluidState` over the parity alphabet.
     pub fn is_fluid(self) -> bool {
         self == ParityBlock::Water || self == ParityBlock::Lava
+    }
+
+    /// `BlockState.blocksMotion()` over the parity alphabet: everything except
+    /// air, the two fluids, and the snow *layer* (a 1-layer snow does not block
+    /// motion). Used to prime/maintain the FEATURES-stage heightmaps
+    /// (`OCEAN_FLOOR`, `MOTION_BLOCKING`).
+    pub fn blocks_motion(self) -> bool {
+        !matches!(self, ParityBlock::Air | ParityBlock::Water | ParityBlock::Lava | ParityBlock::Snow)
     }
 }
 
