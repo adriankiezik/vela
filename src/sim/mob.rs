@@ -2184,6 +2184,17 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let solid = grass_block_state();
         let (bx, bz) = (601_000, 0);
+        // Live parity worldgen is on by default, so this far-away column is real
+        // (possibly tall) terrain rather than the old value-noise flatland. Clear
+        // the airspace the pig walks and jumps through first, so generated blocks
+        // can't bury the controlled platform, then (re)place the floors on top.
+        for x in 0..9 {
+            for z in -2..=2 {
+                for y in 100..=104 {
+                    crate::world::set_block(bx + x, y, bz + z, crate::world::AIR_STATE);
+                }
+            }
+        }
         // Low floor at y=99 (top y=100) for x in 0..2, raised floor (extra block at
         // y=100, top y=101) for x in 3..8 — a 1-block ledge whose face is at x=3.
         for x in 0..9 {

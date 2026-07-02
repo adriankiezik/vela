@@ -656,6 +656,38 @@ impl SurfaceSystem {
         }
     }
 
+    /// `SurfaceSystem.topMaterial` — evaluate the surface rule at one arbitrary
+    /// position and return the resulting block, or `None`. Used by carvers to
+    /// convert the dirt exposed directly beneath a carved grass/mycelium column
+    /// into the biome's top material (`WorldCarver.carveBlock`). Matches vanilla:
+    /// a fresh `SurfaceRules.Context` with `stoneDepthAbove = stoneDepthBelow = 1`
+    /// and `waterHeight = underFluid ? y + 1 : Integer.MIN_VALUE`.
+    pub fn top_material(
+        &self,
+        chunk: &mut FilledChunk,
+        noise_chunk: &mut NoiseChunk,
+        biomes: &BakedBiomes,
+        block_x: i32,
+        block_y: i32,
+        block_z: i32,
+        under_fluid: bool,
+    ) -> Option<ParityBlock> {
+        let mut ctx = ColumnCtx {
+            system: self,
+            chunk,
+            noise_chunk,
+            biomes,
+            block_x,
+            block_z,
+            surface_depth: self.get_surface_depth(block_x, block_z),
+            block_y,
+            water_height: if under_fluid { block_y + 1 } else { i32::MIN },
+            stone_depth_above: 1,
+            stone_depth_below: 1,
+        };
+        try_apply(&self.rule, &mut ctx)
+    }
+
     /// `SurfaceSystem.erodedBadlandsExtension`.
     fn eroded_badlands_extension(
         &self,

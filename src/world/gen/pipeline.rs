@@ -665,6 +665,23 @@ impl ChunkPipeline {
             // (write radius 0). The blocks are taken out so the generator (read
             // for the biome source + aquifer) and the mutated chunk don't alias.
             ChunkStatus::Carvers => {
+                // The 3×3 stored biomes feed `carveBlock`'s top-material fix-up
+                // (dirt under a carved grass/mycelium column → biome top). The
+                // neighborhood is ≥ BIOMES because the center's SURFACE step
+                // (this step's parent) already required Biomes at radius 1.
+                let baked = {
+                    let mut all = Vec::with_capacity(9);
+                    for dz in -1..=1 {
+                        for dx in -1..=1 {
+                            let chunk = &self.chunks[&(pos.0 + dx, pos.1 + dz)];
+                            all.push((
+                                (pos.0 + dx, pos.1 + dz),
+                                chunk.biome_sections.as_deref().expect("neighbors ≥ BIOMES"),
+                            ));
+                        }
+                    }
+                    BakedBiomes::from_sections(all, noise.min_y, noise.height)
+                };
                 let mut blocks = self
                     .chunks
                     .get_mut(&pos)
@@ -672,7 +689,7 @@ impl ChunkPipeline {
                     .blocks
                     .take()
                     .expect("CARVERS runs after NOISE/SURFACE");
-                super::carvers::apply_carvers(&self.generator, self.seed, pos, &mut blocks);
+                super::carvers::apply_carvers(&self.generator, self.seed, pos, &mut blocks, &baked);
                 self.chunks.get_mut(&pos).expect("proto chunk resident").blocks = Some(blocks);
             }
             // `generateFeatures` → `applyBiomeDecoration` (P8). Features of every
@@ -806,15 +823,32 @@ fn with_pipeline<R>(f: impl FnOnce(&mut ChunkPipeline) -> R) -> R {
 const PROTO_CACHE_LIMIT: usize = 320;
 const PROTO_KEEP_RADIUS: i32 = 8;
 
-/// The status the live path generates to. Held at SURFACE for now: CARVERS
-/// (P7) does mutate blocks, but wiring caves into the *live* world is left as a
-/// deliberate follow-up (it wants the WG heightmaps refreshed post-carve for
-/// `surface_height`/spawn, and the grass-top-material deferral noted in
-/// `super::carvers` closed) — the same conservative posture P6 took for the
-/// whole live flip. Advancing to CARVERS costs little extra (its only non-no-op
-/// dependency is the center chunk's own SURFACE), so bump this to `Carvers`
-/// once those two items land, then toward FULL as P8/P9 arrive.
-const LIVE_TARGET: ChunkStatus = ChunkStatus::Surface;
+/// The status the live path generates to. Held at CARVERS: caves/ravines
+/// (P7 carvers) now run in the live world. CARVERS has `blockStateWriteRadius`
+/// 0 — it only mutates its own chunk — so a chunk extracted at this status is a
+/// deterministic pure function of the seed, unaffected by generation/cache
+/// order.
+///
+/// Heightmap handling matches vanilla across the surface→carvers boundary
+/// (verified against `ChunkStatusTasks`/`Heightmap.primeHeightmaps`): the WG
+/// heightmaps (`OCEAN_FLOOR_WG`/`WORLD_SURFACE_WG`) are built at NOISE and are
+/// **not** re-primed after carving — vanilla's carvers touch only the FINAL
+/// heightmaps, and the WG pair keeps its pre-carve value (which is what
+/// `surface_height`/spawn read).
+///
+/// FEATURES is deliberately **not** live yet. It has write radius 1 (a chunk's
+/// decoration writes into its neighbors), so a chunk cannot be served until its
+/// whole 3×3 neighborhood has completed FEATURES — vanilla's FULL requirement.
+/// Vela's live path generates on demand and *consumes* the center proto (then
+/// trims the cache), so a served chunk would (a) miss the feature writes its
+/// not-yet-featured neighbors owe it, and (b) on re-serve regenerate fresh while
+/// those neighbors won't re-run features into it — order-dependent, non-
+/// deterministic output. Making FEATURES live therefore needs the real chunk-
+/// lifecycle finalization (serve at FULL, hold protos resident until the
+/// neighborhood is featured, run each chunk's features exactly once) — the
+/// live-pipeline integration the roadmap defers. Tracked in docs/WORLDGEN_PARITY.md.
+/// Light/spawn/FULL stay no-ops (Vela lights at encode time, spawns in the sim).
+const LIVE_TARGET: ChunkStatus = ChunkStatus::Carvers;
 
 /// Generate chunk `(cx, cz)` through the pipeline (to [`LIVE_TARGET`]) and
 /// extract it. The consumed proto leaves the cache (its data moves into the

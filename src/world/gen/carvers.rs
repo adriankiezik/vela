@@ -21,11 +21,13 @@
 //! chunk — the only chunk written (write radius 0). Carved blocks are resolved
 //! through the center chunk's aquifer (`NoiseChunk::carve_state`).
 //!
-//! Parity deferral: vanilla's `carveBlock` rewrites the dirt directly under a
-//! carved grass/mycelium column to the biome top material (via
-//! `SurfaceSystem.topMaterial`). That single-block surface fix-up at cave/ravine
-//! openings is deferred (see the note in `carve_block` and P7 in
-//! docs/WORLDGEN_PARITY.md). Everything else is block-exact.
+//! Top-material fix-up: vanilla's `carveBlock` rewrites the dirt directly under
+//! a carved grass/mycelium column to the biome top material (via
+//! `SurfaceSystem.topMaterial`). This is ported 1:1 (`carve_block` +
+//! `SurfaceSystem::top_material`): a per-column `hasGrass` latch, and when the
+//! block below a carved opening is exposed `dirt` it is re-topped through the
+//! surface rule at that single position (`stoneDepthAbove/Below = 1`,
+//! `waterHeight = underFluid ? y+1 : MIN`). Everything is block-exact.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -34,7 +36,7 @@ use serde_json::Value;
 
 use super::density::{FilledChunk, NoiseChunk, ParityBlock};
 use super::random::{RandomSource, WorldgenRandom};
-use super::surface_rules::SurfacedGenerator;
+use super::surface_rules::{BakedBiomes, SurfaceSystem, SurfacedGenerator};
 use super::vanilla_jsons;
 
 // ---------------------------------------------------------------------------
@@ -395,6 +397,10 @@ struct Env<'a> {
     blocks: &'a mut FilledChunk,
     noise: &'a mut NoiseChunk,
     mask: &'a mut CarvingMask,
+    /// The surface system + baked 3×3 biomes, for the `carveBlock` top-material
+    /// fix-up (dirt exposed under a carved grass/mycelium column → biome top).
+    surface: &'a SurfaceSystem,
+    biomes: &'a BakedBiomes,
     min_gen_y: i32,
     gen_depth: i32,
     /// The center chunk position (`ChunkPos` of the chunk being carved).
@@ -478,6 +484,9 @@ fn carve_ellipsoid(
             if xd * xd + zd * zd >= 1.0 {
                 continue;
             }
+            // `MutableBoolean hasGrass` — per column, latched once a carved block
+            // is grass/mycelium so the dirt below the opening is re-topped.
+            let mut has_grass = false;
             let mut world_y = max_y;
             while world_y > min_y {
                 let yd = (world_y as f64 - 0.5 - y) / vertical_radius;
@@ -485,7 +494,7 @@ fn carve_ellipsoid(
                     && !env.mask.get(x_index, world_y, z_index)
                 {
                     env.mask.set(x_index, world_y, z_index);
-                    if carve_block(env, lava_level, world_x, world_y, world_z) {
+                    if carve_block(env, lava_level, world_x, world_y, world_z, &mut has_grass) {
                         carved = true;
                     }
                 }
@@ -496,19 +505,27 @@ fn carve_ellipsoid(
     carved
 }
 
-/// `WorldCarver.carveBlock` (block output only). Reads the current block from
-/// the center chunk, checks the replaceable tag, resolves the carve state
-/// through the aquifer, and writes it back.
-fn carve_block(env: &mut Env, lava_level: i32, wx: i32, wy: i32, wz: i32) -> bool {
+/// `WorldCarver.carveBlock`. Reads the current block from the center chunk,
+/// checks the replaceable tag, resolves the carve state through the aquifer,
+/// writes it back, and — when the just-carved column was grass/mycelium and the
+/// block directly below is now exposed dirt — rewrites that dirt to the biome's
+/// top material (`SurfaceSystem.topMaterial`), exactly like vanilla.
+fn carve_block(
+    env: &mut Env,
+    lava_level: i32,
+    wx: i32,
+    wy: i32,
+    wz: i32,
+    has_grass: &mut bool,
+) -> bool {
     let lx = wx & 15;
     let lz = wz & 15;
     let current = env.blocks.block(lx, wy, lz);
-    // PARITY DEFERRAL: vanilla also notes grass_block/mycelium here and, when
-    // the dirt just below a carved opening is exposed, rewrites it to the
-    // biome's top material (`context.topMaterial` → `SurfaceSystem.topMaterial`
-    // at that point). That surface fix-up at cave/ravine mouths is not yet
-    // ported (it needs the surface-rule top-material path at an arbitrary
-    // position). See docs/WORLDGEN_PARITY.md P7.
+    // Latch `hasGrass` before the replaceable check (vanilla notes it on the
+    // block about to be carved, whether or not it ends up replaced).
+    if current == ParityBlock::GrassBlock || current == ParityBlock::Mycelium {
+        *has_grass = true;
+    }
     if !is_carver_replaceable(current) {
         return false;
     }
@@ -516,6 +533,28 @@ fn carve_block(env: &mut Env, lava_level: i32, wx: i32, wy: i32, wz: i32) -> boo
         return false;
     };
     env.blocks.set_block(lx, wy, lz, state);
+    // Top-material fix-up: if this column exposed dirt directly beneath a carved
+    // grass/mycelium block, re-top it to the biome surface (grass under grass,
+    // mycelium under mushroom fields, …). `underFluid` is whether the block we
+    // just carved is now a fluid (water/lava), which selects the surface rule's
+    // submerged branch.
+    if *has_grass {
+        let below_y = wy - 1;
+        if env.blocks.block(lx, below_y, lz) == ParityBlock::Dirt {
+            let under_fluid = state.is_fluid();
+            if let Some(top) = env.surface.top_material(
+                &mut *env.blocks,
+                &mut *env.noise,
+                env.biomes,
+                wx,
+                below_y,
+                wz,
+                under_fluid,
+            ) {
+                env.blocks.set_block(lx, below_y, lz, top);
+            }
+        }
+    }
     true
 }
 
@@ -807,7 +846,13 @@ fn canyon_update_vertical_radius(
 
 /// `NoiseBasedChunkGenerator.applyCarvers` for the center chunk `pos`. Mutates
 /// `blocks` in place (write radius 0 — only the center chunk is written).
-pub fn apply_carvers(generator: &SurfacedGenerator, seed: i64, pos: (i32, i32), blocks: &mut FilledChunk) {
+pub fn apply_carvers(
+    generator: &SurfacedGenerator,
+    seed: i64,
+    pos: (i32, i32),
+    blocks: &mut FilledChunk,
+    biomes: &BakedBiomes,
+) {
     let rs = &generator.inner.random_state;
     let ns = rs.settings.noise;
     let (min_gen_y, gen_depth) = (ns.min_y, ns.height);
@@ -823,6 +868,8 @@ pub fn apply_carvers(generator: &SurfacedGenerator, seed: i64, pos: (i32, i32), 
         blocks,
         noise: &mut noise,
         mask: &mut mask,
+        surface: &generator.surface,
+        biomes,
         min_gen_y,
         gen_depth,
         center: pos,

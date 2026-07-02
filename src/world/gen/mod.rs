@@ -467,12 +467,36 @@ mod tests {
 
     #[test]
     fn terrain_is_continuous_across_a_chunk_boundary() {
-        // Adjacent world columns across a chunk edge must not jump sharply.
-        for z in -32..32 {
-            let left = surface_height(15, z);
-            let right = surface_height(16, z);
-            assert!((left - right).abs() <= 3, "discontinuity at z={z}: {left} vs {right}");
+        // Parity terrain is the real vanilla noise field: continuous, but with
+        // genuine cliffs, so adjacent columns can legitimately differ by far more
+        // than the old value-noise generator's gentle ±3. (The P2 golden fixture
+        // proves two adjacent chunks are bit-exact vs the JVM — there is no seam;
+        // a single steep column like the historic "77 vs 83" is just a cliff.)
+        //
+        // The parity invariant is therefore *no chunk-boundary artifact*: the
+        // height step across the x=15|16 chunk border must be no larger than the
+        // largest step between interior adjacent columns over the same swath. A
+        // real seam (per-chunk `NoiseChunk` disagreeing on the shared cell edge)
+        // would make the border systematically the steepest.
+        let mut border_max = 0;
+        let mut interior_max = 0;
+        for z in -48..48 {
+            border_max = border_max.max((surface_height(15, z) - surface_height(16, z)).abs());
+            // Interior adjacent-column steps strictly inside chunk 0 and chunk 1
+            // (excluding the 15|16 and 31|32 chunk borders).
+            for x in 0..15 {
+                interior_max =
+                    interior_max.max((surface_height(x, z) - surface_height(x + 1, z)).abs());
+            }
+            for x in 16..31 {
+                interior_max =
+                    interior_max.max((surface_height(x, z) - surface_height(x + 1, z)).abs());
+            }
         }
+        assert!(
+            border_max <= interior_max,
+            "chunk-boundary seam: border step {border_max} exceeds interior max {interior_max}"
+        );
     }
 
     #[test]
