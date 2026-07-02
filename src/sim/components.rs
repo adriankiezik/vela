@@ -291,20 +291,31 @@ impl ChunkSender {
     }
 
     /// [`next_batch`](Self::next_batch) with a readiness gate and a size cap:
-    /// the batch takes the longest *ready* prefix of the pending queue
-    /// (stopping at the first cold column preserves strict nearest-first
-    /// delivery), at most `limit` columns. When the head is cold or `limit`
-    /// is zero nothing is taken and nothing is accounted — the quota keeps
-    /// accumulating and the batch goes out a tick or two later.
+    /// within the `Mth.floor(batchQuota)` nearest candidates, ship the *ready*
+    /// columns and *skip* the cold ones (leaving them in `pending`, in order),
+    /// at most `limit` columns. A single still-generating near column no longer
+    /// stalls the warm columns queued behind it — it is simply passed over and
+    /// retried in a later batch once it warms. When the whole window is cold, or
+    /// `limit` is zero, or the quota gate is shut, nothing is taken and nothing
+    /// is accounted — the quota keeps accumulating and the batch goes out later.
     ///
-    /// Documented deviations: vanilla needs neither gate. Readiness is
-    /// implied by its tracking (a chunk only becomes sendable after async
-    /// generation reached FULL); Vela tracks at enqueue time and checks
-    /// readiness at send. The size cap is Vela's stand-in for TCP
-    /// backpressure: vanilla's connection blocks when the socket can't
-    /// drain, while Vela's bounded outbox would otherwise overflow — the
-    /// caller caps the batch to the outbox headroom so the stream waits
-    /// instead of tripping the fell-too-far-behind disconnect.
+    /// This matches `collectChunksToSend` (see [`ChunkSender`] docs for the file):
+    /// vanilla takes the `Mth.floor(batchQuota)` nearest `pendingChunks`, maps
+    /// each through `getChunkToSend`, and drops the nulls (columns not yet
+    /// generated to FULL) — it does *not* stop at the first unready column, and
+    /// the skipped columns stay pending. The window is bounded by the candidate
+    /// count, so a batch may ship fewer than `floor(batchQuota)` columns when
+    /// some of the nearest are still cold (vanilla does not backfill from farther
+    /// out either).
+    ///
+    /// Documented deviations: vanilla needs no explicit readiness closure —
+    /// readiness is implied by its `getChunkToSend` returning non-null only after
+    /// async generation reached FULL; Vela tracks at enqueue time and checks wire
+    /// readiness at send via `ready`. The `limit` cap is Vela's stand-in for TCP
+    /// backpressure: vanilla's connection blocks when the socket can't drain,
+    /// while Vela's bounded outbox would otherwise overflow — the caller caps the
+    /// batch to the outbox headroom so the stream waits instead of tripping the
+    /// fell-too-far-behind disconnect.
     pub fn next_batch_ready(
         &mut self,
         limit: usize,
@@ -321,17 +332,30 @@ impl ChunkSender {
         if self.batch_quota < 1.0 || self.pending.is_empty() {
             return Vec::new();
         }
-        // `collectChunksToSend`: up to `Mth.floor(batchQuota)` nearest columns,
-        // bounded by the ready prefix and the caller's cap.
-        let mut count = (self.batch_quota.floor() as usize).min(self.pending.len()).min(limit);
-        count = self.pending[..count]
-            .iter()
-            .position(|&c| !ready(c))
-            .unwrap_or(count);
-        if count == 0 {
+        // `collectChunksToSend`: the candidate window is the `Mth.floor(batchQuota)`
+        // nearest columns (all of `pending` if fewer). Within it, collect the ready
+        // columns and skip the cold ones — vanilla's `filter(Objects::nonNull)` —
+        // bounded by the caller's outbox headroom `limit`. `retain` visits
+        // front-to-back, so the batch stays nearest-first and the skipped (kept)
+        // columns keep their relative order.
+        let window = (self.batch_quota.floor() as usize).min(self.pending.len());
+        let mut batch: Vec<(i32, i32)> = Vec::new();
+        let mut scanned = 0usize;
+        self.pending.retain(|&c| {
+            let in_window = scanned < window;
+            scanned += 1;
+            if in_window && batch.len() < limit && ready(c) {
+                batch.push(c);
+                false // sent — drop from the pending queue
+            } else {
+                true // cold, out of window, or over cap — stays pending
+            }
+        });
+        // `if (!chunksToSend.isEmpty())`: account (and increment the outstanding
+        // count) only when a non-empty batch actually ships.
+        if batch.is_empty() {
             return Vec::new();
         }
-        let batch: Vec<(i32, i32)> = self.pending.drain(0..count).collect();
         self.unacknowledged_batches += 1;
         self.batch_quota -= batch.len() as f32;
         batch
@@ -592,27 +616,48 @@ mod tests {
         assert_eq!(s.pending, vec![(1, 1), (3, 3)]);
     }
 
-    /// The readiness gate takes only the warm prefix (strict nearest-first),
-    /// accounts nothing on a cold head, and resumes once the head warms.
+    /// The readiness gate uses vanilla `collectChunksToSend` skip semantics: a
+    /// cold column mid-queue is passed over (left pending, in order) while the
+    /// warm columns behind it — within the quota window — still ship, and the
+    /// cold one ships in a later batch once it warms.
     #[test]
-    fn readiness_gate_takes_warm_prefix_only() {
+    fn readiness_gate_skips_cold_and_ships_rest() {
         let mut s = ChunkSender::new();
         for i in 1..=5 {
             s.mark_pending((i, 0));
         }
-        // Head warm, (3,0) cold: only the prefix before it ships.
+        // (3,0) is cold: it is skipped, the warm columns before *and after* it
+        // ship this batch, and (3,0) stays at the head of the remaining queue.
         let batch = s.next_batch_ready(usize::MAX, |c| c != (3, 0));
-        assert_eq!(batch, vec![(1, 0), (2, 0)]);
+        assert_eq!(batch, vec![(1, 0), (2, 0), (4, 0), (5, 0)]);
         assert_eq!(s.unacknowledged_batches, 1);
+        assert_eq!(s.batch_quota, 9.0 - 4.0, "quota debited by the four shipped");
+        assert_eq!(s.pending, vec![(3, 0)], "the cold column stays pending, in order");
         s.on_ack(9.0);
-        // Cold head: nothing ships, nothing is accounted, the queue keeps order.
+        // Still cold: nothing ships, nothing is accounted, the queue keeps order.
         let quota_before = s.batch_quota;
         assert!(s.next_batch_ready(usize::MAX, |_| false).is_empty());
         assert_eq!(s.unacknowledged_batches, 0);
-        assert!(s.batch_quota >= quota_before, "no quota debited on a cold head");
-        assert_eq!(s.pending, vec![(3, 0), (4, 0), (5, 0)]);
-        // Head warmed: the stream resumes in order.
-        assert_eq!(s.next_batch_ready(usize::MAX, |_| true), vec![(3, 0), (4, 0), (5, 0)]);
+        assert!(s.batch_quota >= quota_before, "no quota debited when all cold");
+        assert_eq!(s.pending, vec![(3, 0)]);
+        // Warmed: the previously-skipped column ships in a later batch.
+        assert_eq!(s.next_batch_ready(usize::MAX, |_| true), vec![(3, 0)]);
+        assert!(s.pending.is_empty());
+    }
+
+    /// A cold column stalls only its own delivery, never the columns behind it:
+    /// even the nearest column being cold does not block the rest of the window.
+    #[test]
+    fn readiness_gate_cold_head_does_not_block_tail() {
+        let mut s = ChunkSender::new();
+        for i in 1..=4 {
+            s.mark_pending((i, 0));
+        }
+        // (1,0) — the nearest/head column — is cold; (2,0)..(4,0) ship past it.
+        let batch = s.next_batch_ready(usize::MAX, |c| c != (1, 0));
+        assert_eq!(batch, vec![(2, 0), (3, 0), (4, 0)]);
+        assert_eq!(s.pending, vec![(1, 0)]);
+        assert_eq!(s.unacknowledged_batches, 1);
     }
 
     /// The outbox-headroom cap bounds a batch without accounting a skipped

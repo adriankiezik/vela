@@ -46,16 +46,18 @@ pub(super) fn on_joined(
         next.0 += 1;
         v
     };
-    // Choose a solid, dry spawn column from the generator rather than the fixed
-    // origin (which may be ocean under the biome/height field).
-    let spawn = crate::world::spawn_column();
-    let (mut sx, mut sz) = (spawn.0 as f64, spawn.1 as f64);
-    // The column's surface block sits at `surface_height` with air above, so stand
-    // the player one block higher (their feet rest on top of the surface block).
-    let mut sy = (crate::world::surface_height(sx as i32, sz as i32) + 1) as f64;
+    // Spawn position. A returning player's saved position (restored below) wins;
+    // only a fresh player needs the generator's spawn column. That column is
+    // derived once and memoised via `world_spawn()` — the old unconditional
+    // `spawn_column()` here re-spiralled `surface_height` (hundreds of potential
+    // synchronous chunk generations) on *every* join, even when saved data then
+    // overrode it. Seeded to the origin and replaced by exactly one branch below.
+    let (mut sx, mut sz) = (0.0f64, 0.0f64);
+    let mut sy = 0.0f64;
     let mut syaw = 0.0f32;
     let mut spitch = 0.0f32;
     let mut son_ground = false;
+    let mut restored_from_save = false;
     // Fresh-spawn inventory defaults (empty, first hotbar slot selected), replaced
     // below if the player has saved data.
     let mut inv_slots = [None; crate::inventory::PLAYER_INVENTORY_SLOTS];
@@ -84,10 +86,22 @@ pub(super) fn on_joined(
                     exhaustion_level: pd.food_exhaustion,
                     tick_timer: pd.food_tick_timer,
                 };
+                restored_from_save = true;
             }
             Ok(None) => {}
             Err(e) => warn!(%name, error = %e, "failed to read player data; spawning fresh"),
         }
+    }
+    // Fresh player only: pick a solid, dry spawn column from the generator rather
+    // than the fixed origin (which may be ocean under the biome/height field). The
+    // column is memoised, so only the very first fresh join pays the search; the
+    // `surface_height` here may still generate one chunk once (the surface block
+    // sits at that height with air above, so stand the player one block higher).
+    if !restored_from_save {
+        let (wx, wz) = crate::world::world_spawn();
+        sx = wx as f64;
+        sz = wz as f64;
+        sy = (crate::world::surface_height(wx, wz) + 1) as f64;
     }
     // The player's game mode is attached at join (seeded from the server-default
     // `gamemode`) so every system can rely on it being present — matching vanilla,

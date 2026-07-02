@@ -230,14 +230,27 @@ pub fn send_queued_chunks(mut players: Query<(&Conn, &mut ChunkSender)>) {
         // chunk costs ~40 ms to generate — most of a tick budget).
         let batch =
             sender.next_batch_ready(headroom, |(cx, cz)| crate::world::chunk_wire_ready(cx, cz));
+        // Keep the generation pool ahead of the pacer. With vanilla skip
+        // semantics the batcher passes over cold columns near the front of the
+        // queue rather than stalling on them, so re-request warming for the cold
+        // columns in the leading window — the ones just skipped and the ones the
+        // pacer will reach next. Warm columns are a cache-hit no-op in the pool,
+        // so this dedup-cheap sweep replaces the old head-only re-prefetch, which
+        // pinned the whole stream behind a single still-generating near column.
+        // A cold column here can also mean its wire cache was *invalidated* (an
+        // edit landed after the first prefetch); warming it again recovers.
+        const PREFETCH_WINDOW: usize = 64;
+        let cold: Vec<(i32, i32)> = sender
+            .pending
+            .iter()
+            .take(PREFETCH_WINDOW)
+            .copied()
+            .filter(|&(cx, cz)| !crate::world::chunk_wire_ready(cx, cz))
+            .collect();
+        if !cold.is_empty() {
+            crate::world::prefetch(cold);
+        }
         if batch.is_empty() {
-            // A cold head can also mean its wire cache was *invalidated* (an
-            // edit landed after the prefetch). Re-request warming for the
-            // queue head so the stream always makes progress; for
-            // already-warm columns this is a cheap cache hit in the pool.
-            if let Some(&head) = sender.pending.first() {
-                crate::world::prefetch([head]);
-            }
             continue;
         }
         // A chunk batch is an atomic, ordered unit: start, its level_chunks, then

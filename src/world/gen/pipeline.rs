@@ -463,10 +463,17 @@ impl WorldGenRegion<'_> {
 /// engines. `advance` brings a chunk to a target status, generating every
 /// dependency (recursively, depth-first) first — the vanilla "pyramid".
 ///
-/// Single-threaded by design: parity output must not depend on scheduling, so
-/// a deterministic depth-first order is the simplest correct scheduler. (The
-/// only order-visible state is the RTree's last-result tie-breaking seed,
-/// which vanilla itself leaves thread-dependent.)
+/// One instance is single-threaded by design: parity output must not depend on
+/// scheduling *within* an instance, so a deterministic depth-first order is the
+/// simplest correct scheduler. (The only order-visible state is the RTree's
+/// last-result tie-breaking seed, which vanilla itself leaves thread-dependent
+/// via a `ThreadLocal` — and which never changes a non-tie result.)
+///
+/// The live path runs one instance *per prefetch worker* (see [`with_pipeline`])
+/// rather than sharing one behind a lock: instances are independent, so distinct
+/// workers generate in parallel, and byte-identical output for a `(seed, pos)`
+/// is preserved because each instance is a pure function of the seed save for
+/// the same measure-zero tie-break vanilla already leaves per-thread.
 pub struct ChunkPipeline {
     pub generator: SurfacedGenerator,
     chunks: HashMap<(i32, i32), ProtoChunk>,
@@ -602,46 +609,45 @@ pub struct ParityChunk {
     pub surface_biomes: [u16; 256],
 }
 
-/// A `Send` wrapper for the mutex-guarded global pipeline. The parity engine
-/// uses `Rc` internally (single-threaded by design), which makes
-/// `ChunkPipeline: !Send`; moving the *whole* pipeline between threads is
-/// still sound because every `Rc` clone lives inside it — nothing handed out
-/// of this module carries one (`ParityChunk` is plain data, the mapping
-/// tables hold leaked strs and ids) — so no reference count is ever touched
-/// from two threads. All access goes through the `Mutex`.
-struct SendPipeline(ChunkPipeline);
-// SAFETY: see above — the pipeline's Rc graph is fully owned by the value,
-// never aliased outside the mutex guard.
-unsafe impl Send for SendPipeline {}
-
-impl std::ops::Deref for SendPipeline {
-    type Target = ChunkPipeline;
-    fn deref(&self) -> &ChunkPipeline {
-        &self.0
-    }
+// One pipeline per thread, so the prefetch worker pool generates in parallel
+// with zero lock contention. `ChunkPipeline` is `!Send` (its P2–P5 engines
+// hold `Rc`s and its RTree keeps an interior-mutable last-result cell), which
+// is exactly why *sharing* one instance across threads was a mutex before —
+// here each thread owns its instance outright and nothing crosses the thread
+// boundary, so the `!Send` bound is a perfect fit rather than an obstacle.
+//
+// Determinism is unaffected: output is a pure function of `(seed, pos)` save
+// for the RTree's tie-break on fitness ties (a measure-zero event on real
+// noise), which vanilla itself makes thread-dependent via a `ThreadLocal`
+// last-result. One pipeline per worker reproduces that per-thread evolution
+// exactly — strictly closer to vanilla than a single shared instance.
+//
+// The instance is seeded lazily from `super::seed`, which every worker reads
+// after the boot-time `super::set_seed`, so all workers agree on the seed.
+thread_local! {
+    static PIPELINE: std::cell::RefCell<ChunkPipeline> =
+        std::cell::RefCell::new(ChunkPipeline::new_overworld(super::seed() as i64));
 }
 
-impl std::ops::DerefMut for SendPipeline {
-    fn deref_mut(&mut self) -> &mut ChunkPipeline {
-        &mut self.0
-    }
-}
-
-/// The process-wide pipeline the live generator draws from, seeded once from
-/// the world seed (like the legacy generator's `RUNTIME_SEED`).
-fn global() -> &'static std::sync::Mutex<SendPipeline> {
-    static PIPELINE: OnceLock<std::sync::Mutex<SendPipeline>> = OnceLock::new();
-    PIPELINE.get_or_init(|| {
-        std::sync::Mutex::new(SendPipeline(ChunkPipeline::new_overworld(super::seed() as i64)))
-    })
+/// Run `f` against the calling thread's pipeline (creating it on first touch).
+fn with_pipeline<R>(f: impl FnOnce(&mut ChunkPipeline) -> R) -> R {
+    PIPELINE.with(|cell| f(&mut cell.borrow_mut()))
 }
 
 /// Above this many resident proto-chunks, trim the trail: keep only the
 /// neighborhood of the chunk just consumed. Dropped protos regenerate
 /// deterministically if revisited; this only bounds memory (a surfaced proto
 /// is ~100 KiB), it never changes output.
-const PROTO_CACHE_LIMIT: usize = 2048;
-const PROTO_KEEP_RADIUS: i32 = 16;
+///
+/// The cache is now per worker thread (see [`with_pipeline`]), so the bound is
+/// paid once per prefetch worker: at most `prefetch_workers() × PROTO_CACHE_LIMIT`
+/// protos live at once. The limit is chosen accordingly — 512 protos ≈ 50 MiB
+/// per thread, ~400 MiB across a maxed-out 8-worker pool. `PROTO_KEEP_RADIUS`
+/// keeps a 17×17 (289-proto) working set on each trim, comfortably under the
+/// limit so trims have hysteresis rather than thrashing, while still amortizing
+/// the shared biome/noise rings across a worker's local moves.
+const PROTO_CACHE_LIMIT: usize = 512;
+const PROTO_KEEP_RADIUS: i32 = 8;
 
 /// The status the live path generates to. SURFACE is the last stage that
 /// mutates blocks today — everything between it and FULL (carvers, features,
@@ -657,33 +663,35 @@ const LIVE_TARGET: ChunkStatus = ChunkStatus::Surface;
 /// returned `ParityChunk`); partially generated neighbors stay resident so
 /// the dependency pyramid amortizes as the player moves.
 pub fn generate_full(cx: i32, cz: i32) -> ParityChunk {
-    let mut pipeline = global().lock().expect("parity pipeline mutex poisoned");
-    pipeline.advance(cx, cz, LIVE_TARGET);
-    let proto = pipeline.chunks.remove(&(cx, cz)).expect("chunk just advanced");
-    let blocks = proto.blocks.expect("surfaced chunk has blocks");
-    let sections = proto.biome_sections.expect("surfaced chunk has biomes");
+    with_pipeline(|pipeline| {
+        pipeline.advance(cx, cz, LIVE_TARGET);
+        let proto = pipeline.chunks.remove(&(cx, cz)).expect("chunk just advanced");
+        let blocks = proto.blocks.expect("surfaced chunk has blocks");
+        let sections = proto.biome_sections.expect("surfaced chunk has biomes");
 
-    let min_section_y = blocks.min_y >> 4;
-    let quart_min_y = blocks.min_y >> 2;
-    let quart_max_y = (blocks.min_y + blocks.height - 1) >> 2;
-    let mut surface_biomes = [0u16; 256];
-    for lz in 0..16i32 {
-        for lx in 0..16i32 {
-            let col = (lz * 16 + lx) as usize;
-            let top = (blocks.world_surface_wg[col] - 1).max(blocks.min_y);
-            let (qx, qz) = ((cx * 16 + lx) >> 2, (cz * 16 + lz) >> 2);
-            let qy = (top >> 2).clamp(quart_min_y, quart_max_y);
-            let section = &sections[((qy >> 2) - min_section_y) as usize];
-            surface_biomes[col] = section[((((qy & 3) * 4) + (qz & 3)) * 4 + (qx & 3)) as usize];
+        let min_section_y = blocks.min_y >> 4;
+        let quart_min_y = blocks.min_y >> 2;
+        let quart_max_y = (blocks.min_y + blocks.height - 1) >> 2;
+        let mut surface_biomes = [0u16; 256];
+        for lz in 0..16i32 {
+            for lx in 0..16i32 {
+                let col = (lz * 16 + lx) as usize;
+                let top = (blocks.world_surface_wg[col] - 1).max(blocks.min_y);
+                let (qx, qz) = ((cx * 16 + lx) >> 2, (cz * 16 + lz) >> 2);
+                let qy = (top >> 2).clamp(quart_min_y, quart_max_y);
+                let section = &sections[((qy >> 2) - min_section_y) as usize];
+                surface_biomes[col] =
+                    section[((((qy & 3) * 4) + (qz & 3)) * 4 + (qx & 3)) as usize];
+            }
         }
-    }
 
-    if pipeline.chunks.len() > PROTO_CACHE_LIMIT {
-        pipeline
-            .chunks
-            .retain(|pos, _| chessboard_distance(*pos, (cx, cz)) <= PROTO_KEEP_RADIUS);
-    }
-    ParityChunk { blocks, surface_biomes }
+        if pipeline.chunks.len() > PROTO_CACHE_LIMIT {
+            pipeline
+                .chunks
+                .retain(|pos, _| chessboard_distance(*pos, (cx, cz)) <= PROTO_KEEP_RADIUS);
+        }
+        ParityChunk { blocks, surface_biomes }
+    })
 }
 
 /// The terrain surface height (topmost solid block y) at a world column,
@@ -691,11 +699,13 @@ pub fn generate_full(cx: i32, cz: i32) -> ParityChunk {
 /// height field) read from the pipeline after surfacing the owning chunk.
 /// Cached by the proto cache, so repeated probes in one area are cheap.
 pub fn surface_height(wx: i32, wz: i32) -> i32 {
-    let mut pipeline = global().lock().expect("parity pipeline mutex poisoned");
-    let (cx, cz) = (wx >> 4, wz >> 4);
-    pipeline.advance(cx, cz, ChunkStatus::Surface);
-    let blocks = pipeline.chunks[&(cx, cz)].blocks.as_ref().expect("surfaced chunk has blocks");
-    blocks.ocean_floor_wg[((wz & 15) * 16 + (wx & 15)) as usize] - 1
+    with_pipeline(|pipeline| {
+        let (cx, cz) = (wx >> 4, wz >> 4);
+        pipeline.advance(cx, cz, ChunkStatus::Surface);
+        let blocks =
+            pipeline.chunks[&(cx, cz)].blocks.as_ref().expect("surfaced chunk has blocks");
+        blocks.ocean_floor_wg[((wz & 15) * 16 + (wx & 15)) as usize] - 1
+    })
 }
 
 /// The real block-state id for a parity block, resolved once per variant from
@@ -718,14 +728,16 @@ pub fn block_state_of(block: ParityBlock) -> crate::ids::BlockState {
 fn biome_table() -> &'static Vec<(&'static str, u32)> {
     static TABLE: OnceLock<Vec<(&'static str, u32)>> = OnceLock::new();
     TABLE.get_or_init(|| {
-        let pipeline = global().lock().expect("parity pipeline mutex poisoned");
-        (0..pipeline.generator.source.biome_count())
-            .map(|i| {
-                let name: &'static str =
-                    Box::leak(pipeline.generator.source.biome_name(i as u16).to_owned().into());
-                (name, super::biome::network_id(name))
-            })
-            .collect()
+        with_pipeline(|pipeline| {
+            (0..pipeline.generator.source.biome_count())
+                .map(|i| {
+                    let name: &'static str = Box::leak(
+                        pipeline.generator.source.biome_name(i as u16).to_owned().into(),
+                    );
+                    (name, super::biome::network_id(name))
+                })
+                .collect()
+        })
     })
 }
 
@@ -832,7 +844,7 @@ mod tests {
         assert_eq!(block_ids.len(), ParityBlock::ALL.len(), "parity block mapping collided");
         assert_eq!(block_state_of(ParityBlock::Air).0, 0);
 
-        let count = global().lock().unwrap().generator.source.biome_count();
+        let count = with_pipeline(|p| p.generator.source.biome_count());
         let mut biome_ids: Vec<_> = (0..count as u16).map(biome_network_id_of).collect();
         biome_ids.sort_unstable();
         biome_ids.dedup();
@@ -853,7 +865,7 @@ mod tests {
         assert_eq!(chunk.blocks.block(0, chunk.blocks.min_y, 0), ParityBlock::Bedrock);
         let top = chunk.blocks.min_y + chunk.blocks.height - 1;
         assert_eq!(chunk.blocks.block(8, top, 8), ParityBlock::Air);
-        let count = global().lock().unwrap().generator.source.biome_count() as u16;
+        let count = with_pipeline(|p| p.generator.source.biome_count()) as u16;
         assert!(chunk.surface_biomes.iter().all(|&f| f < count));
     }
 
@@ -883,6 +895,81 @@ mod tests {
             assert_eq!(blocks.ocean_floor_wg, expected.ocean_floor_wg);
             assert_eq!(blocks.world_surface_wg, expected.world_surface_wg);
         }
+    }
+
+    /// Independent pipeline instances of the same seed produce byte-identical
+    /// chunks — the invariant the per-worker `thread_local!` pipelines rely on.
+    /// Generating an unrelated chunk on one instance first (exercising the
+    /// RTree's cross-chunk last-result state) must not perturb the target's
+    /// blocks or biomes.
+    #[test]
+    fn independent_instances_generate_identically() {
+        let seed = 8000;
+        let (cx, cz) = (2, 5);
+
+        let mut a = ChunkPipeline::new_overworld(seed);
+        let mut b = ChunkPipeline::new_overworld(seed);
+        // Warm `b` with a different chunk first, so its biome-source last-result
+        // seed and proto cache differ from a's when it reaches the target.
+        b.advance(-7, 3, Surface);
+
+        a.advance(cx, cz, Surface);
+        b.advance(cx, cz, Surface);
+
+        let pa = a.chunk(cx, cz).unwrap();
+        let pb = b.chunk(cx, cz).unwrap();
+        let (ba, bb) = (pa.blocks.as_ref().unwrap(), pb.blocks.as_ref().unwrap());
+        assert_eq!(ba.blocks, bb.blocks, "blocks differ across instances");
+        assert_eq!(ba.ocean_floor_wg, bb.ocean_floor_wg, "OCEAN_FLOOR_WG differs");
+        assert_eq!(ba.world_surface_wg, bb.world_surface_wg, "WORLD_SURFACE_WG differs");
+        assert_eq!(
+            pa.biome_sections.as_ref().unwrap(),
+            pb.biome_sections.as_ref().unwrap(),
+            "biomes differ across instances",
+        );
+    }
+
+    /// Wall-clock sanity check that independent per-thread pipelines scale:
+    /// generate 64 distinct chunks to SURFACE on 1 thread, then split across 4.
+    /// Ignored (a benchmark, not an assertion) — run with
+    /// `cargo test --release generation_scales_across_threads -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn generation_scales_across_threads() {
+        use std::time::Instant;
+        let seed = 8000;
+        let coords: Vec<(i32, i32)> = (0..64).map(|i| (i % 8, i / 8)).collect();
+
+        let t0 = Instant::now();
+        {
+            let mut p = ChunkPipeline::new_overworld(seed);
+            for &(cx, cz) in &coords {
+                p.advance(cx, cz, Surface);
+            }
+        }
+        let single = t0.elapsed();
+
+        let t1 = Instant::now();
+        let threads = 4;
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let mine: Vec<_> =
+                    coords.iter().copied().skip(t).step_by(threads).collect();
+                s.spawn(move || {
+                    let mut p = ChunkPipeline::new_overworld(seed);
+                    for (cx, cz) in mine {
+                        p.advance(cx, cz, Surface);
+                    }
+                });
+            }
+        });
+        let parallel = t1.elapsed();
+
+        println!(
+            "64 chunks to SURFACE: 1 thread {single:?}, {threads} threads {parallel:?} \
+             ({:.2}x)",
+            single.as_secs_f64() / parallel.as_secs_f64()
+        );
     }
 
     /// Advancing to FULL walks the pyramid: the center reaches FULL and every

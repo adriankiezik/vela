@@ -412,6 +412,17 @@ pub fn spawn_column() -> (i32, i32) {
     (0, 0)
 }
 
+/// The world spawn column `(wx, wz)`, computed once and memoised. [`spawn_column`]
+/// spirals outward probing `surface_height` per ring and can trigger hundreds of
+/// synchronous chunk generations, so per-join / per-save callers must not re-run
+/// it. The first call (boot, or the first fresh join with no saved position) pays
+/// the one-off cost; every later call is an O(1) load. Mirrors vanilla caching
+/// the level spawn in `ServerLevelData` rather than re-searching it.
+pub fn world_spawn() -> (i32, i32) {
+    static SPAWN: OnceLock<(i32, i32)> = OnceLock::new();
+    *SPAWN.get_or_init(spawn_column)
+}
+
 /// Encode `(lx, y, lz)` into the flat per-column-stack cell key shared with the
 /// chunk store's edit map, or `None` if `y` is outside the buildable world.
 pub(super) fn edit_key(lx: i32, y: i32, lz: i32) -> Option<u32> {

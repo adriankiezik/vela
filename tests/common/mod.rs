@@ -309,14 +309,37 @@ pub fn drive_into_play_with_view_distance(
 
 /// Drain frames from `s` (up to a generous bound that clears the join backlog)
 /// until `f` returns `true`. Returns whether the condition was met.
+///
+/// Auto-acknowledges chunk batches the way a real client does: on each
+/// `ClientboundChunkBatchFinished` (Play id 11) it replies with a
+/// `ServerboundChunkBatchReceived` (id 11). The server caps outstanding batches
+/// at one until the first ack (`PlayerChunkSender.maxUnacknowledgedBatches` = 1,
+/// raised to 10 on the first ack), so without this the view never finishes
+/// streaming — only the first batch would ever ship, leaving nearer columns
+/// stuck `pending` and any entity spawned in them unpaired. A real 26.2 client
+/// always sends this ack, so mirroring it keeps the harness on the server's
+/// actual chunk-delivery contract rather than an old single-batch quirk.
 pub fn drain_until(s: &mut TcpStream, mut f: impl FnMut(i32, &[u8]) -> bool) -> bool {
     for _ in 0..4000 {
         let Some((id, body)) = recv_opt(s) else {
             return false; // stream closed / timed out
         };
+        ack_chunk_batch(s, id);
         if f(id, &body) {
             return true;
         }
     }
     false
+}
+
+/// Reply to a `ClientboundChunkBatchFinished` (Play id 11) with a
+/// `ServerboundChunkBatchReceived` (id 11) carrying a sustainable rate, exactly
+/// as a real client does to release the next batch. A no-op for any other packet.
+fn ack_chunk_batch(s: &mut TcpStream, id: i32) {
+    const CHUNK_BATCH_FINISHED: i32 = 11;
+    if id == CHUNK_BATCH_FINISHED {
+        // `desiredChunksPerTick`: a healthy constant rate (clamped server-side to
+        // MAX_CHUNKS_PER_TICK), enough to drain the small test view promptly.
+        send(s, 11, &64.0f32.to_be_bytes());
+    }
 }

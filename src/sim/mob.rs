@@ -421,8 +421,18 @@ impl MobState {
 
 /// Whether the world block at `(x, y, z)` obstructs movement. Vela has no
 /// per-block collision shapes, so "solid" is "not air" (as in `item_tick`).
+///
+/// Non-generating: a cold (non-resident) column reads as **solid**. This runs on
+/// the tick thread (mob movement/collision every tick), so it must never
+/// generate a chunk. Treating an unloaded cell as an obstacle is the conservative
+/// parity choice — vanilla's `Entity.move` never advances into an unloaded chunk,
+/// so a mob at the loaded edge simply comes to rest rather than the tick thread
+/// stalling on a worldgen build. A ticking mob's own column is always resident,
+/// so this only bites a probe that reaches a cold neighbour.
 fn is_solid(x: i32, y: i32, z: i32) -> bool {
-    crate::world::block_state_at(x, y, z) != crate::world::AIR_STATE
+    crate::world::try_block_state_at(x, y, z)
+        .map(|s| s != crate::world::AIR_STATE)
+        .unwrap_or(true)
 }
 
 /// The inclusive block-index range a `[lo, hi]` box interval overlaps. The trailing
@@ -1387,7 +1397,15 @@ pub fn mob_spawn(world: &mut World) {
         // chunk, then a random y from the world floor up to WORLD_SURFACE + 1.
         let sx = chunk.0 * 16 + rng.gen_range(0..16);
         let sz = chunk.1 * 16 + rng.gen_range(0..16);
-        let top = crate::world::surface_height(sx, sz) + 1;
+        // Non-generating surface peek: `mob_spawn` runs on the tick thread every
+        // persistent-cadence tick, so a cold column here is skipped (vanilla's
+        // spawner only walks loaded chunks) rather than forced through a ~40 ms
+        // parity build. `spawnable` is the players' loaded set, so a resident hit
+        // is the norm; the `None` guard is defensive against a mid-tick eviction.
+        let Some(surface) = crate::world::resident_surface_height(sx, sz) else {
+            continue;
+        };
+        let top = surface + 1;
         let sy = rng.gen_range(crate::world::MIN_Y..=top);
         // `if (start.getY() >= level.getMinY() + 1)`.
         if sy < crate::world::MIN_Y + 1 {
@@ -1540,16 +1558,23 @@ fn is_valid_spawn_position(x: i32, y: i32, z: i32, dist_sqr: f64) -> bool {
     if dist_sqr > CREATURE_DESPAWN_DISTANCE_SQR {
         return false;
     }
-    if crate::world::block_state_at(x, y - 1, z) != grass_block_state() {
+    // Non-generating reads on the tick thread: a cold (non-resident) neighbour
+    // makes the position invalid — vanilla only spawns in loaded chunks, so a
+    // read that would generate one is a skip. `None != Some(grass)` / `None !=
+    // Some(AIR)` naturally reject a missing column.
+    if crate::world::try_block_state_at(x, y - 1, z) != Some(grass_block_state()) {
         return false;
     }
-    if crate::world::block_state_at(x, y, z) != crate::world::AIR_STATE {
+    if crate::world::try_block_state_at(x, y, z) != Some(crate::world::AIR_STATE) {
         return false;
     }
-    if crate::world::block_state_at(x, y + 1, z) != crate::world::AIR_STATE {
+    if crate::world::try_block_state_at(x, y + 1, z) != Some(crate::world::AIR_STATE) {
         return false;
     }
-    crate::world::raw_brightness(x, y, z) > 8
+    // Brightness gate: an unlit column (wire/light not yet built) is also a skip —
+    // building light on the tick thread is exactly what we avoid. `None` (cold or
+    // unlit) fails `is_some_and`, so the candidate is rejected.
+    crate::world::try_raw_brightness(x, y, z).is_some_and(|b| b > 8)
 }
 
 // --- Damage / death path (LivingEntity.hurtServer + die) ---------------------
@@ -2078,6 +2103,11 @@ mod tests {
         // its movement/landing is broadcast to a viewer.
         let mut world = world_with_id();
         let sy = crate::world::surface_height(0, 0);
+        // The collision `is_solid` is now non-generating: it treats a cold column
+        // as solid, so a mob only falls through a *resident* one. In production the
+        // mob's chunk is loaded; warm it here so the fall reaches the surface
+        // instead of the pig resting in mid-air over an ungenerated column.
+        let _ = crate::world::chunk_columns(0, 0);
         let mut rx = spawn_viewer(&mut world, &[(0, 0)]);
         spawn_mob(&mut world, MobKind::Pig, (0.5, (sy + 10) as f64, 0.5));
         let _ = drain(&mut rx); // discard the spawn pair
@@ -2660,6 +2690,13 @@ mod tests {
         let loaded: Vec<(i32, i32)> = (-8..=8)
             .flat_map(|cx| (-8..=8).map(move |cz| (cx, cz)))
             .collect();
+        // The spawner now only touches *resident, wire-built* chunks (it never
+        // generates or lights on the tick thread). In production the loaded set is
+        // exactly the streamed-and-lit columns, so warm them here to model that —
+        // otherwise every candidate would be skipped as "not loaded".
+        for &(cx, cz) in &loaded {
+            let _ = crate::world::chunk_columns(cx, cz);
+        }
 
         let mut world = world_with_id();
         let _rx = spawn_viewer(&mut world, &loaded);
@@ -2733,6 +2770,13 @@ mod tests {
         let loaded: HashSet<(i32, i32)> = (-2..=2)
             .flat_map(|cx| (-2..=2).map(move |cz| ((base_x >> 4) + cx, (base_z >> 4) + cz)))
             .collect();
+        // Rebuild the wire/light the spawner's brightness gate (`try_raw_brightness`)
+        // reads: the platform `set_block`s above invalidated it, and the gate is
+        // non-generating, so an unlit column would skip every candidate. In
+        // production a re-stream rebuilds this off-thread.
+        for &(cx, cz) in &loaded {
+            let _ = crate::world::chunk_columns(cx, cz);
+        }
 
         let mut rng = rand::thread_rng();
         let mut cap = LocalMobCap::new(&[], &[]);

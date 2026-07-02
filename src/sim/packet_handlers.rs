@@ -223,8 +223,18 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
             face: _,
             sequence,
         } => {
-            // 2 = STOP_DESTROY_BLOCK (dig completed).
-            if action == 2 {
+            // 2 = STOP_DESTROY_BLOCK (dig completed). Gate on the player's loaded
+            // view, mirroring vanilla: a serverbound dig lands on `ServerLevel`
+            // for a chunk loaded server-side, which for a legitimate client is
+            // exactly a column in its `ChunkTrackingView`. Vela's equivalent is
+            // the player's `LoadedChunks` set. Inside that set the target may be
+            // reference-counted yet not *yet* resident (columns warm through the
+            // background prefetch pool), so we take the generating `set_block`
+            // path — a rare, player-driven, single-column build is acceptable on
+            // the tick thread, and dropping the dig instead would desync the
+            // client's predicted break. Out-of-view (e.g. cheated) digs are
+            // ignored, so this never generates a far chunk on the tick thread.
+            if action == 2 && column_loaded(world, entity, x, z) {
                 let prev = crate::world::set_block(x, y, z, crate::world::AIR_STATE);
                 if prev != crate::world::AIR_STATE {
                     broadcast_block_update(
@@ -268,8 +278,15 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
                 let (dx, dy, dz) = face_step(face);
                 let (px, py, pz) = (x + dx, y + dy, z + dz);
                 // Only place into air, mirroring vanilla's replaceable check
-                // (loosely — air is the one replaceable state we model).
-                if crate::world::block_state_at(px, py, pz) == crate::world::AIR_STATE {
+                // (loosely — air is the one replaceable state we model). Gated on
+                // the player's loaded view like the dig above: inside it the
+                // target column may be referenced but not yet warmed, so use the
+                // generating read/write (a one-off single-column build is fine for
+                // a player-driven place). An out-of-view target is ignored, so
+                // this never generates a far chunk on the tick thread.
+                if column_loaded(world, entity, px, pz)
+                    && crate::world::block_state_at(px, py, pz) == crate::world::AIR_STATE
+                {
                     crate::world::set_block(px, py, pz, state);
                     broadcast_block_update(world, px, pz, packets::block_update(px, py, pz, state));
                     // Consume one from the held stack in survival, matching vanilla
@@ -287,6 +304,20 @@ pub(super) fn on_packet(world: &mut World, id: Uuid, packet: Serverbound) {
             ack_block_change(world, entity, sequence);
         }
     }
+}
+
+/// Whether the player is tracking the column containing world `(x, z)` — i.e.
+/// the block sits in a chunk loaded server-side for this player. This is Vela's
+/// stand-in for vanilla gating a serverbound block edit on the target chunk being
+/// loaded within the player's ticket/view range: a legitimate dig or place only
+/// ever targets a column in the player's `ChunkTrackingView`, which here is the
+/// `LoadedChunks` set. It lets the edit handlers take the generating world path
+/// (warming a referenced-but-not-yet-resident column on demand) while still
+/// refusing to generate an arbitrary far column for an out-of-view edit.
+fn column_loaded(world: &World, entity: Entity, x: i32, z: i32) -> bool {
+    world
+        .get::<LoadedChunks>(entity)
+        .is_some_and(|lc| lc.loaded.contains(&(x >> 4, z >> 4)))
 }
 
 /// The block-state the player would place: their selected hotbar item mapped

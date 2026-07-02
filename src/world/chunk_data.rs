@@ -306,16 +306,22 @@ pub fn chunk_wire_ready(cx: i32, cz: i32) -> bool {
 /// worldgen pipeline). Hot-path guard: per-tick probes (natural mob spawning
 /// samples a column per spawnable chunk, every tick) must never regenerate a
 /// chunk that was already delivered and whose pipeline proto was consumed.
-pub(super) fn resident_surface_height(wx: i32, wz: i32) -> Option<i32> {
+pub fn resident_surface_height(wx: i32, wz: i32) -> Option<i32> {
     let guard = store().0.lock().expect("chunk store mutex poisoned");
     let chunk = guard.columns.get(&(wx >> 4, wz >> 4))?;
     Some(chunk.gen.heights[(((wz & 15) * 16) + (wx & 15)) as usize])
 }
 
-/// How many worker threads warm queued chunks. Parity generation serializes
-/// on the pipeline mutex, but disk loads, lighting, and encoding overlap —
-/// and in legacy mode generation itself parallelizes.
-const PREFETCH_WORKERS: usize = 3;
+/// How many worker threads warm queued chunks. Parity generation now runs a
+/// private [`pipeline`](super::gen::pipeline) instance per worker (a
+/// `thread_local!` — no shared lock), so worldgen scales across these threads
+/// alongside the disk loads, lighting, and encoding that already overlapped
+/// (and legacy-mode generation, which parallelizes too). Sized from the host's
+/// parallelism, leaving two cores for the sim/net threads and clamped so the
+/// per-worker proto caches stay memory-bounded (see `PROTO_CACHE_LIMIT`).
+fn prefetch_workers() -> usize {
+    std::thread::available_parallelism().map(|n| n.get().saturating_sub(2)).unwrap_or(2).clamp(2, 8)
+}
 
 /// Queue columns for background warming: each is generated (if missing) and
 /// its wire columns built off the simulation thread, so `send_queued_chunks`
@@ -329,7 +335,7 @@ pub fn prefetch(coords: impl IntoIterator<Item = (i32, i32)>) {
     let queue = QUEUE.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<(i32, i32)>();
         let rx = Arc::new(Mutex::new(rx));
-        for i in 0..PREFETCH_WORKERS {
+        for i in 0..prefetch_workers() {
             let rx = Arc::clone(&rx);
             std::thread::Builder::new()
                 .name(format!("chunk-prefetch-{i}"))
@@ -362,7 +368,9 @@ pub fn chunk_columns(cx: i32, cz: i32) -> Arc<ChunkColumns> {
 }
 
 /// The block-state id at world `(x, y, z)` — an edit if present, else generated
-/// terrain. Out-of-world `y` reads as air.
+/// terrain. Out-of-world `y` reads as air. Generating: the tick thread uses
+/// [`try_block_state_at`] instead, so the live callers left are the test suite.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn block_state_at(x: i32, y: i32, z: i32) -> BlockState {
     if !(MIN_Y..MAX_Y_EXCL).contains(&y) {
         return states::AIR;
@@ -372,14 +380,55 @@ pub fn block_state_at(x: i32, y: i32, z: i32) -> BlockState {
     with_chunk(cx, cz, |c| c.state(lx, y, lz))
 }
 
+/// Non-generating counterpart to [`block_state_at`]: the block-state id at world
+/// `(x, y, z)` **only if** its chunk is already resident, else `None`. Never
+/// generates a chunk and never waits on the store condvar. This is the
+/// tick-thread read path: a cold (non-resident) column is treated as "not
+/// loaded" — mirroring vanilla, whose entity movement and spawning only touch
+/// fully loaded chunks — rather than stalling the simulation on a ~40 ms parity
+/// pipeline build. Out-of-world `y` reads as air
+/// (`Some(AIR)`), matching [`block_state_at`].
+pub fn try_block_state_at(x: i32, y: i32, z: i32) -> Option<BlockState> {
+    if !(MIN_Y..MAX_Y_EXCL).contains(&y) {
+        return Some(states::AIR);
+    }
+    let (cx, cz) = (x >> 4, z >> 4);
+    let (lx, lz) = (x & 15, z & 15);
+    let guard = store().0.lock().expect("chunk store mutex poisoned");
+    let chunk = guard.columns.get(&(cx, cz))?;
+    Some(chunk.state(lx, y, lz))
+}
+
 /// `LevelReader.getRawBrightness((x, y, z), 0)` — `max(skyLight, blockLight)`
 /// with no sky darkening subtracted. Reads the column's converged
 /// [`super::light::ChunkLight`] (built and cached with the wire blob), generating
-/// the chunk on first touch. The natural spawner's animal light gate consults it.
+/// the chunk on first touch. Generating: the natural spawner's animal light gate
+/// now uses [`try_raw_brightness`], so this is retained as the non-tick-thread
+/// seam (kept per the API contract).
+#[allow(dead_code)]
 pub fn raw_brightness(x: i32, y: i32, z: i32) -> u8 {
     let (cx, cz) = (x >> 4, z >> 4);
     let (lx, lz) = (x & 15, z & 15);
     chunk_columns(cx, cz).light.raw_brightness(lx, y, lz)
+}
+
+/// Non-generating counterpart to [`raw_brightness`]: `max(skyLight, blockLight)`
+/// at world `(x, y, z)` **only if** the chunk is resident *and* its wire columns
+/// (which carry the converged light) are already built — else `None`. Crucially
+/// this never triggers the wire/light build on the caller thread: converging a
+/// column's light is expensive and belongs on the prefetch workers, so the
+/// natural spawner's brightness gate treats an unlit (or non-resident) column as
+/// "skip", exactly as it treats an unloaded one. In a live server the loaded set
+/// is precisely the streamed-and-lit columns, so this is a hit for any chunk a
+/// player can see; it only returns `None` in the brief window after an edit
+/// invalidates the wire, until a re-stream rebuilds it off-thread.
+pub fn try_raw_brightness(x: i32, y: i32, z: i32) -> Option<u8> {
+    let (cx, cz) = (x >> 4, z >> 4);
+    let (lx, lz) = (x & 15, z & 15);
+    let guard = store().0.lock().expect("chunk store mutex poisoned");
+    let chunk = guard.columns.get(&(cx, cz))?;
+    let wire = chunk.wire.as_ref()?;
+    Some(wire.light.raw_brightness(lx, y, lz))
 }
 
 /// Set the block-state at world `(x, y, z)`, returning the previous state id.

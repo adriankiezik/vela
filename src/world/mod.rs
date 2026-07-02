@@ -34,10 +34,16 @@ pub mod storage;
 
 pub use block_item::block_state_for_item;
 pub use chunk_data::{
-    block_state_at, chunk_columns, chunk_wire_ready, evict_chunk, evict_unused_chunks, prefetch,
-    raw_brightness, save_dirty_chunks, set_block,
+    chunk_columns, chunk_wire_ready, evict_chunk, evict_unused_chunks, prefetch,
+    resident_surface_height, save_dirty_chunks, set_block, try_block_state_at, try_raw_brightness,
 };
-pub use gen::{biome_at, seed, set_seed, spawn_column, surface_height, DEFAULT_SEED};
+// The generating block/brightness reads: retained as the non-tick-thread seam
+// (and exercised by the test suite) now that every tick-thread caller uses the
+// `try_` variants above. Dead in the release binary, so silence the unused
+// re-export there rather than drop an API the tests still lean on.
+#[allow(unused_imports)]
+pub use chunk_data::{block_state_at, raw_brightness};
+pub use gen::{biome_at, seed, set_seed, surface_height, world_spawn, DEFAULT_SEED};
 pub use light::ChunkLight;
 
 // The wire-columns type is reached through `chunk_columns`' return value rather

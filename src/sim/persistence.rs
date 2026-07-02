@@ -138,8 +138,12 @@ fn save_level_dat(world: &World) {
     let rules = world.resource::<GameRules>();
 
     // Spawn is the top of a solid, dry column near origin, matching the join
-    // sequence's spawn selection.
-    let (sx, sz) = crate::world::spawn_column();
+    // sequence's spawn selection. `world_spawn()` is memoised, so this save path
+    // (autosave runs periodically on the tick thread) no longer re-spirals the
+    // `surface_height` search on every write — it reads the cached column. The
+    // single `surface_height` for the y is a resident peek once the spawn area is
+    // loaded; it may generate one chunk only when saving with no player nearby.
+    let (sx, sz) = crate::world::world_spawn();
     let spawn_y = crate::world::surface_height(sx, sz) + 1;
     let mut data = LevelData::new(level_name, crate::world::seed() as i64, spawn_y);
     data.spawn_x = sx;

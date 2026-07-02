@@ -138,8 +138,17 @@ pub fn take_item_entity(item_id: i32, player_id: i32, amount: i32) -> Bytes {
 
 /// Whether the world block at `(x, y, z)` is a movement obstacle. Vela has no
 /// per-block collision shapes yet, so "solid" is simply "not air".
+///
+/// Non-generating: a cold (non-resident) column reads as **solid**, so a falling
+/// item clamps to rest where it is rather than the tick thread generating the
+/// column below it. This is the conservative "skip physics for a cold cell"
+/// choice — an item over unloaded ground stops this tick instead of falling
+/// through — and it never blocks the tick on a worldgen build. Items live in
+/// players' loaded (resident) chunks, so this is a hit in practice.
 fn is_solid(x: i32, y: i32, z: i32) -> bool {
-    crate::world::block_state_at(x, y, z) != crate::world::AIR_STATE
+    crate::world::try_block_state_at(x, y, z)
+        .map(|s| s != crate::world::AIR_STATE)
+        .unwrap_or(true)
 }
 
 /// A single item's kinematic state for one integration step.
