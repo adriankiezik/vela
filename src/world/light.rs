@@ -260,12 +260,22 @@ fn compute_sky(dampening: &[u8], col_ceiling: &[i32]) -> (Vec<u8>, usize) {
     // Seed the BFS from source cells on the shadow frontier only — a source that
     // borders a transparent-but-dark cell. Such a source must (a) be a source, so
     // it sits strictly above its own column's occluder, hence `gy > global_min_top`;
-    // and (b) border a darker cell, which is impossible once every neighbour is
-    // itself a source, i.e. above `global_max_top`. So all frontier candidates lie
-    // in the band `(global_min_top, global_max_top]` — scan only that, not the
-    // whole ~65k-cell volume. Flat/no-overhang terrain makes the band empty.
+    // and (b) border a darker light-passing cell. Its horizontal/upward neighbours
+    // are all sources once `gy > global_max_top`, but its **downward** neighbour is
+    // the occluder at `gy - 1`, and an occluder can be *translucent*: water counts
+    // toward `col_ceiling` (`getLightDampening() == 1 != 0`, exactly vanilla
+    // `ChunkSkyLightSources.isEdgeOccluded`) yet still passes light. So the source
+    // row directly above the tallest occluder (`global_max_top + 1`) is a real
+    // frontier — it must seed the downward flood into a submerged column — and the
+    // band has to reach it. Frontier candidates therefore lie in
+    // `(global_min_top, global_max_top + 1]`; opaque occluders make that top row a
+    // no-op (their `gy-1` neighbour has opacity 15, so `borders_dark_pervious` is
+    // false), so flat solid terrain still enqueues nothing.
     let band_lo = (global_min_top + 1).max(LIGHT_Y_MIN);
-    let band_hi = global_max_top;
+    // `global_max_top + 1` is always at or below `fill_top` (the filled region
+    // ends at `bright_from_gy >= global_max_top + 1`), so the clamp only guards the
+    // degenerate near-ceiling case; the scanned sources are genuinely filled to 15.
+    let band_hi = (global_max_top + 1).min(fill_top);
     let mut queue: VecDeque<usize> = VecDeque::new();
     for gy in band_lo..=band_hi {
         for lz in 0..16i32 {
@@ -546,5 +556,65 @@ mod tests {
         queue.push_back(idx(sx, sy, sz));
         flood(&mut light, &dampening, &mut queue);
         assert_eq!(light[idx(sx + 1, sy, sz)], MAX_LEVEL - 5);
+    }
+
+    /// Fill every column of a `flat(0)` chunk with water from y=1 up to and
+    /// including `water_top`, leaving open air above — a uniformly deep,
+    /// **fully submerged** chunk. Returns the edit map.
+    fn submerged_edits(water_top: i32) -> HashMap<u32, BlockState> {
+        let water = crate::world::gen::water_state();
+        let mut edits = HashMap::new();
+        for lz in 0..16 {
+            for lx in 0..16 {
+                for y in 1..=water_top {
+                    edits.insert(edit_key_for(lx, y, lz), water);
+                }
+            }
+        }
+        edits
+    }
+
+    #[test]
+    fn fully_submerged_chunk_attenuates_skylight_per_water_block() {
+        // A chunk whose entire 16×16 top is water at the same y (deep ocean
+        // interior). Vanilla `ChunkSkyLightSources.isEdgeOccluded` treats water
+        // as an occluder (`getLightDampening() == 1 != 0`), so the lowest sky
+        // source is the *air cell just above the topmost water* (15); the water
+        // below is lit by downward propagation losing `getOpacity(water) = 1`
+        // per block — 14, 13, … down to 1, then dark. Regression: the band-scan
+        // seed skipped uniform-depth translucent columns, leaving the water at 0.
+        let gen = GenChunk::flat(0);
+        let edits = submerged_edits(62); // topmost water at y=62, air at y=63+
+        let light = compute_light(&gen, &edits);
+
+        // Air just above the water surface is a full sky source.
+        assert_eq!(light.raw_brightness(8, 63, 8), 15);
+        // Each water block down the column loses exactly one level.
+        assert_eq!(light.raw_brightness(8, 62, 8), 14);
+        assert_eq!(light.raw_brightness(8, 61, 8), 13);
+        assert_eq!(light.raw_brightness(8, 55, 8), 7);
+        assert_eq!(light.raw_brightness(8, 49, 8), 1);
+        // Fourteen blocks down the light has reached 0 and stops.
+        assert_eq!(light.raw_brightness(8, 48, 8), 0);
+    }
+
+    #[test]
+    fn partially_submerged_chunk_still_lights_water() {
+        // Control: the same water, but one column is dry land poking above the
+        // surface, so occluder heights vary (chunk only *partially* submerged).
+        // This case was always lit correctly; it must stay that way.
+        let gen = GenChunk::flat(0);
+        let mut edits = submerged_edits(62);
+        for y in 1..=90 {
+            edits.insert(edit_key_for(0, y, 0), states::STONE);
+        }
+        let light = compute_light(&gen, &edits);
+
+        // A water column away from the pillar attenuates just like the fully
+        // submerged case.
+        assert_eq!(light.raw_brightness(8, 62, 8), 14);
+        assert_eq!(light.raw_brightness(8, 61, 8), 13);
+        assert_eq!(light.raw_brightness(8, 49, 8), 1);
+        assert_eq!(light.raw_brightness(8, 48, 8), 0);
     }
 }
