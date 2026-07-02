@@ -1602,11 +1602,27 @@ pub enum ParityBlock {
     InfestedStone = 54,
     InfestedDeepslate = 55,
     Snow = 56,
+    // P8 vegetal-decoration blocks. Appended (discriminants ≥ 57) so the P2–P5
+    // fixture digest alphabet is untouched. These are the tree-system outputs:
+    // logs + leaves per wood type, plus the beehive nest decorator block. Their
+    // default block states (log `axis=y`, leaves `distance=7,persistent=false`)
+    // equal vanilla's pre-`updateLeaves` states, so straight-trunk trees are
+    // block-identical at identity level; leaf-distance/log-axis property parity
+    // is a follow-up gated by the end-to-end `.mca` diff.
+    OakLog = 57,
+    BirchLog = 58,
+    SpruceLog = 59,
+    DarkOakLog = 60,
+    OakLeaves = 61,
+    BirchLeaves = 62,
+    SpruceLeaves = 63,
+    DarkOakLeaves = 64,
+    BeeNest = 65,
 }
 
 impl ParityBlock {
     /// Every parity block, in discriminant order (index `b as usize`).
-    pub const ALL: [ParityBlock; 57] = [
+    pub const ALL: [ParityBlock; 66] = [
         ParityBlock::Air,
         ParityBlock::Stone,
         ParityBlock::Water,
@@ -1664,6 +1680,15 @@ impl ParityBlock {
         ParityBlock::InfestedStone,
         ParityBlock::InfestedDeepslate,
         ParityBlock::Snow,
+        ParityBlock::OakLog,
+        ParityBlock::BirchLog,
+        ParityBlock::SpruceLog,
+        ParityBlock::DarkOakLog,
+        ParityBlock::OakLeaves,
+        ParityBlock::BirchLeaves,
+        ParityBlock::SpruceLeaves,
+        ParityBlock::DarkOakLeaves,
+        ParityBlock::BeeNest,
     ];
 
     /// The `minecraft:` block id this parity block resolves to in the real
@@ -1727,6 +1752,15 @@ impl ParityBlock {
             ParityBlock::InfestedStone => "minecraft:infested_stone",
             ParityBlock::InfestedDeepslate => "minecraft:infested_deepslate",
             ParityBlock::Snow => "minecraft:snow",
+            ParityBlock::OakLog => "minecraft:oak_log",
+            ParityBlock::BirchLog => "minecraft:birch_log",
+            ParityBlock::SpruceLog => "minecraft:spruce_log",
+            ParityBlock::DarkOakLog => "minecraft:dark_oak_log",
+            ParityBlock::OakLeaves => "minecraft:oak_leaves",
+            ParityBlock::BirchLeaves => "minecraft:birch_leaves",
+            ParityBlock::SpruceLeaves => "minecraft:spruce_leaves",
+            ParityBlock::DarkOakLeaves => "minecraft:dark_oak_leaves",
+            ParityBlock::BeeNest => "minecraft:bee_nest",
         }
     }
 
@@ -1787,6 +1821,15 @@ impl ParityBlock {
             "infested_stone" => ParityBlock::InfestedStone,
             "infested_deepslate" => ParityBlock::InfestedDeepslate,
             "snow" => ParityBlock::Snow,
+            "oak_log" => ParityBlock::OakLog,
+            "birch_log" => ParityBlock::BirchLog,
+            "spruce_log" => ParityBlock::SpruceLog,
+            "dark_oak_log" => ParityBlock::DarkOakLog,
+            "oak_leaves" => ParityBlock::OakLeaves,
+            "birch_leaves" => ParityBlock::BirchLeaves,
+            "spruce_leaves" => ParityBlock::SpruceLeaves,
+            "dark_oak_leaves" => ParityBlock::DarkOakLeaves,
+            "bee_nest" => ParityBlock::BeeNest,
             _ => return None,
         })
     }
@@ -1807,6 +1850,19 @@ impl ParityBlock {
     /// (`OCEAN_FLOOR`, `MOTION_BLOCKING`).
     pub fn blocks_motion(self) -> bool {
         !matches!(self, ParityBlock::Air | ParityBlock::Water | ParityBlock::Lava | ParityBlock::Snow)
+    }
+
+    /// Membership in `#minecraft:leaves` over the parity alphabet. The
+    /// `MOTION_BLOCKING_NO_LEAVES` heightmap excludes these (they block motion
+    /// but are skipped by that heightmap's opacity predicate).
+    pub fn is_leaves(self) -> bool {
+        matches!(
+            self,
+            ParityBlock::OakLeaves
+                | ParityBlock::BirchLeaves
+                | ParityBlock::SpruceLeaves
+                | ParityBlock::DarkOakLeaves
+        )
     }
 }
 

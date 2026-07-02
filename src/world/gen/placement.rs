@@ -124,10 +124,10 @@ impl Heightmap {
         match self {
             Heightmap::WorldSurfaceWg | Heightmap::WorldSurface => !block.is_air(),
             Heightmap::OceanFloorWg | Heightmap::OceanFloor => block.blocks_motion(),
-            // No leaves exist in the parity alphabet, so the two motion-blocking
-            // heightmaps coincide.
-            Heightmap::MotionBlocking | Heightmap::MotionBlockingNoLeaves => {
-                block.blocks_motion() || block.is_fluid()
+            Heightmap::MotionBlocking => block.blocks_motion() || block.is_fluid(),
+            // `MOTION_BLOCKING_NO_LEAVES` is `MOTION_BLOCKING` minus `#leaves`.
+            Heightmap::MotionBlockingNoLeaves => {
+                !block.is_leaves() && (block.blocks_motion() || block.is_fluid())
             }
         }
     }
