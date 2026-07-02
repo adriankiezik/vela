@@ -300,6 +300,18 @@ pub fn chunk_wire_ready(cx: i32, cz: i32) -> bool {
     guard.columns.get(&(cx, cz)).is_some_and(|c| c.wire.is_some())
 }
 
+/// The baked surface height of a *resident* chunk's column — a non-generating
+/// peek. `None` when the chunk isn't in the store; the caller decides whether
+/// missing warrants generating (the parity `surface_height` falls back to the
+/// worldgen pipeline). Hot-path guard: per-tick probes (natural mob spawning
+/// samples a column per spawnable chunk, every tick) must never regenerate a
+/// chunk that was already delivered and whose pipeline proto was consumed.
+pub(super) fn resident_surface_height(wx: i32, wz: i32) -> Option<i32> {
+    let guard = store().0.lock().expect("chunk store mutex poisoned");
+    let chunk = guard.columns.get(&(wx >> 4, wz >> 4))?;
+    Some(chunk.gen.heights[(((wz & 15) * 16) + (wx & 15)) as usize])
+}
+
 /// How many worker threads warm queued chunks. Parity generation serializes
 /// on the pipeline mutex, but disk loads, lighting, and encoding overlap —
 /// and in legacy mode generation itself parallelizes.
@@ -585,6 +597,18 @@ mod tests {
                                   // 256 columns at 9 bits, 7 per long -> 37 longs.
         assert_eq!(maps[0].1.len(), 37);
         assert_eq!(maps[1].1.len(), 37);
+    }
+
+    /// The non-generating height peek: `None` for a chunk that was never
+    /// touched, the baked column height once resident.
+    #[test]
+    fn resident_height_peeks_without_generating() {
+        // A far-away coordinate no other test touches.
+        let (wx, wz) = (20_017, 20_033);
+        assert_eq!(resident_surface_height(wx, wz), None, "untouched chunk must not read back");
+        // Any block read makes the chunk resident.
+        let _ = block_state_at(wx, 100, wz);
+        assert_eq!(resident_surface_height(wx, wz), Some(surface_height(wx, wz)));
     }
 
     #[test]

@@ -78,11 +78,17 @@ fn field_seed(salt: u32) -> u32 {
 
 /// The terrain surface height (topmost solid block y) for a world column.
 /// Deterministic in `(wx, wz)` and continuous, so adjacent chunks line up.
-/// In parity mode this reads the pipeline's `OCEAN_FLOOR_WG` instead, so
-/// spawn placement and mob logic see the real generated terrain.
+/// In parity mode this is `OCEAN_FLOOR_WG`, read from the *resident* chunk
+/// when one exists (an O(1) peek — per-tick callers like the natural mob
+/// spawner probe columns of loaded chunks every tick, and regenerating a
+/// consumed pipeline proto per probe at ~40 ms would sink the tick rate) and
+/// from the worldgen pipeline only for columns no chunk holds (the boot-time
+/// spawn search). Both sources bake the same value, so the fallback is a
+/// cache-miss cost, never a different answer.
 pub fn surface_height(wx: i32, wz: i32) -> i32 {
     if parity_enabled() {
-        return pipeline::surface_height(wx, wz);
+        return super::chunk_data::resident_surface_height(wx, wz)
+            .unwrap_or_else(|| pipeline::surface_height(wx, wz));
     }
     let hs = field_seed(HEIGHT_SALT);
     let cont = noise::fbm2(wx as f64 / 400.0, wz as f64 / 400.0, hs, 4);
