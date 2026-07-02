@@ -1156,6 +1156,21 @@ fn flush_emissions(world: &mut World, emissions: &[(Entity, Bytes)]) {
 /// categories when `spawnPersistent = gameTime % 400 == 0`. Vela spawns only
 /// CREATURE mobs today, so the whole spawn pass runs on that cadence.
 const SPAWN_PERSISTENT_INTERVAL: u64 = 400;
+
+/// The live persistent-spawn cadence. Vanilla's 400, unless `VELA_SPAWN_INTERVAL_TICKS`
+/// overrides it — a test-only lever the natural-spawn integration test uses to fire
+/// many spawn passes per second (so it doesn't have to wait out real 20-second
+/// cadences) without touching *what* gets spawned. Unset/unparsable → 400. Read once.
+fn spawn_persistent_interval() -> u64 {
+    static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("VELA_SPAWN_INTERVAL_TICKS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&t| t > 0)
+            .unwrap_or(SPAWN_PERSISTENT_INTERVAL)
+    })
+}
 /// `MobCategory.CREATURE.getMaxInstancesPerChunk()`.
 const CREATURE_MAX_PER_CHUNK: i32 = 10;
 /// `NaturalSpawner.MAGIC_NUMBER` — `17²`, the divisor in the global cap formula.
@@ -1338,7 +1353,7 @@ fn creature_global_cap(spawnable_chunk_count: i32) -> i32 {
 pub fn mob_spawn(world: &mut World) {
     let tick = world.resource::<Tick>().0;
     // CREATURE only participates on the persistent cadence.
-    if !tick.is_multiple_of(SPAWN_PERSISTENT_INTERVAL) {
+    if !tick.is_multiple_of(spawn_persistent_interval()) {
         return;
     }
 
@@ -2688,18 +2703,21 @@ mod tests {
     #[test]
     fn mob_spawn_populates_real_terrain_end_to_end() {
         // Production-like conditions: a player on the generated surface with a
-        // radius-8 loaded set (17×17 = 289 chunks → global cap 10). Many passes
-        // on the 400-tick cadence must actually place mobs — this covers the
-        // full `mob_spawn` path (random chunk/Y picks, grass/air/light gates)
-        // on real worldgen, not a hand-built platform.
+        // radius-4 loaded set (9×9 = 81 chunks → global cap 2). Many passes on the
+        // 400-tick cadence must actually place mobs — this covers the full
+        // `mob_spawn` path (random chunk/Y picks, grass/air/light gates) on real
+        // worldgen, not a hand-built platform. (Radius 4 rather than a wider set
+        // keeps the up-front warm — a full parity generate+light per column, ~40 ms
+        // each — bounded: 81 columns instead of 289 still yields a non-zero cap and
+        // ample real grass for the spawner to land on, at a fraction of the cost.)
         let _lock = crate::world::WORLD_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
         let (px, pz) = (0, 0);
         let py = crate::world::surface_height(px, pz) + 1;
-        let loaded: Vec<(i32, i32)> = (-8..=8)
-            .flat_map(|cx| (-8..=8).map(move |cz| (cx, cz)))
+        let loaded: Vec<(i32, i32)> = (-4..=4)
+            .flat_map(|cx| (-4..=4).map(move |cz| (cx, cz)))
             .collect();
         // The spawner now only touches *resident, wire-built* chunks (it never
         // generates or lights on the tick thread). In production the loaded set is
@@ -2726,7 +2744,10 @@ mod tests {
         }
         let count = world.query::<&Mob>().iter(&world).count();
         assert!(count > 0, "no mobs spawned in 50 end-to-end passes");
-        assert!(count as i32 <= creature_global_cap(289), "global cap respected");
+        assert!(
+            count as i32 <= creature_global_cap(loaded.len() as i32),
+            "global cap respected"
+        );
     }
 
     #[test]

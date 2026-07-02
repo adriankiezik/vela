@@ -1175,16 +1175,40 @@ mod tests {
     #[test]
     fn jvm_golden_parity_p5() {
         let fixture = include_str!("testdata/p5_golden.txt");
-        let mut generators: HashMap<i64, SurfacedGenerator> = HashMap::new();
-        let mut chunks: HashMap<(i64, i32, i32), FilledChunk> = HashMap::new();
-        let mut checked = 0usize;
+        // Generating the 47 chunks is the whole cost; the column/heightmap lines are
+        // cheap lookups into already-built chunks. The biome source's RTree carries a
+        // `Cell<last_result>` that evolves with query order, so a seed's lines must
+        // replay strictly in fixture order — but the three seeds are fully independent
+        // generators, so fan them out across threads (each seed owns its generator and
+        // chunk cache). Preserves exact per-seed semantics at ~1/3 the wall time.
+        let mut by_seed: Vec<(i64, Vec<&str>)> = Vec::new();
         for line in fixture.lines() {
+            let seed: i64 =
+                line.split_whitespace().nth(1).expect("seed").parse().expect("seed");
+            match by_seed.iter_mut().find(|(s, _)| *s == seed) {
+                Some((_, lines)) => lines.push(line),
+                None => by_seed.push((seed, vec![line])),
+            }
+        }
+        let checked: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                by_seed.iter().map(|(_, lines)| scope.spawn(|| replay_seed(lines))).collect();
+            handles.into_iter().map(|h| h.join().expect("seed replay thread")).sum()
+        });
+        assert_eq!(checked, 288, "fixture line count");
+    }
+
+    /// Replay one seed's slice of the golden fixture (in order) against a freshly
+    /// built generator, asserting every line. Returns the number of lines checked.
+    fn replay_seed(lines: &[&str]) -> usize {
+        let mut generator: Option<SurfacedGenerator> = None;
+        let mut chunks: HashMap<(i32, i32), FilledChunk> = HashMap::new();
+        for line in lines {
             let mut parts = line.split_whitespace();
             let tag = parts.next().expect("tag");
             let seed: i64 = parts.next().expect("seed").parse().expect("seed");
-            let generator = generators
-                .entry(seed)
-                .or_insert_with(|| SurfacedGenerator::new_overworld(seed));
+            let generator =
+                generator.get_or_insert_with(|| SurfacedGenerator::new_overworld(seed));
             match tag {
                 "zoomseed" => {
                     let want: i64 = parts.next().unwrap().parse().unwrap();
@@ -1207,7 +1231,7 @@ mod tests {
                         h = h.wrapping_mul(0x100000001b3);
                     }
                     assert_eq!(h, digest, "chunk digest seed {seed} chunk ({cx},{cz})");
-                    chunks.insert((seed, cx, cz), chunk);
+                    chunks.insert((cx, cz), chunk);
                 }
                 "column" => {
                     let cx: i32 = parts.next().unwrap().parse().unwrap();
@@ -1215,7 +1239,7 @@ mod tests {
                     let x: i32 = parts.next().unwrap().parse().unwrap();
                     let z: i32 = parts.next().unwrap().parse().unwrap();
                     let want = parts.next().expect("column blocks");
-                    let chunk = &chunks[&(seed, cx, cz)];
+                    let chunk = &chunks[&(cx, cz)];
                     let got: String = (0..chunk.height)
                         .map(|dy| block_char(chunk.block(x, chunk.min_y + dy, z)))
                         .collect();
@@ -1225,7 +1249,7 @@ mod tests {
                     let cx: i32 = parts.next().unwrap().parse().unwrap();
                     let cz: i32 = parts.next().unwrap().parse().unwrap();
                     let want = parts.next().expect("heights");
-                    let chunk = &chunks[&(seed, cx, cz)];
+                    let chunk = &chunks[&(cx, cz)];
                     let hm =
                         if tag == "hmws" { &chunk.world_surface_wg } else { &chunk.ocean_floor_wg };
                     let got = (0..256)
@@ -1239,8 +1263,7 @@ mod tests {
                 }
                 other => panic!("unknown fixture tag {other}"),
             }
-            checked += 1;
         }
-        assert_eq!(checked, 288, "fixture line count");
+        lines.len()
     }
 }

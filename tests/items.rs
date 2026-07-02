@@ -250,6 +250,15 @@ fn two_drops_merge_into_one() {
     // 40 ticks = 2 s; give margin).
     std::thread::sleep(Duration::from_millis(2500));
 
+    // The merge's RemoveEntities has already been sent (and buffered) by now, so the
+    // final scan only needs to drain the backlog — not wait ~20 s for the server to
+    // drop this deliberately-idle client on the keep-alive timeout, which is what
+    // `drain_until`'s stream-end fallback would otherwise block on. Drop the read
+    // timeout to a small idle gap: the backlog streams back-to-back, and once it is
+    // exhausted the next packet (a 1 Hz SetTime) is far enough out that the timeout
+    // fires and the scan returns promptly.
+    s.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+
     // Exactly one of the two item entities is removed by the merge (folded into the
     // other). No player is in pickup range, and the item lifetime is 6000 ticks, so
     // a removal here can only be the merge.

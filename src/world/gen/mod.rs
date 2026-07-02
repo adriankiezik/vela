@@ -457,10 +457,25 @@ mod tests {
 
     #[test]
     fn surface_stays_in_the_world() {
-        for x in (-512..512).step_by(31) {
-            for z in (-512..512).step_by(29) {
-                let h = surface_height(x, z);
-                assert!((MIN_Y + 2..MAX_Y_EXCL - 40).contains(&h), "height {h} out of world at ({x},{z})");
+        // Surfacing a column in parity mode advances (and caches) its whole owning
+        // chunk, so probing one column per chunk over a wide scattered grid would
+        // pay a full chunk-surface per sample. Instead sweep a coarse set of chunks
+        // spanning the same ~[-512, 512] region and check *every* column of each —
+        // same chunk-surface cost amortized over all 256 columns, giving both a
+        // cheaper test and far broader coverage than the old one-column-per-chunk
+        // sampling. The invariant is unchanged: no column's surface leaves the world.
+        for cx in (-32..32).step_by(21) {
+            for cz in (-32..32).step_by(21) {
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let (x, z) = (cx * 16 + lx, cz * 16 + lz);
+                        let h = surface_height(x, z);
+                        assert!(
+                            (MIN_Y + 2..MAX_Y_EXCL - 40).contains(&h),
+                            "height {h} out of world at ({x},{z})"
+                        );
+                    }
+                }
             }
         }
     }
