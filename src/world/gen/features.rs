@@ -63,7 +63,7 @@ use serde_json::Value;
 
 use super::density::ParityBlock;
 use super::placement::{
-    BiomeFeatureIndex, BlockPredicate, BlockTag, DecorationLevel, Heightmap, IntProvider,
+    BiomeFeatureIndex, BlockPredicate, BlockTag, DecorationLevel, FloatProvider, Heightmap, IntProvider,
     PlacementCtx, PlacementModifier, Pos, RuleTest,
 };
 use super::random::{RandomSource, WorldgenRandom};
@@ -408,6 +408,60 @@ struct GeodeConfig {
     max_gen_offset: i32,
     noise_multiplier: f64,
     invalid_blocks_threshold: i32,
+}
+
+/// `SpeleothemConfiguration` (single pointed dripstone).
+#[derive(Clone, Debug)]
+struct SpeleothemConfig {
+    base_block: ParityBlock,
+    pointed_block: ParityBlock,
+    replaceable_blocks: Option<BlockTag>,
+    chance_of_taller_generation: f32,
+    chance_of_directional_spread: f32,
+    chance_of_spread_radius2: f32,
+    chance_of_spread_radius3: f32,
+}
+
+/// `SpeleothemClusterConfiguration` (`dripstone_cluster`).
+#[derive(Clone, Debug)]
+struct SpeleothemClusterConfig {
+    floor_to_ceiling_search_range: i32,
+    height: IntProvider,
+    radius: IntProvider,
+    max_stalagmite_stalactite_height_diff: i32,
+    height_deviation: i32,
+    speleothem_block_layer_thickness: IntProvider,
+    density: FloatProvider,
+    wetness: FloatProvider,
+    chance_of_speleothem_at_max_distance_from_center: f64,
+    max_distance_from_center_affecting_height_bias: i32,
+    max_distance_from_edge_affecting_chance_of_speleothem: i32,
+    base_block: ParityBlock,
+    pointed_block: ParityBlock,
+    replaceable_blocks: Option<BlockTag>,
+}
+
+/// `LargeDripstoneConfiguration`.
+#[derive(Clone, Debug)]
+struct LargeDripstoneConfig {
+    floor_to_ceiling_search_range: i32,
+    column_radius: IntProvider,
+    height_scale: FloatProvider,
+    max_column_radius_to_cave_height_ratio: f64,
+    stalactite_bluntness: FloatProvider,
+    stalagmite_bluntness: FloatProvider,
+    wind_speed: FloatProvider,
+    min_radius_for_wind: i32,
+    min_bluntness_for_wind: f64,
+    base_block: ParityBlock,
+    pointed_block: ParityBlock,
+    replaceable_blocks: Option<BlockTag>,
+}
+
+/// `CompositeFeatureConfiguration` (`simple_random_selector`).
+#[derive(Clone, Debug)]
+struct SimpleRandomSelectorConfig {
+    features: Vec<NestedFeature>,
 }
 
 // ---------------------------------------------------------------------------
@@ -892,15 +946,22 @@ struct RandomSelectorConfig {
 fn parse_nested(v: &Value) -> NestedFeature {
     match v {
         Value::String(s) => NestedFeature::PlacedRef(strip(s)),
-        Value::Object(_) => NestedFeature::InlineRef {
-            feature: strip(v["feature"].as_str().unwrap_or("")),
-            placement: v["placement"]
+        Value::Object(_) => {
+            let placement = v["placement"]
                 .as_array()
                 .unwrap_or(&vec![])
                 .iter()
                 .map(PlacementModifier::parse)
-                .collect(),
-        },
+                .collect();
+            // `feature` is either a placed-feature id string or an inline
+            // configured feature object (`{type, config}`, as in
+            // `simple_random_selector`). The latter resolves directly.
+            if v["feature"].is_object() {
+                NestedFeature::Resolved { feature: Box::new(ConfiguredFeature::parse(&v["feature"])), placement }
+            } else {
+                NestedFeature::InlineRef { feature: strip(v["feature"].as_str().unwrap_or("")), placement }
+            }
+        }
         _ => NestedFeature::PlacedRef(String::new()),
     }
 }
@@ -945,6 +1006,10 @@ enum ConfiguredFeature {
     MonsterRoom,
     UnderwaterMagma(UnderwaterMagmaConfig),
     Geode(GeodeConfig),
+    Speleothem(SpeleothemConfig),
+    SpeleothemCluster(SpeleothemClusterConfig),
+    LargeDripstone(LargeDripstoneConfig),
+    SimpleRandomSelector(SimpleRandomSelectorConfig),
     Deferred(String),
 }
 
@@ -1022,6 +1087,12 @@ impl ConfiguredFeature {
                 placement_probability: cfg["placement_probability_per_valid_position"].as_f64().unwrap_or(0.0) as f32,
             }),
             "geode" => ConfiguredFeature::Geode(parse_geode(cfg)),
+            "speleothem" => ConfiguredFeature::Speleothem(parse_speleothem(cfg)),
+            "speleothem_cluster" => ConfiguredFeature::SpeleothemCluster(parse_speleothem_cluster(cfg)),
+            "large_dripstone" => ConfiguredFeature::LargeDripstone(parse_large_dripstone(cfg)),
+            "simple_random_selector" => ConfiguredFeature::SimpleRandomSelector(SimpleRandomSelectorConfig {
+                features: cfg["features"].as_array().unwrap_or(&vec![]).iter().map(parse_nested).collect(),
+            }),
             // `freeze_top_layer` (SnowAndFreezeFeature) is recognized but
             // deferred: its exact `Biome.shouldFreeze`/`shouldSnow` gates need
             // the biome-temperature/height-adjust plumbing (in surface_rules)
@@ -1120,6 +1191,11 @@ fn resolve_cf(
                 .collect(),
             default: resolve_nested(&rc.default, configured, placed),
         }),
+        ConfiguredFeature::SimpleRandomSelector(sc) => {
+            ConfiguredFeature::SimpleRandomSelector(SimpleRandomSelectorConfig {
+                features: sc.features.iter().map(|f| resolve_nested(f, configured, placed)).collect(),
+            })
+        }
         other => other.clone(),
     }
 }
@@ -1190,7 +1266,9 @@ impl FeatureRegistry {
         // never needs the registry.
         let selector_ids: Vec<String> = configured
             .iter()
-            .filter(|(_, c)| matches!(c, ConfiguredFeature::RandomSelector(_)))
+            .filter(|(_, c)| {
+                matches!(c, ConfiguredFeature::RandomSelector(_) | ConfiguredFeature::SimpleRandomSelector(_))
+            })
             .map(|(k, _)| k.clone())
             .collect();
         for id in selector_ids {
@@ -1500,6 +1578,10 @@ fn place_feature(
         ConfiguredFeature::MonsterRoom => place_monster_room(ctx, random, origin),
         ConfiguredFeature::UnderwaterMagma(cfg) => place_underwater_magma(cfg, ctx, random, origin),
         ConfiguredFeature::Geode(cfg) => place_geode(cfg, ctx, random, origin),
+        ConfiguredFeature::Speleothem(cfg) => place_speleothem(cfg, ctx, random, origin),
+        ConfiguredFeature::SpeleothemCluster(cfg) => place_speleothem_cluster(cfg, ctx, random, origin),
+        ConfiguredFeature::LargeDripstone(cfg) => place_large_dripstone(cfg, ctx, random, origin),
+        ConfiguredFeature::SimpleRandomSelector(cfg) => place_simple_random_selector(cfg, ctx, random, origin),
         ConfiguredFeature::Deferred(_) => {}
     }
 }
@@ -3117,6 +3199,669 @@ fn pos_dist_sqr(a: Pos, b: Pos) -> f64 {
     let dy = (a.y - b.y) as f64;
     let dz = (a.z - b.z) as f64;
     dx * dx + dy * dy + dz * dz
+}
+
+// ---------------------------------------------------------------------------
+// Dripstone group: speleothem (pointed_dripstone), speleothem_cluster
+// (dripstone_cluster), large_dripstone, simple_random_selector
+// ---------------------------------------------------------------------------
+
+fn dripstone_tag(v: &Value) -> Option<BlockTag> {
+    v.as_str().map(|s| s.trim_start_matches('#')).and_then(BlockTag::from_id)
+}
+
+fn parse_speleothem(cfg: &Value) -> SpeleothemConfig {
+    SpeleothemConfig {
+        base_block: cfg["base_block"]["Name"].as_str().and_then(ParityBlock::from_name).unwrap_or(ParityBlock::DripstoneBlock),
+        pointed_block: cfg["pointed_block"]["Name"].as_str().and_then(ParityBlock::from_name).unwrap_or(ParityBlock::PointedDripstone),
+        replaceable_blocks: dripstone_tag(&cfg["replaceable_blocks"]),
+        chance_of_taller_generation: cfg.get("chance_of_taller_generation").and_then(Value::as_f64).unwrap_or(0.2) as f32,
+        chance_of_directional_spread: cfg.get("chance_of_directional_spread").and_then(Value::as_f64).unwrap_or(0.7) as f32,
+        chance_of_spread_radius2: cfg.get("chance_of_spread_radius2").and_then(Value::as_f64).unwrap_or(0.5) as f32,
+        chance_of_spread_radius3: cfg.get("chance_of_spread_radius3").and_then(Value::as_f64).unwrap_or(0.5) as f32,
+    }
+}
+
+fn parse_speleothem_cluster(cfg: &Value) -> SpeleothemClusterConfig {
+    SpeleothemClusterConfig {
+        floor_to_ceiling_search_range: cfg["floor_to_ceiling_search_range"].as_i64().unwrap_or(12) as i32,
+        height: IntProvider::parse(&cfg["height"]),
+        radius: IntProvider::parse(&cfg["radius"]),
+        max_stalagmite_stalactite_height_diff: cfg["max_stalagmite_stalactite_height_diff"].as_i64().unwrap_or(0) as i32,
+        height_deviation: cfg["height_deviation"].as_i64().unwrap_or(1) as i32,
+        speleothem_block_layer_thickness: IntProvider::parse(&cfg["speleothem_block_layer_thickness"]),
+        density: FloatProvider::parse(&cfg["density"]),
+        wetness: FloatProvider::parse(&cfg["wetness"]),
+        chance_of_speleothem_at_max_distance_from_center: cfg["chance_of_speleothem_at_max_distance_from_center"].as_f64().unwrap_or(0.0),
+        max_distance_from_center_affecting_height_bias: cfg["max_distance_from_center_affecting_height_bias"].as_i64().unwrap_or(0) as i32,
+        max_distance_from_edge_affecting_chance_of_speleothem: cfg["max_distance_from_edge_affecting_chance_of_speleothem"].as_i64().unwrap_or(0) as i32,
+        base_block: cfg["base_block"]["Name"].as_str().and_then(ParityBlock::from_name).unwrap_or(ParityBlock::DripstoneBlock),
+        pointed_block: cfg["pointed_block"]["Name"].as_str().and_then(ParityBlock::from_name).unwrap_or(ParityBlock::PointedDripstone),
+        replaceable_blocks: dripstone_tag(&cfg["replaceable_blocks"]),
+    }
+}
+
+fn parse_large_dripstone(cfg: &Value) -> LargeDripstoneConfig {
+    LargeDripstoneConfig {
+        floor_to_ceiling_search_range: cfg.get("floor_to_ceiling_search_range").and_then(Value::as_i64).unwrap_or(30) as i32,
+        column_radius: IntProvider::parse(&cfg["column_radius"]),
+        height_scale: FloatProvider::parse(&cfg["height_scale"]),
+        max_column_radius_to_cave_height_ratio: cfg["max_column_radius_to_cave_height_ratio"].as_f64().unwrap_or(0.0),
+        stalactite_bluntness: FloatProvider::parse(&cfg["stalactite_bluntness"]),
+        stalagmite_bluntness: FloatProvider::parse(&cfg["stalagmite_bluntness"]),
+        wind_speed: FloatProvider::parse(&cfg["wind_speed"]),
+        min_radius_for_wind: cfg["min_radius_for_wind"].as_i64().unwrap_or(0) as i32,
+        min_bluntness_for_wind: cfg["min_bluntness_for_wind"].as_f64().unwrap_or(0.0),
+        base_block: ParityBlock::DripstoneBlock,
+        pointed_block: ParityBlock::PointedDripstone,
+        replaceable_blocks: dripstone_tag(&cfg["replaceable_blocks"]),
+    }
+}
+
+fn int_provider_min(p: &IntProvider) -> i32 {
+    match p {
+        IntProvider::Constant(c) => *c,
+        IntProvider::Uniform { min, .. } => *min,
+        IntProvider::BiasedToBottom { min, .. } => *min,
+        IntProvider::Clamped { source, min, .. } => (*min).max(int_provider_min(source)),
+        IntProvider::ClampedNormal { min, .. } => *min,
+        IntProvider::Trapezoid { min, .. } => *min,
+        IntProvider::WeightedList(e) => e.iter().map(|(p, _)| int_provider_min(p)).min().unwrap_or(0),
+    }
+}
+fn int_provider_max(p: &IntProvider) -> i32 {
+    match p {
+        IntProvider::Constant(c) => *c,
+        IntProvider::Uniform { max, .. } => *max,
+        IntProvider::BiasedToBottom { max, .. } => *max,
+        IntProvider::Clamped { source, max, .. } => (*max).min(int_provider_max(source)),
+        IntProvider::ClampedNormal { max, .. } => *max,
+        IntProvider::Trapezoid { max, .. } => *max,
+        IntProvider::WeightedList(e) => e.iter().map(|(p, _)| int_provider_max(p)).max().unwrap_or(0),
+    }
+}
+
+/// `Mth.clampedMap(double,double,double,double,double)`.
+fn clamped_map(x: f64, a: f64, b: f64, c: f64, d: f64) -> f64 {
+    let t = (x - a) / (b - a);
+    if t < 0.0 {
+        c
+    } else if t > 1.0 {
+        d
+    } else {
+        c + t * (d - c)
+    }
+}
+
+/// `Mth.randomBetweenInclusive`.
+fn mth_random_between_inclusive(random: &mut WorldgenRandom, min: i32, max: i32) -> i32 {
+    min + random.next_int_bounded(max - min + 1)
+}
+
+/// `ClampedNormalFloat.sample(random, mean, deviation, min, max)`.
+fn clamped_normal_sample(random: &mut WorldgenRandom, mean: f32, deviation: f32, min: f32, max: f32) -> f32 {
+    (mean + (random.next_gaussian() as f32) * deviation).clamp(min, max)
+}
+
+// --- SpeleothemUtils helpers ---
+
+fn spel_is_empty_or_water(b: ParityBlock) -> bool {
+    b.is_air() || b == ParityBlock::Water
+}
+fn spel_is_neither_empty_nor_water(b: ParityBlock) -> bool {
+    !b.is_air() && b != ParityBlock::Water
+}
+fn spel_is_empty_or_water_or_lava(b: ParityBlock) -> bool {
+    b.is_air() || b == ParityBlock::Water || b == ParityBlock::Lava
+}
+fn spel_is_base(b: ParityBlock, base: ParityBlock, replaceable: Option<BlockTag>) -> bool {
+    b == base || replaceable.map(|t| t.contains(b)).unwrap_or(false)
+}
+fn spel_is_base_or_lava(b: ParityBlock, base: ParityBlock, replaceable: Option<BlockTag>) -> bool {
+    spel_is_base(b, base, replaceable) || b == ParityBlock::Lava
+}
+
+/// `SpeleothemUtils.getSpeleothemHeight`.
+fn speleothem_util_height(xz_dist: f64, radius: f64, scale: f64, bluntness: f64) -> f64 {
+    let xz = if xz_dist < bluntness { bluntness } else { xz_dist };
+    let r = xz / radius * 0.384;
+    let part1 = 0.75 * r.powf(1.333_333_333_333_333_3);
+    let part2 = r.powf(0.666_666_666_666_666_6);
+    let part3 = 0.333_333_333_333_333_3 * r.ln();
+    let h = (scale * (part1 - part2 - part3)).max(0.0);
+    h / 0.384 * radius
+}
+
+/// `SpeleothemUtils.isCircleMostlyEmbeddedInStone`.
+fn speleothem_circle_embedded(ctx: &PlacementCtx, center: Pos, xz_radius: i32) -> bool {
+    if spel_is_empty_or_water_or_lava(ctx.level.get_block(center.x, center.y, center.z)) {
+        return false;
+    }
+    let angle_increment = 6.0_f32 / xz_radius as f32;
+    let mut angle = 0.0_f32;
+    while angle < std::f32::consts::TAU {
+        let dx = (super::carvers::mth_cos(angle as f64) * xz_radius as f32) as i32;
+        let dz = (super::carvers::mth_sin(angle as f64) * xz_radius as f32) as i32;
+        if spel_is_empty_or_water_or_lava(ctx.level.get_block(center.x + dx, center.y, center.z + dz)) {
+            return false;
+        }
+        angle += angle_increment;
+    }
+    true
+}
+
+/// `SpeleothemUtils.placeBaseBlockIfPossible`.
+fn speleothem_place_base(ctx: &mut PlacementCtx, p: Pos, base: ParityBlock, replaceable: Option<BlockTag>) -> bool {
+    let s = ctx.level.get_block(p.x, p.y, p.z);
+    if replaceable.map(|t| t.contains(s)).unwrap_or(false) {
+        ctx.level.set_block(p.x, p.y, p.z, base);
+        true
+    } else {
+        false
+    }
+}
+
+/// `SpeleothemUtils.growSpeleothem` — `buildBaseToTipColumn` collapses onto
+/// `height` consecutive `pointed_block`s (their thickness/direction/waterlogged
+/// properties drop to the default state per precedent). Draws no RNG.
+fn speleothem_grow(
+    ctx: &mut PlacementCtx,
+    start: Pos,
+    tip: (i32, i32, i32),
+    height: i32,
+    base: ParityBlock,
+    pointed: ParityBlock,
+    replaceable: Option<BlockTag>,
+) {
+    let root = Pos::new(start.x - tip.0, start.y - tip.1, start.z - tip.2);
+    if !spel_is_base(ctx.level.get_block(root.x, root.y, root.z), base, replaceable) {
+        return;
+    }
+    let mut p = start;
+    for _ in 0..height {
+        ctx.level.set_block(p.x, p.y, p.z, pointed);
+        p = Pos::new(p.x + tip.0, p.y + tip.1, p.z + tip.2);
+    }
+}
+
+/// `Column.scan` reduced to `(floor, ceiling)` — the solid edges bounding the
+/// contiguous `inside` column at `pos`. `None` when `pos` is not `inside`.
+fn column_scan(
+    ctx: &PlacementCtx,
+    pos: Pos,
+    range: i32,
+    inside: impl Fn(ParityBlock) -> bool,
+    valid_edge: impl Fn(ParityBlock) -> bool,
+) -> Option<(Option<i32>, Option<i32>)> {
+    if !inside(ctx.level.get_block(pos.x, pos.y, pos.z)) {
+        return None;
+    }
+    let scan = |dir: i32| {
+        let mut y = pos.y;
+        let mut i = 1;
+        while i < range && inside(ctx.level.get_block(pos.x, y, pos.z)) {
+            y += dir;
+            i += 1;
+        }
+        if valid_edge(ctx.level.get_block(pos.x, y, pos.z)) {
+            Some(y)
+        } else {
+            None
+        }
+    };
+    let ceiling = scan(1);
+    let floor = scan(-1);
+    Some((floor, ceiling))
+}
+
+fn column_height(floor: Option<i32>, ceiling: Option<i32>) -> Option<i32> {
+    match (floor, ceiling) {
+        (Some(f), Some(c)) => Some(c - f - 1),
+        _ => None,
+    }
+}
+
+/// `SpeleothemFeature.place` — the single pointed dripstone (`pointed_dripstone`
+/// via `simple_random_selector`).
+fn place_speleothem(cfg: &SpeleothemConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    let base = cfg.base_block;
+    let rep = cfg.replaceable_blocks;
+    let above = spel_is_base(ctx.level.get_block(origin.x, origin.y + 1, origin.z), base, rep);
+    let below = spel_is_base(ctx.level.get_block(origin.x, origin.y - 1, origin.z), base, rep);
+    // getTipDirection: DOWN means tip points down (attached to ceiling above).
+    let tip: (i32, i32, i32) = if above && below {
+        if random.next_boolean() { (0, -1, 0) } else { (0, 1, 0) }
+    } else if above {
+        (0, -1, 0)
+    } else if below {
+        (0, 1, 0)
+    } else {
+        return;
+    };
+    let opp = (-tip.0, -tip.1, -tip.2);
+    let root = Pos::new(origin.x + opp.0, origin.y + opp.1, origin.z + opp.2);
+    // createPatchOfBaseBlocks.
+    speleothem_place_base(ctx, root, base, rep);
+    // Direction.Plane.HORIZONTAL: NORTH, EAST, SOUTH, WEST.
+    const HORIZ: [(i32, i32, i32); 4] = [(0, 0, -1), (1, 0, 0), (0, 0, 1), (-1, 0, 0)];
+    for &(dx, dy, dz) in HORIZ.iter() {
+        if random.next_float() <= cfg.chance_of_directional_spread {
+            let p1 = Pos::new(root.x + dx, root.y + dy, root.z + dz);
+            speleothem_place_base(ctx, p1, base, rep);
+            if random.next_float() <= cfg.chance_of_spread_radius2 {
+                let d2 = random_direction(random);
+                let p2 = Pos::new(p1.x + d2.0, p1.y + d2.1, p1.z + d2.2);
+                speleothem_place_base(ctx, p2, base, rep);
+                if random.next_float() <= cfg.chance_of_spread_radius3 {
+                    let d3 = random_direction(random);
+                    let p3 = Pos::new(p2.x + d3.0, p2.y + d3.1, p2.z + d3.2);
+                    speleothem_place_base(ctx, p3, base, rep);
+                }
+            }
+        }
+    }
+    // height = (nextFloat < chanceOfTaller && isEmptyOrWater(pos.relative(tip))) ? 2 : 1.
+    let taller = random.next_float() < cfg.chance_of_taller_generation;
+    let tip_is_empty = spel_is_empty_or_water(ctx.level.get_block(origin.x + tip.0, origin.y + tip.1, origin.z + tip.2));
+    let height = if taller && tip_is_empty { 2 } else { 1 };
+    speleothem_grow(ctx, origin, tip, height, base, cfg.pointed_block, rep);
+}
+
+/// `Direction.getRandom(random)` — `Direction.values()[nextInt(6)]`:
+/// DOWN, UP, NORTH, SOUTH, WEST, EAST.
+fn random_direction(random: &mut WorldgenRandom) -> (i32, i32, i32) {
+    const DIRS: [(i32, i32, i32); 6] =
+        [(0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)];
+    DIRS[random.next_int_bounded(6) as usize]
+}
+
+/// `SimpleRandomSelectorFeature.place`.
+fn place_simple_random_selector(
+    cfg: &SimpleRandomSelectorConfig,
+    ctx: &mut PlacementCtx,
+    random: &mut WorldgenRandom,
+    origin: Pos,
+) {
+    if cfg.features.is_empty() {
+        return;
+    }
+    let index = random.next_int_bounded(cfg.features.len() as i32) as usize;
+    place_nested(&cfg.features[index], ctx, random, origin);
+}
+
+/// `SpeleothemClusterFeature.getChanceOfStalagmiteOrStalactite`.
+fn cluster_chance(x_radius: i32, z_radius: i32, dx: i32, dz: i32, cfg: &SpeleothemClusterConfig) -> f64 {
+    let dist_from_edge = (x_radius - dx.abs()).min(z_radius - dz.abs());
+    clamped_map(
+        dist_from_edge as f64,
+        0.0,
+        cfg.max_distance_from_edge_affecting_chance_of_speleothem as f64,
+        cfg.chance_of_speleothem_at_max_distance_from_center,
+        1.0,
+    )
+}
+
+/// `SpeleothemClusterFeature.getSpeleothemHeight`.
+fn cluster_height(
+    random: &mut WorldgenRandom,
+    dx: i32,
+    dz: i32,
+    density: f32,
+    max_height: i32,
+    cfg: &SpeleothemClusterConfig,
+) -> i32 {
+    if random.next_float() > density {
+        return 0;
+    }
+    let dist = dx.abs() + dz.abs();
+    let height_mean = clamped_map(
+        dist as f64,
+        0.0,
+        cfg.max_distance_from_center_affecting_height_bias as f64,
+        max_height as f64 / 2.0,
+        0.0,
+    ) as f32;
+    clamped_normal_sample(random, height_mean, cfg.height_deviation as f32, 0.0, max_height as f32) as i32
+}
+
+fn cluster_replace_with_base(
+    ctx: &mut PlacementCtx,
+    first: Pos,
+    max_count: i32,
+    dir: (i32, i32, i32),
+    cfg: &SpeleothemClusterConfig,
+) {
+    let mut p = first;
+    for _ in 0..max_count {
+        if !speleothem_place_base(ctx, p, cfg.base_block, cfg.replaceable_blocks) {
+            return;
+        }
+        p = Pos::new(p.x + dir.0, p.y + dir.1, p.z + dir.2);
+    }
+}
+
+fn cluster_can_be_adjacent_to_water(ctx: &PlacementCtx, p: Pos) -> bool {
+    let s = ctx.level.get_block(p.x, p.y, p.z);
+    BlockTag::BaseStoneOverworld.contains(s) || s == ParityBlock::Water
+}
+
+fn cluster_can_place_pool(ctx: &PlacementCtx, p: Pos, cfg: &SpeleothemClusterConfig) -> bool {
+    let s = ctx.level.get_block(p.x, p.y, p.z);
+    if s == ParityBlock::Water || s == cfg.base_block || s == cfg.pointed_block {
+        return false;
+    }
+    if ctx.level.get_block(p.x, p.y + 1, p.z) == ParityBlock::Water {
+        return false;
+    }
+    const HORIZ: [(i32, i32, i32); 4] = [(0, 0, -1), (1, 0, 0), (0, 0, 1), (-1, 0, 0)];
+    for &(dx, dy, dz) in HORIZ.iter() {
+        if !cluster_can_be_adjacent_to_water(ctx, Pos::new(p.x + dx, p.y + dy, p.z + dz)) {
+            return false;
+        }
+    }
+    cluster_can_be_adjacent_to_water(ctx, Pos::new(p.x, p.y - 1, p.z))
+}
+
+/// `SpeleothemClusterFeature.place` (`dripstone_cluster`).
+fn place_speleothem_cluster(cfg: &SpeleothemClusterConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    if !spel_is_empty_or_water(ctx.level.get_block(origin.x, origin.y, origin.z)) {
+        return;
+    }
+    let height = cfg.height.sample(random);
+    let wetness = cfg.wetness.sample(random);
+    let density = cfg.density.sample(random);
+    let x_radius = cfg.radius.sample(random);
+    let z_radius = cfg.radius.sample(random);
+    for dx in -x_radius..=x_radius {
+        for dz in -z_radius..=z_radius {
+            let chance = cluster_chance(x_radius, z_radius, dx, dz, cfg);
+            let pos = Pos::new(origin.x + dx, origin.y, origin.z + dz);
+            cluster_place_column(ctx, random, pos, dx, dz, wetness, chance, height, density, cfg);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cluster_place_column(
+    ctx: &mut PlacementCtx,
+    random: &mut WorldgenRandom,
+    pos: Pos,
+    dx: i32,
+    dz: i32,
+    chance_of_water: f32,
+    chance_of_speleothem: f64,
+    cluster_height_val: i32,
+    density: f32,
+    cfg: &SpeleothemClusterConfig,
+) {
+    let scan = match column_scan(
+        ctx,
+        pos,
+        cfg.floor_to_ceiling_search_range,
+        spel_is_empty_or_water,
+        spel_is_neither_empty_nor_water,
+    ) {
+        Some(s) => s,
+        None => return,
+    };
+    let ceiling = scan.1;
+    let base_floor = scan.0;
+    if ceiling.is_none() && base_floor.is_none() {
+        return;
+    }
+    // Possible water pool at the base.
+    let want_pool = random.next_float() < chance_of_water;
+    let (mut floor, ceiling) = (base_floor, ceiling);
+    if want_pool {
+        if let Some(bf) = base_floor {
+            if cluster_can_place_pool(ctx, Pos::new(pos.x, bf, pos.z), cfg) {
+                ctx.level.set_block(pos.x, bf, pos.z, ParityBlock::Water);
+                floor = Some(bf - 1);
+            }
+        }
+    }
+    let column_h = column_height(floor, ceiling);
+
+    // Stalactite.
+    let want_stalactite = random.next_double() < chance_of_speleothem;
+    let mut stalactite_height = 0;
+    if let Some(c) = ceiling {
+        if want_stalactite && ctx.level.get_block(pos.x, c, pos.z) != ParityBlock::Lava {
+            let thickness = cfg.speleothem_block_layer_thickness.sample(random);
+            cluster_replace_with_base(ctx, Pos::new(pos.x, c, pos.z), thickness, (0, 1, 0), cfg);
+            let max_h = match floor {
+                Some(f) => cluster_height_val.min(c - f),
+                None => cluster_height_val,
+            };
+            stalactite_height = cluster_height(random, dx, dz, density, max_h, cfg);
+        }
+    }
+
+    // Stalagmite.
+    let want_stalagmite = random.next_double() < chance_of_speleothem;
+    let mut stalagmite_height = 0;
+    if let Some(f) = floor {
+        if want_stalagmite && ctx.level.get_block(pos.x, f, pos.z) != ParityBlock::Lava {
+            let thickness = cfg.speleothem_block_layer_thickness.sample(random);
+            cluster_replace_with_base(ctx, Pos::new(pos.x, f, pos.z), thickness, (0, -1, 0), cfg);
+            if ceiling.is_some() {
+                stalagmite_height = 0.max(
+                    stalactite_height
+                        + mth_random_between_inclusive(
+                            random,
+                            -cfg.max_stalagmite_stalactite_height_diff,
+                            cfg.max_stalagmite_stalactite_height_diff,
+                        ),
+                );
+            } else {
+                stalagmite_height = cluster_height(random, dx, dz, density, cluster_height_val, cfg);
+            }
+        }
+    }
+
+    // Resolve overlap.
+    let (actual_stalagmite, actual_stalactite) = if let (Some(c), Some(f)) = (ceiling, floor) {
+        if c - stalactite_height <= f + stalagmite_height {
+            let lowest_stalactite_bottom = (c - stalactite_height).max(f + 1);
+            let highest_stalagmite_top = (f + stalagmite_height).min(c - 1);
+            let actual_stalactite_bottom =
+                mth_random_between_inclusive(random, lowest_stalactite_bottom, highest_stalagmite_top + 1);
+            let actual_stalagmite_top = actual_stalactite_bottom - 1;
+            (actual_stalagmite_top - f, c - actual_stalactite_bottom)
+        } else {
+            (stalagmite_height, stalactite_height)
+        }
+    } else {
+        (stalagmite_height, stalactite_height)
+    };
+
+    let merge_tips = random.next_boolean()
+        && actual_stalactite > 0
+        && actual_stalagmite > 0
+        && column_h == Some(actual_stalactite + actual_stalagmite);
+    let _ = merge_tips; // tip-merge only changes the TIP thickness property (collapsed).
+
+    if let Some(c) = ceiling {
+        speleothem_grow(
+            ctx,
+            Pos::new(pos.x, c - 1, pos.z),
+            (0, -1, 0),
+            actual_stalactite,
+            cfg.base_block,
+            cfg.pointed_block,
+            cfg.replaceable_blocks,
+        );
+    }
+    if let Some(f) = floor {
+        speleothem_grow(
+            ctx,
+            Pos::new(pos.x, f + 1, pos.z),
+            (0, 1, 0),
+            actual_stalagmite,
+            cfg.base_block,
+            cfg.pointed_block,
+            cfg.replaceable_blocks,
+        );
+    }
+}
+
+/// `LargeDripstoneFeature.WindOffsetter`.
+struct WindOffsetter {
+    origin_y: i32,
+    wind: Option<(f64, f64)>, // (x, z) speed components
+    max_offset: i32,
+}
+
+impl WindOffsetter {
+    fn none() -> Self {
+        WindOffsetter { origin_y: 0, wind: None, max_offset: 0 }
+    }
+    fn new(origin_y: i32, random: &mut WorldgenRandom, wind_speed: &FloatProvider, max_offset: i32) -> Self {
+        let speed = wind_speed.sample(random);
+        let dir = random.next_float() * std::f32::consts::PI;
+        let wind = (
+            (super::carvers::mth_cos(dir as f64) * speed) as f64,
+            (super::carvers::mth_sin(dir as f64) * speed) as f64,
+        );
+        WindOffsetter { origin_y, wind: Some(wind), max_offset }
+    }
+    fn offset(&self, p: Pos) -> Pos {
+        match self.wind {
+            None => p,
+            Some((wx, wz)) => {
+                let dy = (self.origin_y - p.y) as f64;
+                let dx = (wx * dy).floor() as i32;
+                let dz = (wz * dy).floor() as i32;
+                Pos::new(p.x + dx.clamp(-self.max_offset, self.max_offset), p.y, p.z + dz.clamp(-self.max_offset, self.max_offset))
+            }
+        }
+    }
+}
+
+struct LargeDripstone {
+    root: Pos,
+    pointing_up: bool,
+    radius: i32,
+    bluntness: f64,
+    scale: f64,
+}
+
+impl LargeDripstone {
+    fn height_at_radius(&self, check_radius: f32) -> i32 {
+        speleothem_util_height(check_radius as f64, self.radius as f64, self.scale, self.bluntness) as i32
+    }
+    fn height(&self) -> i32 {
+        self.height_at_radius(0.0)
+    }
+    fn is_suitable_for_wind(&self, cfg: &LargeDripstoneConfig) -> bool {
+        self.radius >= cfg.min_radius_for_wind && self.bluntness >= cfg.min_bluntness_for_wind
+    }
+    fn move_back_until_embedded(&mut self, ctx: &PlacementCtx, wind: &WindOffsetter) -> bool {
+        while self.radius > 1 {
+            let mut new_root = self.root;
+            let max_tries = 10.min(self.height());
+            for _ in 0..max_tries {
+                if ctx.level.get_block(new_root.x, new_root.y, new_root.z) == ParityBlock::Lava {
+                    return false;
+                }
+                if speleothem_circle_embedded(ctx, wind.offset(new_root), self.radius) {
+                    self.root = new_root;
+                    return true;
+                }
+                new_root.y += if self.pointing_up { -1 } else { 1 };
+            }
+            self.radius /= 2;
+        }
+        false
+    }
+    fn place_blocks(&self, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, wind: &WindOffsetter) {
+        for dx in -self.radius..=self.radius {
+            for dz in -self.radius..=self.radius {
+                let cur_radius = ((dx * dx + dz * dz) as f32).sqrt();
+                if cur_radius > self.radius as f32 {
+                    continue;
+                }
+                let mut height = self.height_at_radius(cur_radius);
+                if height > 0 {
+                    if random.next_float() < 0.2 {
+                        height = (height as f32 * (random.next_float() * (1.0 - 0.8) + 0.8)) as i32;
+                    }
+                    let mut p = Pos::new(self.root.x + dx, self.root.y, self.root.z + dz);
+                    let mut out_of_stone = false;
+                    let max_y = if self.pointing_up {
+                        ctx.level.get_height(Heightmap::WorldSurfaceWg, p.x, p.z)
+                    } else {
+                        i32::MAX
+                    };
+                    let mut i = 0;
+                    while i < height && p.y < max_y {
+                        let wp = wind.offset(p);
+                        let wb = ctx.level.get_block(wp.x, wp.y, wp.z);
+                        if spel_is_empty_or_water_or_lava(wb) {
+                            out_of_stone = true;
+                            ctx.level.set_block(wp.x, wp.y, wp.z, ParityBlock::DripstoneBlock);
+                        } else if out_of_stone && BlockTag::BaseStoneOverworld.contains(wb) {
+                            break;
+                        }
+                        p.y += if self.pointing_up { 1 } else { -1 };
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `LargeDripstoneFeature.place`.
+fn place_large_dripstone(cfg: &LargeDripstoneConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    if !spel_is_empty_or_water(ctx.level.get_block(origin.x, origin.y, origin.z)) {
+        return;
+    }
+    let rep = cfg.replaceable_blocks;
+    let scan = column_scan(ctx, origin, cfg.floor_to_ceiling_search_range, spel_is_empty_or_water, |b| {
+        spel_is_base_or_lava(b, ParityBlock::DripstoneBlock, rep)
+    });
+    let (floor, ceiling) = match scan {
+        Some((Some(f), Some(c))) => (f, c),
+        _ => return, // not a Column.Range
+    };
+    let range_height = ceiling - floor - 1;
+    if range_height < 4 {
+        return;
+    }
+    let radius_min = int_provider_min(&cfg.column_radius);
+    let radius_max_p = int_provider_max(&cfg.column_radius);
+    let max_column_radius_from_height = (range_height as f64 * cfg.max_column_radius_to_cave_height_ratio) as i32;
+    let max_column_radius = max_column_radius_from_height.clamp(radius_min, radius_max_p);
+    let radius = mth_random_between_inclusive(random, radius_min, max_column_radius);
+
+    let mut stalactite = LargeDripstone {
+        root: Pos::new(origin.x, ceiling - 1, origin.z),
+        pointing_up: false,
+        radius,
+        bluntness: cfg.stalactite_bluntness.sample(random) as f64,
+        scale: cfg.height_scale.sample(random) as f64,
+    };
+    let mut stalagmite = LargeDripstone {
+        root: Pos::new(origin.x, floor + 1, origin.z),
+        pointing_up: true,
+        radius,
+        bluntness: cfg.stalagmite_bluntness.sample(random) as f64,
+        scale: cfg.height_scale.sample(random) as f64,
+    };
+    let wind = if stalactite.is_suitable_for_wind(cfg) && stalagmite.is_suitable_for_wind(cfg) {
+        WindOffsetter::new(origin.y, random, &cfg.wind_speed, 16 - radius)
+    } else {
+        WindOffsetter::none()
+    };
+    let stalactite_embedded = stalactite.move_back_until_embedded(ctx, &wind);
+    let stalagmite_embedded = stalagmite.move_back_until_embedded(ctx, &wind);
+    if stalactite_embedded {
+        stalactite.place_blocks(ctx, random, &wind);
+    }
+    if stalagmite_embedded {
+        stalagmite.place_blocks(ctx, random, &wind);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5834,5 +6579,124 @@ mod tests {
         assert!(a.iter().any(|(_, b)| *b == AmethystBlock), "the inner layer is amethyst block");
         assert!(a.iter().any(|(_, b)| *b == SmoothBasalt), "the outer crust is smooth basalt");
         assert!(a.iter().any(|(_, b)| *b == BuddingAmethyst), "budding amethyst appears");
+    }
+
+    /// A cave: solid stone with an air gap in `[floor+1, ceiling)`.
+    fn cave_level(floor: i32, ceiling: i32) -> TestLevel {
+        let mut level = TestLevel::new(400); // all stone below y=400
+        for z in -20..20 {
+            for x in -20..20 {
+                for y in floor + 1..ceiling {
+                    level.set_block(x, y, z, ParityBlock::Air);
+                }
+            }
+        }
+        level
+    }
+
+    /// A single `speleothem` (pointed_dripstone) grows a pointed dripstone off a
+    /// stone floor, laying a dripstone-block base patch; deterministic.
+    #[test]
+    fn speleothem_grows_pointed_dripstone() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:dripstone_caves"]);
+        // Pull the inline speleothem config out of the pointed_dripstone selector.
+        let cfg = match reg.configured.get("pointed_dripstone") {
+            Some(ConfiguredFeature::SimpleRandomSelector(sc)) => {
+                match sc.features.first() {
+                    Some(NestedFeature::Resolved { feature, .. }) => match feature.as_ref() {
+                        ConfiguredFeature::Speleothem(c) => c.clone(),
+                        other => panic!("nested feature is not speleothem: {other:?}"),
+                    },
+                    other => panic!("selector feature not resolved: {other:?}"),
+                }
+            }
+            other => panic!("pointed_dripstone is not a simple_random_selector: {other:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = cave_level(89, 100); // floor stone at 89, air 90..100
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_speleothem(&cfg, &mut ctx, &mut random, Pos::new(0, 90, 0));
+            let mut writes: Vec<_> = level.blocks.iter().map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(5);
+        assert_eq!(a, run(5), "speleothem deterministic");
+        assert!(a.iter().any(|(_, b)| *b == PointedDripstone), "a pointed dripstone grew");
+        assert!(a.iter().any(|(_, b)| *b == DripstoneBlock), "a dripstone-block base patch was laid");
+    }
+
+    /// `pointed_dripstone` (simple_random_selector) reaches the speleothem through
+    /// its environment_scan + random_offset placement chain; deterministic.
+    #[test]
+    fn pointed_dripstone_selector_is_deterministic() {
+        let reg = registry_for(&["minecraft:dripstone_caves"]);
+        let cf = reg.configured.get("pointed_dripstone").expect("pointed_dripstone").clone();
+        let run = |seed: i64| {
+            let mut level = cave_level(89, 100);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_feature(&cf, &mut ctx, &mut random, Pos::new(0, 95, 0));
+            let mut writes: Vec<_> = level.blocks.iter().map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        assert_eq!(run(9), run(9), "pointed_dripstone selector deterministic");
+    }
+
+    /// `dripstone_cluster` (speleothem_cluster) hangs stalactites/stalagmites in a
+    /// cave, deterministically, placing pointed dripstone and dripstone block.
+    #[test]
+    fn dripstone_cluster_fills_cave() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:dripstone_caves"]);
+        let cfg = match reg.configured.get("dripstone_cluster") {
+            Some(ConfiguredFeature::SpeleothemCluster(c)) => c.clone(),
+            other => panic!("dripstone_cluster is not a speleothem_cluster: {other:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = cave_level(88, 100); // floor 88, air 89..100, ceiling 100
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_speleothem_cluster(&cfg, &mut ctx, &mut random, Pos::new(0, 94, 0));
+            let mut writes: Vec<_> = level.blocks.iter().map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        // Sweep for a seed that grows at least one pointed dripstone.
+        let seed = (0..64)
+            .find(|s| run(*s).iter().any(|(_, b)| *b == PointedDripstone))
+            .expect("some seed grows a dripstone cluster");
+        let a = run(seed);
+        assert_eq!(a, run(seed), "dripstone cluster deterministic");
+        assert!(a.iter().any(|(_, b)| *b == PointedDripstone), "pointed dripstone");
+        assert!(a.iter().any(|(_, b)| *b == DripstoneBlock), "dripstone block base layer");
+    }
+
+    /// `large_dripstone` builds a dripstone column in a tall cave; deterministic.
+    #[test]
+    fn large_dripstone_builds_column() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:dripstone_caves"]);
+        let cfg = match reg.configured.get("large_dripstone") {
+            Some(ConfiguredFeature::LargeDripstone(c)) => c.clone(),
+            other => panic!("large_dripstone is not a large_dripstone: {other:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = cave_level(80, 110); // tall cave: floor 80, air 81..110
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_large_dripstone(&cfg, &mut ctx, &mut random, Pos::new(0, 95, 0));
+            level.blocks.iter().filter(|(_, b)| **b == DripstoneBlock).count()
+        };
+        let seed = (0..128).find(|s| run(*s) > 0).expect("some seed builds a large dripstone");
+        assert_eq!(run(seed), run(seed), "large dripstone deterministic");
+        assert!(run(seed) > 0, "the column places dripstone block");
     }
 }

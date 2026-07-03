@@ -308,6 +308,67 @@ impl IntProvider {
     }
 }
 
+/// `FloatProvider` — the subset the dripstone features use.
+#[derive(Clone, Debug)]
+pub enum FloatProvider {
+    Constant(f32),
+    /// `UniformFloat.of(min_inclusive, max_exclusive)`.
+    Uniform { min: f32, max: f32 },
+    /// `ClampedNormalFloat`.
+    ClampedNormal { mean: f32, deviation: f32, min: f32, max: f32 },
+    /// `TrapezoidFloat`.
+    Trapezoid { min: f32, max: f32, plateau: f32 },
+}
+
+impl FloatProvider {
+    pub fn parse(v: &Value) -> FloatProvider {
+        if let Some(n) = v.as_f64() {
+            return FloatProvider::Constant(n as f32);
+        }
+        let t = v.get("type").and_then(Value::as_str).unwrap_or("minecraft:constant");
+        match t.strip_prefix("minecraft:").unwrap_or(t) {
+            "constant" => FloatProvider::Constant(v["value"].as_f64().unwrap_or(0.0) as f32),
+            "uniform" => FloatProvider::Uniform {
+                min: v["min_inclusive"].as_f64().unwrap_or(0.0) as f32,
+                max: v["max_exclusive"].as_f64().unwrap_or(0.0) as f32,
+            },
+            "clamped_normal" => FloatProvider::ClampedNormal {
+                mean: v["mean"].as_f64().unwrap_or(0.0) as f32,
+                deviation: v["deviation"].as_f64().unwrap_or(0.0) as f32,
+                min: v["min"].as_f64().unwrap_or(0.0) as f32,
+                max: v["max"].as_f64().unwrap_or(0.0) as f32,
+            },
+            "trapezoid" => FloatProvider::Trapezoid {
+                min: v["min"].as_f64().unwrap_or(0.0) as f32,
+                max: v["max"].as_f64().unwrap_or(0.0) as f32,
+                plateau: v["plateau"].as_f64().unwrap_or(0.0) as f32,
+            },
+            _ => FloatProvider::Constant(0.0),
+        }
+    }
+
+    pub fn sample(&self, random: &mut WorldgenRandom) -> f32 {
+        match self {
+            FloatProvider::Constant(v) => *v,
+            // `Mth.randomBetween` = `nextFloat() * (max - min) + min`.
+            FloatProvider::Uniform { min, max } => random.next_float() * (*max - *min) + *min,
+            // `Mth.clamp(Mth.normal(random, mean, deviation), min, max)`,
+            // `Mth.normal = mean + (float)nextGaussian() * deviation`.
+            FloatProvider::ClampedNormal { mean, deviation, min, max } => {
+                let n = *mean + (random.next_gaussian() as f32) * *deviation;
+                n.clamp(*min, *max)
+            }
+            // `TrapezoidFloat.sample`.
+            FloatProvider::Trapezoid { min, max, plateau } => {
+                let range = *max - *min;
+                let plateau_start = (range - *plateau) / 2.0;
+                let plateau_end = range - plateau_start;
+                *min + random.next_float() * plateau_end + random.next_float() * plateau_start
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HeightProvider
 // ---------------------------------------------------------------------------
