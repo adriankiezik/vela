@@ -1522,11 +1522,21 @@ impl Spline {
     }
 }
 
+/// Evaluate an unwrapped (router-level) graph at a single position, reusing a
+/// caller-owned [`ChunkEvalState`]. A batch of samples — e.g. a chunk's biome
+/// fill — then shares one state instead of allocating a fresh one per call.
+/// Unwrapped graphs carry only `Marker` (compute-through) cache nodes, which
+/// never read or write the state's cache slots under `Ctx::Point`, so the
+/// result is bit-identical to a fresh [`ChunkEvalState::standalone`] each call.
+pub fn compute_at_with(f: &Dfn, x: i32, y: i32, z: i32, st: &mut ChunkEvalState) -> f64 {
+    f.compute(Ctx::Point { x, y, z }, st)
+}
+
 /// Evaluate an unwrapped (router-level) graph at a single position — vanilla's
 /// `router.finalDensity().compute(new SinglePointContext(x, y, z))`.
 pub fn compute_at(f: &Dfn, x: i32, y: i32, z: i32) -> f64 {
     let mut st = ChunkEvalState::standalone();
-    f.compute(Ctx::Point { x, y, z }, &mut st)
+    compute_at_with(f, x, y, z, &mut st)
 }
 
 // ---------------------------------------------------------------------------
