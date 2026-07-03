@@ -577,6 +577,10 @@ pub enum BlockTag {
     GeodeInvalidBlocks,
     /// `#minecraft:corals` (`#coral_plants ∪` the 5 coral fans).
     Corals,
+    /// `#minecraft:moss_replaceable`.
+    MossReplaceable,
+    /// `#minecraft:lush_ground_replaceable` (= `#moss_replaceable ∪ clay/gravel/sand`).
+    LushGroundReplaceable,
 }
 
 impl BlockTag {
@@ -603,6 +607,8 @@ impl BlockTag {
             "dripstone_replaceable_blocks" => BlockTag::DripstoneReplaceableBlocks,
             "geode_invalid_blocks" => BlockTag::GeodeInvalidBlocks,
             "corals" => BlockTag::Corals,
+            "moss_replaceable" => BlockTag::MossReplaceable,
+            "lush_ground_replaceable" => BlockTag::LushGroundReplaceable,
             _ => return None,
         })
     }
@@ -675,6 +681,15 @@ impl BlockTag {
                 TubeCoral | BrainCoral | BubbleCoral | FireCoral | HornCoral
                     | TubeCoralFan | BrainCoralFan | BubbleCoralFan | FireCoralFan | HornCoralFan
             ),
+            // `#base_stone_overworld ∪ #cave_vines(none) ∪ #dirt ∪ #mud ∪
+            // #moss_blocks ∪ #grass_blocks` over the parity alphabet.
+            BlockTag::MossReplaceable => {
+                BlockTag::BaseStoneOverworld.contains(b)
+                    || matches!(b, Dirt | CoarseDirt | RootedDirt | Mud | MossBlock | PaleMossBlock | GrassBlock)
+            }
+            BlockTag::LushGroundReplaceable => {
+                BlockTag::MossReplaceable.contains(b) || matches!(b, Clay | Gravel | Sand)
+            }
         }
     }
 }

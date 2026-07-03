@@ -464,6 +464,24 @@ struct SimpleRandomSelectorConfig {
     features: Vec<NestedFeature>,
 }
 
+/// `VegetationPatchConfiguration` (moss / clay-pool patches, lush caves). Also
+/// carries the `waterlogged` flag distinguishing the two feature types.
+#[derive(Clone, Debug)]
+struct VegetationPatchConfig {
+    replaceable: Option<BlockTag>,
+    ground_state: StateProvider,
+    vegetation_feature: NestedFeature,
+    /// `true` = FLOOR (direction DOWN), `false` = CEILING (direction UP).
+    surface_floor: bool,
+    depth: IntProvider,
+    extra_bottom_block_chance: f32,
+    vertical_range: i32,
+    vegetation_chance: f32,
+    xz_radius: IntProvider,
+    extra_edge_column_chance: f32,
+    waterlogged: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Tree feature (TreeFeature / TreeConfiguration and the placer system)
 // ---------------------------------------------------------------------------
@@ -1013,6 +1031,7 @@ enum ConfiguredFeature {
     CoralTree,
     CoralClaw,
     CoralMushroom,
+    VegetationPatch(VegetationPatchConfig),
     Deferred(String),
 }
 
@@ -1099,6 +1118,8 @@ impl ConfiguredFeature {
             "coral_tree" => ConfiguredFeature::CoralTree,
             "coral_claw" => ConfiguredFeature::CoralClaw,
             "coral_mushroom" => ConfiguredFeature::CoralMushroom,
+            "vegetation_patch" => ConfiguredFeature::VegetationPatch(parse_vegetation_patch(cfg, false)),
+            "waterlogged_vegetation_patch" => ConfiguredFeature::VegetationPatch(parse_vegetation_patch(cfg, true)),
             // `freeze_top_layer` (SnowAndFreezeFeature) is recognized but
             // deferred: its exact `Biome.shouldFreeze`/`shouldSnow` gates need
             // the biome-temperature/height-adjust plumbing (in surface_rules)
@@ -1202,6 +1223,10 @@ fn resolve_cf(
                 features: sc.features.iter().map(|f| resolve_nested(f, configured, placed)).collect(),
             })
         }
+        ConfiguredFeature::VegetationPatch(vc) => ConfiguredFeature::VegetationPatch(VegetationPatchConfig {
+            vegetation_feature: resolve_nested(&vc.vegetation_feature, configured, placed),
+            ..vc.clone()
+        }),
         other => other.clone(),
     }
 }
@@ -1273,7 +1298,12 @@ impl FeatureRegistry {
         let selector_ids: Vec<String> = configured
             .iter()
             .filter(|(_, c)| {
-                matches!(c, ConfiguredFeature::RandomSelector(_) | ConfiguredFeature::SimpleRandomSelector(_))
+                matches!(
+                    c,
+                    ConfiguredFeature::RandomSelector(_)
+                        | ConfiguredFeature::SimpleRandomSelector(_)
+                        | ConfiguredFeature::VegetationPatch(_)
+                )
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -1591,6 +1621,7 @@ fn place_feature(
         ConfiguredFeature::CoralTree => place_coral(CoralKind::Tree, ctx, random, origin),
         ConfiguredFeature::CoralClaw => place_coral(CoralKind::Claw, ctx, random, origin),
         ConfiguredFeature::CoralMushroom => place_coral(CoralKind::Mushroom, ctx, random, origin),
+        ConfiguredFeature::VegetationPatch(cfg) => place_vegetation_patch(cfg, ctx, random, origin),
         ConfiguredFeature::Deferred(_) => {}
     }
 }
@@ -4062,6 +4093,234 @@ fn coral_claw(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos, 
             if random.next_float() < 0.25 {
                 pos.y += 1;
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VegetationPatchFeature (moss / clay-pool patches, lush caves)
+// ---------------------------------------------------------------------------
+
+fn offset_pos(p: Pos, d: (i32, i32, i32)) -> Pos {
+    Pos::new(p.x + d.0, p.y + d.1, p.z + d.2)
+}
+
+/// `Vec3i.hashCode` = `(y + z*31)*31 + x` (32-bit wrapping).
+fn vec3i_hash(p: Pos) -> i32 {
+    (p.y.wrapping_add(p.z.wrapping_mul(31))).wrapping_mul(31).wrapping_add(p.x)
+}
+
+/// A faithful `java.util.HashSet<BlockPos>` — its iteration order is a
+/// deterministic function of element `hashCode`s, the `hash(h)=h^(h>>>16)`
+/// spread, power-of-two bucket indexing `(cap-1)&hash`, per-bucket insertion
+/// chaining, and the ×0.75 resize threshold (initial capacity 16). This is the
+/// order `VegetationPatchFeature.distributeVegetation` (and the waterlogged
+/// water pass) iterate, which drives their RNG draw sequence. Bucket
+/// treeification is not modeled: it needs capacity ≥ 64 **and** an 8-deep
+/// bucket, which the small patch sets never reach.
+struct JavaHashSet {
+    table: Vec<Vec<(Pos, i32)>>,
+    size: usize,
+    threshold: usize,
+}
+
+impl JavaHashSet {
+    fn new() -> Self {
+        JavaHashSet { table: vec![Vec::new(); 16], size: 0, threshold: 12 }
+    }
+    fn spread(p: Pos) -> i32 {
+        let h = vec3i_hash(p);
+        h ^ ((h as u32 >> 16) as i32)
+    }
+    fn add(&mut self, p: Pos) {
+        let h = JavaHashSet::spread(p);
+        let cap = self.table.len();
+        let idx = (h as u32 as usize) & (cap - 1);
+        if self.table[idx].iter().any(|(q, _)| *q == p) {
+            return;
+        }
+        self.table[idx].push((p, h));
+        self.size += 1;
+        if self.size > self.threshold {
+            self.resize();
+        }
+    }
+    fn resize(&mut self) {
+        let old_cap = self.table.len();
+        let new_cap = old_cap * 2;
+        let mut new_table: Vec<Vec<(Pos, i32)>> = vec![Vec::new(); new_cap];
+        for (j, bucket) in self.table.iter().enumerate() {
+            for &(p, h) in bucket {
+                if h & (old_cap as i32) == 0 {
+                    new_table[j].push((p, h));
+                } else {
+                    new_table[j + old_cap].push((p, h));
+                }
+            }
+        }
+        self.table = new_table;
+        self.threshold = (new_cap as f64 * 0.75) as usize;
+    }
+    /// Elements in HashMap iteration order (table order, per-bucket chain order).
+    fn iter_order(&self) -> Vec<Pos> {
+        self.table.iter().flatten().map(|(p, _)| *p).collect()
+    }
+}
+
+fn parse_vegetation_patch(cfg: &Value, waterlogged: bool) -> VegetationPatchConfig {
+    VegetationPatchConfig {
+        replaceable: dripstone_tag(&cfg["replaceable"]),
+        ground_state: StateProvider::parse(&cfg["ground_state"]),
+        vegetation_feature: parse_nested(&cfg["vegetation_feature"]),
+        surface_floor: cfg["surface"].as_str() != Some("ceiling"),
+        depth: IntProvider::parse(&cfg["depth"]),
+        extra_bottom_block_chance: cfg["extra_bottom_block_chance"].as_f64().unwrap_or(0.0) as f32,
+        vertical_range: cfg["vertical_range"].as_i64().unwrap_or(1) as i32,
+        vegetation_chance: cfg["vegetation_chance"].as_f64().unwrap_or(0.0) as f32,
+        xz_radius: IntProvider::parse(&cfg["xz_radius"]),
+        extra_edge_column_chance: cfg["extra_edge_column_chance"].as_f64().unwrap_or(0.0) as f32,
+        waterlogged,
+    }
+}
+
+fn nested_supported(nf: &NestedFeature) -> bool {
+    match nf {
+        NestedFeature::Resolved { feature, placement } => {
+            feature.is_implemented() && placement.iter().all(|m| m.is_supported())
+        }
+        _ => false,
+    }
+}
+
+/// `VegetationPatchFeature.placeGround`.
+fn veg_place_ground(
+    cfg: &VegetationPatchConfig,
+    ctx: &mut PlacementCtx,
+    random: &mut WorldgenRandom,
+    below_start: Pos,
+    depth: i32,
+) -> bool {
+    let dir = if cfg.surface_floor { (0, -1, 0) } else { (0, 1, 0) };
+    let mut below = below_start;
+    for i in 0..depth {
+        let stp = match cfg.ground_state.get_state(ctx.level, random, below) {
+            Some(s) => s,
+            None => return i != 0,
+        };
+        let below_state = ctx.level.get_block(below.x, below.y, below.z);
+        if stp != below_state {
+            if !cfg.replaceable.map(|t| t.contains(below_state)).unwrap_or(false) {
+                return i != 0;
+            }
+            ctx.level.set_block(below.x, below.y, below.z, stp);
+            below = offset_pos(below, dir);
+        }
+    }
+    true
+}
+
+/// `VegetationPatchFeature.placeGroundPatch`. `isFaceSturdy` is approximated by
+/// `blocksMotion` (full-cube top face) over the parity alphabet — draws no RNG.
+fn veg_place_ground_patch(
+    cfg: &VegetationPatchConfig,
+    ctx: &mut PlacementCtx,
+    random: &mut WorldgenRandom,
+    origin: Pos,
+    x_radius: i32,
+    z_radius: i32,
+) -> JavaHashSet {
+    let inwards = if cfg.surface_floor { (0, -1, 0) } else { (0, 1, 0) };
+    let outwards = (-inwards.0, -inwards.1, -inwards.2);
+    let mut surface = JavaHashSet::new();
+    for dx in -x_radius..=x_radius {
+        let is_x_edge = dx == -x_radius || dx == x_radius;
+        for dz in -z_radius..=z_radius {
+            let is_z_edge = dz == -z_radius || dz == z_radius;
+            let is_edge = is_x_edge || is_z_edge;
+            let is_corner = is_x_edge && is_z_edge;
+            let is_edge_not_corner = is_edge && !is_corner;
+            if !is_corner
+                && (!is_edge_not_corner
+                    || (cfg.extra_edge_column_chance != 0.0 && !(random.next_float() > cfg.extra_edge_column_chance)))
+            {
+                let mut pos = Pos::new(origin.x + dx, origin.y, origin.z + dz);
+                let mut offset = 0;
+                while ctx.level.get_block(pos.x, pos.y, pos.z).is_air() && offset < cfg.vertical_range {
+                    pos = offset_pos(pos, inwards);
+                    offset += 1;
+                }
+                let mut o2 = 0;
+                while !ctx.level.get_block(pos.x, pos.y, pos.z).is_air() && o2 < cfg.vertical_range {
+                    pos = offset_pos(pos, outwards);
+                    o2 += 1;
+                }
+                let below = offset_pos(pos, inwards);
+                let below_state = ctx.level.get_block(below.x, below.y, below.z);
+                if ctx.level.get_block(pos.x, pos.y, pos.z).is_air() && below_state.blocks_motion() {
+                    let extra = if cfg.extra_bottom_block_chance > 0.0
+                        && random.next_float() < cfg.extra_bottom_block_chance
+                    {
+                        1
+                    } else {
+                        0
+                    };
+                    let depth = cfg.depth.sample(random) + extra;
+                    let ground_pos = below;
+                    if veg_place_ground(cfg, ctx, random, below, depth) {
+                        surface.add(ground_pos);
+                    }
+                }
+            }
+        }
+    }
+    surface
+}
+
+/// `WaterloggedVegetationPatchFeature.isExposedDirection` — approximated by
+/// `!blocksMotion` (a non-full-face neighbour), draws no RNG.
+fn veg_is_exposed(ctx: &PlacementCtx, pos: Pos) -> bool {
+    // Direction.NORTH, EAST, SOUTH, WEST, DOWN.
+    const DIRS: [(i32, i32, i32); 5] = [(0, 0, -1), (1, 0, 0), (0, 0, 1), (-1, 0, 0), (0, -1, 0)];
+    DIRS.iter().any(|&(dx, dy, dz)| !ctx.level.get_block(pos.x + dx, pos.y + dy, pos.z + dz).blocks_motion())
+}
+
+/// `VegetationPatchFeature.place` (+ the waterlogged variant's water pass).
+fn place_vegetation_patch(cfg: &VegetationPatchConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    // The distributeVegetation loop threads the nested vegetation feature's RNG
+    // between per-surface `nextFloat` draws, so a deferred vegetation feature
+    // would desync the whole patch. When it is unsupported, skip the entire
+    // feature (parity-safe: the RNG is reseeded per top feature).
+    if !nested_supported(&cfg.vegetation_feature) {
+        return;
+    }
+    let x_radius = cfg.xz_radius.sample(random) + 1;
+    let z_radius = cfg.xz_radius.sample(random) + 1;
+    let surface = veg_place_ground_patch(cfg, ctx, random, origin, x_radius, z_radius);
+    let final_surface: Vec<Pos> = if cfg.waterlogged {
+        // Build waterSurface in `surface` iteration order (HashSet order), then
+        // set water in waterSurface iteration order.
+        let mut water_surface = JavaHashSet::new();
+        for sp in surface.iter_order() {
+            if !veg_is_exposed(ctx, sp) {
+                water_surface.add(sp);
+            }
+        }
+        let order = water_surface.iter_order();
+        for &sp in &order {
+            ctx.level.set_block(sp.x, sp.y, sp.z, ParityBlock::Water);
+        }
+        order
+    } else {
+        surface.iter_order()
+    };
+    // distributeVegetation.
+    let up = if cfg.surface_floor { (0, 1, 0) } else { (0, -1, 0) };
+    for sp in final_surface {
+        if cfg.vegetation_chance > 0.0 && random.next_float() < cfg.vegetation_chance {
+            // Base: place at surfacePos.relative(dir.opposite()). Waterlogged:
+            // super.placeVegetation(surfacePos.below()) → surfacePos.
+            let veg_pos = if cfg.waterlogged { sp } else { offset_pos(sp, up) };
+            place_nested(&cfg.vegetation_feature, ctx, random, veg_pos);
         }
     }
 }
@@ -6967,5 +7226,63 @@ mod tests {
                 "coral_{kind_name} places a coral block"
             );
         }
+    }
+
+    /// The `JavaHashSet` iteration order is a deterministic function of the
+    /// inserted `BlockPos`es and reproduces across identical insert sequences,
+    /// and every inserted element is present exactly once.
+    #[test]
+    fn java_hashset_is_deterministic() {
+        let build = || {
+            let mut s = JavaHashSet::new();
+            for x in -5..6 {
+                for z in -3..4 {
+                    s.add(Pos::new(x, 40, z));
+                }
+            }
+            // Re-adding is a no-op (Set semantics).
+            s.add(Pos::new(0, 40, 0));
+            s.iter_order()
+        };
+        let a = build();
+        assert_eq!(a, build(), "hashset order is reproducible");
+        assert_eq!(a.len(), 11 * 7, "all distinct positions present, no dupes");
+        // The order is generally not the insertion order (bucket-driven).
+        let insertion: Vec<Pos> =
+            (-5..6).flat_map(|x| (-3..4).map(move |z| Pos::new(x, 40, z))).collect();
+        assert_ne!(a, insertion, "iteration order is bucket-driven, not insertion order");
+    }
+
+    /// `moss_patch` (vegetation_patch) lays a moss-block ground patch on a cave
+    /// floor and distributes moss vegetation (the `moss_vegetation` simple_block)
+    /// over it in Java-HashSet order; deterministic.
+    #[test]
+    fn vegetation_patch_lays_moss() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:lush_caves"]);
+        let cfg = match reg.configured.get("moss_patch") {
+            Some(ConfiguredFeature::VegetationPatch(c)) => c.clone(),
+            other => panic!("moss_patch is not a vegetation_patch: {other:?}"),
+        };
+        // The moss vegetation feature must be supported for the patch to run.
+        assert!(nested_supported(&cfg.vegetation_feature), "moss_vegetation is supported");
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(90); // stone floor below y=90, air above
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_vegetation_patch(&cfg, &mut ctx, &mut random, Pos::new(0, 93, 0));
+            let mut writes: Vec<_> = level.blocks.iter().map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(4);
+        assert_eq!(a, run(4), "moss patch deterministic");
+        assert!(a.iter().any(|(_, b)| *b == MossBlock), "a moss-block ground patch is laid");
+        // Some moss vegetation (short_grass / moss_carpet / azalea / etc.) is placed.
+        assert!(
+            a.iter().any(|(_, b)| matches!(b, ShortGrass | TallGrass | MossCarpet | Azalea | FloweringAzalea)),
+            "moss vegetation is distributed over the patch"
+        );
     }
 }
