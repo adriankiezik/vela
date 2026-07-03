@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
-use super::density::{compute_at, compute_at_with, ChunkEvalState, Dfn, RandomState};
+use super::density::{compute_at, compute_at_with, Ap2Kind, ChunkEvalState, Dfn, RandomState};
 use super::vanilla_jsons;
 
 /// `Climate.quantizeCoord` — float climate coordinate to fixed-point long.
@@ -372,6 +372,15 @@ pub struct Sampler {
     erosion: Rc<Dfn>,
     depth: Rc<Dfn>,
     weirdness: Rc<Dfn>,
+    /// `depth` split at its top-level `add(y_clamped_gradient, offset)`:
+    /// the y-only gradient and the y-invariant offset subtree (vanilla marks
+    /// it `flat_cache(cache_2d(…))`, its own per-column cache). Caching the
+    /// offset per quart column skips re-deriving the offset spline stack for
+    /// each of the column's quart-Y samples; the per-quart value is the same
+    /// `gradient + offset` f64 add, so the fill is bit-identical. `None` if
+    /// the graph is not the expected overworld shape (then `depth` is
+    /// evaluated whole, per quart, as before).
+    depth_split: Option<(Rc<Dfn>, Rc<Dfn>)>,
 }
 
 /// The five quantized climate coordinates of a quart column that do not vary
@@ -386,12 +395,30 @@ struct ColumnClimate {
     continentalness: i64,
     erosion: i64,
     weirdness: i64,
+    /// The y-invariant offset half of `depth` (see `Sampler::depth_split`),
+    /// pre-quantization. Only meaningful when the split is available.
+    depth_offset: f64,
 }
 
 impl Sampler {
     /// The wiring in `RandomState`: humidity is the router's `vegetation`,
     /// weirdness its `ridges`.
     pub fn new(rs: &RandomState) -> Self {
+        // Overworld `overworld/depth` is `add(y_clamped_gradient, offset-ref)`
+        // with the offset subtree cache-marked (y-invariant). Anything else —
+        // a different dimension or a datapack override — falls back to whole-
+        // graph evaluation.
+        let depth_split = match &*rs.router.depth {
+            Dfn::Ap2 { kind: Ap2Kind::Add, argument1, argument2, .. } => {
+                match (&**argument1, &**argument2) {
+                    (Dfn::YClampedGradient { .. }, Dfn::Marker { .. }) => {
+                        Some((argument1.clone(), argument2.clone()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         Self {
             temperature: rs.router.temperature.clone(),
             humidity: rs.router.vegetation.clone(),
@@ -399,6 +426,7 @@ impl Sampler {
             erosion: rs.router.erosion.clone(),
             depth: rs.router.depth.clone(),
             weirdness: rs.router.ridges.clone(),
+            depth_split,
         }
     }
 
@@ -437,6 +465,11 @@ impl Sampler {
             continentalness: q(&self.continentalness, st),
             erosion: q(&self.erosion, st),
             weirdness: q(&self.weirdness, st),
+            depth_offset: match &self.depth_split {
+                // y-invariant (see `depth_split`); `y = 0` mirrors FlatCache.
+                Some((_, offset)) => compute_at_with(offset, x, 0, z, st),
+                None => 0.0,
+            },
         }
     }
 
@@ -451,7 +484,14 @@ impl Sampler {
         st: &mut ChunkEvalState,
     ) -> TargetPoint {
         let (x, y, z) = (quart_x << 2, quart_y << 2, quart_z << 2);
-        let depth = quantize_coord(compute_at_with(&self.depth, x, y, z, st) as f32);
+        // With the split, `depth` is the same `gradient + offset` add the whole
+        // graph performs — the offset factor comes from the column cache.
+        let depth = match &self.depth_split {
+            Some((gradient, _)) => quantize_coord(
+                (compute_at_with(gradient, x, y, z, st) + col.depth_offset) as f32,
+            ),
+            None => quantize_coord(compute_at_with(&self.depth, x, y, z, st) as f32),
+        };
         TargetPoint::new(
             col.temperature,
             col.humidity,
