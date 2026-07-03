@@ -253,6 +253,17 @@ impl ServerProperties {
         }
     }
 
+    /// `level-seed` parsed into a world seed, mirroring vanilla
+    /// `DedicatedServerProperties` (`WorldOptions.parseSeed(levelSeed)`): the
+    /// (trimmed) value is parsed as a Java `long`, falling back to its Java
+    /// `String.hashCode()` when that fails. `None` when the property is
+    /// empty/blank — the caller then supplies a random seed, exactly as
+    /// vanilla's `.orElse(WorldOptions.randomSeed())` does. Only consulted for
+    /// a *fresh* world; an existing `level.dat` seed always wins.
+    pub fn level_seed(&self) -> Option<i64> {
+        parse_level_seed(self.str("level-seed"))
+    }
+
     /// `view-distance`, clamped to the protocol's sane 2..=32 chunk range.
     pub fn view_distance(&self) -> i32 {
         self.int("view-distance", 10).clamp(2, 32)
@@ -292,6 +303,36 @@ impl ServerProperties {
             }
         }
     }
+}
+
+/// Parse a `level-seed` string into a world seed, 1:1 with vanilla
+/// `WorldOptions.parseSeed` (26.2): trim, empty → `None` (caller randomizes),
+/// else try Java `Long.parseLong` and on failure use Java `String.hashCode()`.
+///
+/// Note: unlike some older versions, 26.2's `parseSeed` has **no** special
+/// handling for a parsed value of `0` — a `level-seed` of `"0"` yields seed 0.
+pub(super) fn parse_level_seed(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Java `Long.parseLong`: optional sign then base-10 digits, i64 range. Rust's
+    // `i64::from_str` accepts the same grammar (optional `+`/`-`, no underscores,
+    // no `0x`), so it stands in exactly for realistic seed strings.
+    match s.parse::<i64>() {
+        Ok(n) => Some(n),
+        Err(_) => Some(java_string_hash_code(s) as i64),
+    }
+}
+
+/// Java `String.hashCode()`: `h = 31*h + c` over the UTF-16 code units, with
+/// i32 wrapping arithmetic (e.g. `"hello".hashCode() == 99162322`).
+fn java_string_hash_code(s: &str) -> i32 {
+    let mut h: i32 = 0;
+    for unit in s.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(unit as i32);
+    }
+    h
 }
 
 /// Parse the body of a `java.util.Properties` file into key/value pairs, shared
@@ -429,5 +470,44 @@ mod tests {
         let props = ServerProperties::parse("hardcore=TRUE\nonline-mode=yes\n");
         assert!(props.hardcore()); // "TRUE" -> true
         assert!(!props.online_mode()); // "yes" is not "true" -> false
+    }
+
+    #[test]
+    fn level_seed_numeric_string_parses_as_long() {
+        // A numeric string parses via Java `Long.parseLong`, incl. negatives and
+        // the full i64 range. No special-casing of 0 (26.2 `parseSeed`).
+        assert_eq!(parse_level_seed("12345"), Some(12345));
+        assert_eq!(parse_level_seed("-987654321012345"), Some(-987654321012345));
+        assert_eq!(parse_level_seed("0"), Some(0));
+        assert_eq!(parse_level_seed(&i64::MAX.to_string()), Some(i64::MAX));
+        // Surrounding whitespace is trimmed, exactly like `seedString.trim()`.
+        assert_eq!(parse_level_seed("  42  "), Some(42));
+    }
+
+    #[test]
+    fn level_seed_non_numeric_uses_java_hashcode() {
+        // Falls back to `String.hashCode()`; known reference value.
+        assert_eq!(java_string_hash_code("hello"), 99162322);
+        assert_eq!(parse_level_seed("hello"), Some(99162322));
+        // The empty string hashes to 0, but an empty/blank property is `None`
+        // (random) — the hashCode branch is only reached for non-empty non-numeric.
+        assert_eq!(java_string_hash_code(""), 0);
+        // A word that overflows i64 as a number also falls to hashCode.
+        assert_eq!(
+            parse_level_seed("99999999999999999999999999"),
+            Some(java_string_hash_code("99999999999999999999999999") as i64)
+        );
+    }
+
+    #[test]
+    fn level_seed_empty_is_none_for_random() {
+        // Empty / blank → `None`; the caller supplies a random seed (vanilla
+        // `.orElse(randomSeed())`).
+        assert_eq!(parse_level_seed(""), None);
+        assert_eq!(parse_level_seed("   "), None);
+        assert_eq!(ServerProperties::default().level_seed(), None);
+        // A set property is honoured through the accessor.
+        let props = ServerProperties::parse("level-seed=hello\n");
+        assert_eq!(props.level_seed(), Some(99162322));
     }
 }
