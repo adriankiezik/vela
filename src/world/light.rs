@@ -68,13 +68,41 @@ const DATA_LAYER_SIZE: usize = 2048;
 /// Maximum light level (`LightEngine.MAX_LEVEL`).
 const MAX_LEVEL: u8 = 15;
 
+/// One light section's `DataLayer`. Beyond vanilla's present/empty split this
+/// distinguishes the *uniformly full-bright* open-sky section: every chunk's
+/// sections above its terrain are the identical all-`0xFF` layer, so they are
+/// served from the shared [`FULL_BRIGHT_LAYER`] instead of each chunk owning a
+/// 2048-byte copy (~15 such sections per chunk — ~30 KiB/chunk resident at
+/// large view distances). Wire output is unchanged: [`LightLayer::bytes`]
+/// yields exactly the bytes the old `Option<Vec<u8>>` held.
+pub enum LightLayer {
+    /// All-zero (vanilla's empty `DataLayer`) — the packet reports it via the
+    /// *empty* mask rather than sending 2048 zero bytes.
+    Empty,
+    /// Uniform open-sky full-bright — identical bytes for every chunk, read
+    /// from the shared static.
+    Bright,
+    /// A computed 2048-byte `DataLayer` (nibble per cell).
+    Data(Box<[u8; DATA_LAYER_SIZE]>),
+}
+
+impl LightLayer {
+    /// The section's wire bytes: `None` for an empty section, otherwise the
+    /// 2048-byte `DataLayer` (shared static for [`LightLayer::Bright`]).
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            LightLayer::Empty => None,
+            LightLayer::Bright => Some(&FULL_BRIGHT_LAYER),
+            LightLayer::Data(bytes) => Some(&**bytes),
+        }
+    }
+}
+
 /// A chunk's computed light: one entry per light section, ascending from
-/// [`MIN_LIGHT_SECTION`]. `Some(bytes)` is a 2048-byte `DataLayer` (nibble per
-/// cell); `None` is an all-zero section (vanilla's empty `DataLayer`), which the
-/// packet reports via the *empty* mask rather than sending 2048 zero bytes.
+/// [`MIN_LIGHT_SECTION`].
 pub struct ChunkLight {
-    pub sky: Vec<Option<Vec<u8>>>,
-    pub block: Vec<Option<Vec<u8>>>,
+    pub sky: Vec<LightLayer>,
+    pub block: Vec<LightLayer>,
 }
 
 impl ChunkLight {
@@ -87,17 +115,32 @@ impl ChunkLight {
     pub fn raw_brightness(&self, lx: i32, y: i32, lz: i32) -> u8 {
         section_nibble(&self.sky, lx, y, lz).max(section_nibble(&self.block, lx, y, lz))
     }
+
+    /// Heap bytes across both layers' stored sections — the per-chunk light
+    /// term the memory profiler tracks. `Bright` sections share one static and
+    /// so cost nothing per chunk.
+    pub fn heap_bytes(&self) -> usize {
+        let layers = |v: &[LightLayer]| {
+            v.iter()
+                .map(|l| match l {
+                    LightLayer::Data(bytes) => std::mem::size_of_val(&**bytes),
+                    LightLayer::Empty | LightLayer::Bright => 0,
+                })
+                .sum::<usize>()
+        };
+        layers(&self.sky) + layers(&self.block)
+    }
 }
 
 /// Read a single nibble out of a per-section `DataLayer` list at chunk-relative
 /// `(lx, lz)` and world-`y`, mirroring the `y<<8 | z<<4 | x` packing in
 /// [`pack_layers`]. An out-of-range `y` or an empty (`None`) section reads `0`.
-fn section_nibble(layers: &[Option<Vec<u8>>], lx: i32, y: i32, lz: i32) -> u8 {
+fn section_nibble(layers: &[LightLayer], lx: i32, y: i32, lz: i32) -> u8 {
     if !(LIGHT_Y_MIN..LIGHT_Y_MAX).contains(&y) {
         return 0;
     }
     let section = ((y - LIGHT_Y_MIN) / 16) as usize;
-    let Some(bytes) = layers.get(section).and_then(|s| s.as_ref()) else {
+    let Some(bytes) = layers.get(section).and_then(LightLayer::bytes) else {
         return 0;
     };
     let ly = y - (LIGHT_Y_MIN + section as i32 * 16);
@@ -370,16 +413,16 @@ fn flood(light: &mut [u8], dampening: &[u8], queue: &mut VecDeque<usize>) {
 }
 
 /// A section's worth of nibbles, all `15` — the packed form of uniformly open
-/// sky. Shared across chunks so full-bright sections need only a cheap copy rather
-/// than nibble-packing 4096 identical cells each time.
-const FULL_BRIGHT_LAYER: [u8; DATA_LAYER_SIZE] = [0xFF; DATA_LAYER_SIZE];
+/// sky. One static shared by every chunk's [`LightLayer::Bright`] sections, so
+/// full-bright sections cost no per-chunk memory and no packing work.
+static FULL_BRIGHT_LAYER: [u8; DATA_LAYER_SIZE] = [0xFF; DATA_LAYER_SIZE];
 
-/// Pack one section of a filled [`VOLUME`] light grid into a `DataLayer`. Returns
-/// `None` for an all-zero section (empty); otherwise its 4096 nibbles are packed
-/// into 2048 bytes at `y<<8 | z<<4 | x` (`DataLayer.getIndex`).
-fn pack_section(light: &[u8], section: usize) -> Option<Vec<u8>> {
+/// Pack one section of a filled [`VOLUME`] light grid into a `DataLayer`.
+/// Returns [`LightLayer::Empty`] for an all-zero section; otherwise its 4096
+/// nibbles are packed into 2048 bytes at `y<<8 | z<<4 | x` (`DataLayer.getIndex`).
+fn pack_section(light: &[u8], section: usize) -> LightLayer {
     let base_gy = LIGHT_Y_MIN + (section as i32) * 16;
-    let mut bytes = vec![0u8; DATA_LAYER_SIZE];
+    let mut bytes = Box::new([0u8; DATA_LAYER_SIZE]);
     let mut any = false;
     for ly in 0..16i32 {
         let gy = base_gy + ly;
@@ -397,14 +440,14 @@ fn pack_section(light: &[u8], section: usize) -> Option<Vec<u8>> {
         }
     }
     if any {
-        Some(bytes)
+        LightLayer::Data(bytes)
     } else {
-        None
+        LightLayer::Empty
     }
 }
 
 /// Slice a filled [`VOLUME`] light grid into per-section `DataLayer`s.
-fn pack_layers(light: &[u8]) -> Vec<Option<Vec<u8>>> {
+fn pack_layers(light: &[u8]) -> Vec<LightLayer> {
     (0..LIGHT_SECTION_COUNT)
         .map(|section| pack_section(light, section))
         .collect()
@@ -412,13 +455,13 @@ fn pack_layers(light: &[u8]) -> Vec<Option<Vec<u8>>> {
 
 /// Like [`pack_layers`], but sections at or above `bright_from_section` are known
 /// to be uniformly open sky (source 15) — [`compute_sky`] never fills the grid
-/// there. Serve those from the shared [`FULL_BRIGHT_LAYER`] (identical bytes to
-/// nibble-packing all-15) instead of scanning 4096 cells per chunk.
-fn pack_sky(light: &[u8], bright_from_section: usize) -> Vec<Option<Vec<u8>>> {
+/// there. Those become [`LightLayer::Bright`] (the shared [`FULL_BRIGHT_LAYER`],
+/// byte-identical to nibble-packing all-15) instead of an owned copy per chunk.
+fn pack_sky(light: &[u8], bright_from_section: usize) -> Vec<LightLayer> {
     (0..LIGHT_SECTION_COUNT)
         .map(|section| {
             if section >= bright_from_section {
-                Some(FULL_BRIGHT_LAYER.to_vec())
+                LightLayer::Bright
             } else {
                 pack_section(light, section)
             }
@@ -466,7 +509,7 @@ mod tests {
         let light = compute_light(&gen, &edits);
         let section = section_of(200);
         assert!(section >= bright_from_section);
-        let bytes = light.sky[section].as_ref().expect("open-sky section present");
+        let bytes = light.sky[section].bytes().expect("open-sky section present");
         let ly = 200 - (LIGHT_Y_MIN + section as i32 * 16);
         assert_eq!(nibble(bytes, lx, ly, lz), 15);
         // The surface block and everything below it are unlit.
@@ -498,7 +541,7 @@ mod tests {
         let gen = GenChunk::flat(63);
         let edits = HashMap::new();
         let light = compute_light(&gen, &edits);
-        assert!(light.block.iter().all(|s| s.is_none()));
+        assert!(light.block.iter().all(|s| s.bytes().is_none()));
     }
 
     #[test]
@@ -508,9 +551,9 @@ mod tests {
         let light = compute_light(&gen, &edits);
         // Topmost section (all air, open sky) is a filled 0xFF DataLayer.
         let top = &light.sky[LIGHT_SECTION_COUNT - 1];
-        assert!(top.as_ref().is_some_and(|b| b.iter().all(|&x| x == 0xFF)));
+        assert!(top.bytes().is_some_and(|b| b.iter().all(|&x| x == 0xFF)));
         // Bottom pad section (below bedrock) is dark → empty.
-        assert!(light.sky[0].is_none());
+        assert!(light.sky[0].bytes().is_none());
     }
 
     #[test]
@@ -520,7 +563,7 @@ mod tests {
         let light = compute_light(&gen, &edits);
         let surface = 63;
         let section = section_of(surface + 1);
-        let bytes = light.sky[section].as_ref().expect("lit section present");
+        let bytes = light.sky[section].bytes().expect("lit section present");
         // The air cell above the surface in column (0,0) reads back as 15.
         let ly = (surface + 1 - (LIGHT_Y_MIN + section as i32 * 16)) as i32;
         assert_eq!(nibble(bytes, 0, ly, 0), 15);

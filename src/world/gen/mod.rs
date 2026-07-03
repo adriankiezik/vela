@@ -124,12 +124,17 @@ pub struct GenChunk {
     /// Per-column surface heights, indexed `lz * 16 + lx`.
     pub heights: [i32; COLUMNS],
     biomes: [Biome; COLUMNS],
-    /// The dense baseline block grid (surface rule + carved caves + generated
-    /// features), indexed `(world_y - MIN_Y) * COLUMNS + lz*16 + lx` — the same
-    /// index [`edit_key`] produces. Computed once so the encoder, heightmap, and
-    /// light engine read O(1) instead of re-evaluating the noise per pass. Empty
-    /// for the test-only `simple` chunk, which computes columns arithmetically.
-    grid: Vec<BlockState>,
+    /// The baseline block grid (surface rule + carved caves + generated
+    /// features), stored per 16-block section in palette-compressed form (see
+    /// [`GridSection`]): a dense `Vec<BlockState>` costs 384 KiB per chunk
+    /// (98,304 cells × 4 B) and dominated resident memory at large view
+    /// distances, while worldgen sections hold a handful of distinct states —
+    /// open-air sections a single one. Logical indexing is unchanged:
+    /// `(world_y - MIN_Y) * COLUMNS + lz*16 + lx` (the [`edit_key`] index),
+    /// split as section `dy >> 4` / cell `(dy & 15) * COLUMNS + lz*16 + lx`.
+    /// Reads stay O(1) via [`base_state`](GenChunk::base_state). Empty for the
+    /// test-only `simple` chunk, which computes columns arithmetically.
+    grid: Vec<GridSection>,
     /// Parity mode only: per-column *surface* biome as a parameter-list fill
     /// value (see [`pipeline::biome_network_id_of`]); when set, it overrides
     /// the legacy `biomes` for the wire/disk palettes. 2-D projection of the
@@ -150,6 +155,106 @@ pub struct GenChunk {
 /// so generated feature overrides drop straight into place.
 fn grid_index(lx: i32, world_y: i32, lz: i32) -> usize {
     ((world_y - MIN_Y) as usize) * COLUMNS + (lz * 16 + lx) as usize
+}
+
+/// Cells per 16-block section of the baseline grid.
+const SECTION_CELLS: usize = 16 * COLUMNS;
+
+/// One 16-block section of the baseline grid, palette-compressed. Worldgen
+/// output is extremely low-entropy per section: everything above the surface is
+/// one state (air), and even ore-bearing deepslate sections hold well under a
+/// dozen distinct states. Storing a per-section palette plus one byte per cell
+/// (or nothing at all for a uniform section) cuts the baseline from 384 KiB to
+/// a few tens of KiB per chunk with an O(1) read.
+#[derive(Debug, PartialEq)]
+enum GridSection {
+    /// Every cell is the same state — open sky, deep ocean water, solid fill.
+    Uniform(BlockState),
+    /// ≤ 16 distinct states — the typical terrain section: `cell`'s palette
+    /// index is the nibble at `cells[cell >> 1]` (even cell → low nibble).
+    Nibble { palette: Vec<BlockState>, cells: Box<[u8; SECTION_CELLS / 2]> },
+    /// ≤ 256 distinct states: `cells[i]` indexes into `palette`.
+    Paletted { palette: Vec<BlockState>, cells: Box<[u8; SECTION_CELLS]> },
+    /// > 256 distinct states — never produced by the current generator, kept so
+    /// compression can't fail if a future stage exceeds a byte palette.
+    Dense(Box<[BlockState; SECTION_CELLS]>),
+}
+
+impl GridSection {
+    /// The state at section-local cell index `(dy & 15) * COLUMNS + lz*16 + lx`.
+    #[inline]
+    fn state(&self, cell: usize) -> BlockState {
+        match self {
+            GridSection::Uniform(s) => *s,
+            GridSection::Nibble { palette, cells } => {
+                palette[((cells[cell >> 1] >> ((cell & 1) * 4)) & 0xF) as usize]
+            }
+            GridSection::Paletted { palette, cells } => palette[cells[cell] as usize],
+            GridSection::Dense(cells) => cells[cell],
+        }
+    }
+
+    /// Heap bytes this section holds (excluding its inline enum footprint).
+    fn heap_bytes(&self) -> usize {
+        match self {
+            GridSection::Uniform(_) => 0,
+            GridSection::Nibble { palette, cells } => {
+                palette.capacity() * std::mem::size_of::<BlockState>()
+                    + std::mem::size_of_val(&**cells)
+            }
+            GridSection::Paletted { palette, cells } => {
+                palette.capacity() * std::mem::size_of::<BlockState>()
+                    + std::mem::size_of_val(&**cells)
+            }
+            GridSection::Dense(cells) => std::mem::size_of_val(&**cells),
+        }
+    }
+}
+
+/// Palette-compress a dense whole-chunk grid (the transient build product of
+/// [`GenChunk::generate`]/[`generate_parity`](GenChunk::generate_parity)) into
+/// per-section storage. Pure re-encoding: `section.state(cell)` reproduces the
+/// input byte-for-byte.
+fn compress_grid(dense: &[BlockState]) -> Vec<GridSection> {
+    debug_assert_eq!(dense.len() % SECTION_CELLS, 0);
+    dense
+        .chunks_exact(SECTION_CELLS)
+        .map(|sec| {
+            let first = sec[0];
+            if sec.iter().all(|&s| s == first) {
+                return GridSection::Uniform(first);
+            }
+            let mut palette: Vec<BlockState> = Vec::new();
+            let mut cells = Box::new([0u8; SECTION_CELLS]);
+            for (i, &s) in sec.iter().enumerate() {
+                // Linear probe: palettes stay tiny (a dozen states), and the
+                // whole pass is a one-off ~0.1 ms against a ~100 ms generate.
+                let idx = match palette.iter().position(|&p| p == s) {
+                    Some(idx) => idx,
+                    None if palette.len() < 256 => {
+                        palette.push(s);
+                        palette.len() - 1
+                    }
+                    None => {
+                        let mut all = Box::new([super::states::AIR; SECTION_CELLS]);
+                        all.copy_from_slice(sec);
+                        return GridSection::Dense(all);
+                    }
+                };
+                cells[i] = idx as u8;
+            }
+            if palette.len() <= 16 {
+                // Typical terrain section: pack the byte indices to nibbles,
+                // halving the per-section cells to 2 KiB.
+                let mut packed = Box::new([0u8; SECTION_CELLS / 2]);
+                for (i, pair) in cells.chunks_exact(2).enumerate() {
+                    packed[i] = pair[0] | (pair[1] << 4);
+                }
+                return GridSection::Nibble { palette, cells: packed };
+            }
+            GridSection::Paletted { palette, cells }
+        })
+        .collect()
 }
 
 /// Whether the live path runs the vanilla-parity pipeline instead of the
@@ -220,7 +325,7 @@ impl GenChunk {
             heights,
             biomes,
             parity_biomes: None,
-            grid,
+            grid: compress_grid(&grid),
             ws_top: [MIN_Y; COLUMNS],
             mb_top: [MIN_Y; COLUMNS],
             simple: false,
@@ -250,7 +355,7 @@ impl GenChunk {
             heights,
             biomes: [Biome::Plains; COLUMNS], // shadowed by `parity_biomes`
             parity_biomes: Some(Box::new(parity.surface_biomes)),
-            grid,
+            grid: compress_grid(&grid),
             ws_top: [MIN_Y; COLUMNS],
             mb_top: [MIN_Y; COLUMNS],
             simple: false,
@@ -312,7 +417,17 @@ impl GenChunk {
         if !(MIN_Y..MAX_Y_EXCL).contains(&world_y) {
             return super::states::AIR;
         }
-        self.grid[grid_index(lx, world_y, lz)]
+        let dy = (world_y - MIN_Y) as usize;
+        self.grid[dy >> 4].state((dy & 15) * COLUMNS + (lz * 16 + lx) as usize)
+    }
+
+    /// Heap bytes this baseline holds (the compressed grid plus the parity
+    /// biome box) — the per-chunk term the memory profiler tracks; fixed-size
+    /// inline fields are excluded.
+    pub fn baseline_bytes(&self) -> usize {
+        self.grid.capacity() * std::mem::size_of::<GridSection>()
+            + self.grid.iter().map(GridSection::heap_bytes).sum::<usize>()
+            + self.parity_biomes.as_ref().map_or(0, |b| std::mem::size_of_val(&**b))
     }
 
     /// The network biome id at a column (for the biome `PalettedContainer`).

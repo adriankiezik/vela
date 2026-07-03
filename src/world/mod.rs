@@ -43,8 +43,11 @@ pub use chunk_data::{
 // re-export there rather than drop an API the tests still lean on.
 #[allow(unused_imports)]
 pub use chunk_data::{block_state_at, raw_brightness};
+// Memory accounting for the profiling example; unused by the server itself.
+#[allow(unused_imports)]
+pub use chunk_data::{store_memory_stats, StoreMemoryStats};
 pub use gen::{biome_at, seed, set_seed, surface_height, world_spawn, DEFAULT_SEED};
-pub use light::ChunkLight;
+pub use light::{ChunkLight, LightLayer};
 
 // The wire-columns type is reached through `chunk_columns`' return value rather
 // than named directly, but stays part of the public API surface.

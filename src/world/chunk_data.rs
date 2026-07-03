@@ -35,23 +35,42 @@ pub(super) fn chunk_heights(cx: i32, cz: i32) -> [i32; COLUMNS] {
 /// *plus* any per-cell edits, so they are produced together and cached; the
 /// cache is invalidated whenever the chunk is edited.
 pub struct ChunkColumns {
-    pub blob: Vec<u8>,
+    /// The 24-section block blob — a zero-copy [`Bytes`] slice into [`frame`]
+    /// (which embeds the identical bytes), so the store holds the blob once,
+    /// not twice.
+    ///
+    /// [`frame`]: ChunkColumns::frame
+    pub blob: Bytes,
     pub heightmaps: Vec<(i32, Vec<i64>)>,
     /// Converged sky/block light for the column's 26 light sections, computed
     /// together with the block blob so an edit that invalidates one re-lights the
     /// other. See [`super::light`].
     pub light: super::light::ChunkLight,
     /// The fully framed `ClientboundLevelChunkWithLightPacket` bytes for this
-    /// column, serialized once (lazily, off the sim thread by the prefetch pool
-    /// or on first send) and handed to every viewer as a refcount clone. The
-    /// packet body is a pure function of `(cx, cz)` and this column's
+    /// column, serialized eagerly with the rest of the wire cache (off the sim
+    /// thread by the prefetch pool) and handed to every viewer as a refcount
+    /// clone. The packet body is a pure function of `(cx, cz)` and this column's
     /// blob/heightmaps/light — no per-connection or per-send-varying field (no
     /// sequence number, no player state) — so one frame is byte-identical for
-    /// every recipient. Populated by [`crate::sim::packets::level_chunk`] via
-    /// `get_or_init`. Lives *inside* `ChunkColumns`, so it is discarded together
-    /// with the rest of the wire cache the instant an edit sets `wire = None`
-    /// (the whole `Arc<ChunkColumns>` is dropped and rebuilt).
-    pub level_chunk_frame: OnceLock<Bytes>,
+    /// every recipient. Lives *inside* `ChunkColumns`, so it is discarded
+    /// together with the rest of the wire cache the instant an edit sets
+    /// `wire = None` (the whole `Arc<ChunkColumns>` is dropped and rebuilt).
+    pub frame: Bytes,
+}
+
+impl ChunkColumns {
+    /// Build the full wire cache for chunk `(cx, cz)` from its baseline and
+    /// edits: blob + heightmaps + converged light, then the framed
+    /// `level_chunk` packet those serialize into, with `blob` sliced back out
+    /// of the frame so the bytes exist once.
+    fn build(cx: i32, cz: i32, gen: &GenChunk, edits: &HashMap<u32, BlockState>) -> Self {
+        let blob = encode_blob(gen, edits);
+        let heightmaps = compute_heightmaps(gen, edits);
+        let light = super::light::compute_light(gen, edits);
+        let (frame, blob_range) =
+            super::encoding::encode_level_chunk_frame(cx, cz, &blob, &heightmaps, &light);
+        ChunkColumns { blob: frame.slice(blob_range), heightmaps, light, frame }
+    }
 }
 
 /// A chunk's mutable state: its generated baseline heights, a sparse map of
@@ -163,14 +182,9 @@ impl ChunkData {
     }
 
     /// The cached wire columns, building them from heights + edits on first use.
-    fn columns(&mut self) -> Arc<ChunkColumns> {
+    fn columns(&mut self, cx: i32, cz: i32) -> Arc<ChunkColumns> {
         if self.wire.is_none() {
-            self.wire = Some(Arc::new(ChunkColumns {
-                blob: encode_blob(&self.gen, &self.edits),
-                heightmaps: compute_heightmaps(&self.gen, &self.edits),
-                light: super::light::compute_light(&self.gen, &self.edits),
-                level_chunk_frame: OnceLock::new(),
-            }));
+            self.wire = Some(Arc::new(ChunkColumns::build(cx, cz, &self.gen, &self.edits)));
         }
         Arc::clone(self.wire.as_ref().expect("wire just built"))
     }
@@ -420,7 +434,7 @@ fn prefetch_shard(cx: i32, cz: i32, workers: usize) -> usize {
 /// The wire columns for chunk `(cx, cz)`, generating and caching on first
 /// request and rebuilding after edits. The returned `Arc` is cheap to clone.
 pub fn chunk_columns(cx: i32, cz: i32) -> Arc<ChunkColumns> {
-    with_chunk(cx, cz, ChunkData::columns)
+    with_chunk(cx, cz, |c| c.columns(cx, cz))
 }
 
 /// The block-state id at world `(x, y, z)` — an edit if present, else generated
@@ -523,6 +537,49 @@ pub fn save_dirty_chunks(game_time: i64) {
     }
     drop(guard);
     super::storage::flush();
+}
+
+/// Byte accounting of the resident chunk store, for the memory profiling
+/// example (`examples/profile_memory.rs`). Counts the *heap payloads* that
+/// scale with resident-chunk count — the generated baseline, the edit map, and
+/// each wire-cache component — not allocator overhead or fixed struct sizes.
+#[derive(Default)]
+pub struct StoreMemoryStats {
+    /// Resident chunk count.
+    pub chunks: usize,
+    /// Bytes held by every chunk's generated baseline (`GenChunk`).
+    pub baseline_bytes: usize,
+    /// Total entries across all edit maps.
+    pub edit_entries: usize,
+    /// Chunks whose wire cache (`ChunkColumns`) is currently built.
+    pub wire_built: usize,
+    /// Bytes across all cached heightmap long arrays.
+    pub heightmap_bytes: usize,
+    /// Heap bytes across all cached light sections (sky + block `DataLayer`s);
+    /// shared full-bright sections cost nothing.
+    pub light_bytes: usize,
+    /// Bytes across all cached `level_chunk` frames. The section blob is a
+    /// slice of its frame, so it is already counted here.
+    pub frame_bytes: usize,
+}
+
+/// Walk the store under its lock and sum each resident chunk's heap payloads.
+pub fn store_memory_stats() -> StoreMemoryStats {
+    let guard = store().0.lock().expect("chunk store mutex poisoned");
+    let mut s = StoreMemoryStats::default();
+    for chunk in guard.columns.values() {
+        s.chunks += 1;
+        s.baseline_bytes += chunk.gen.baseline_bytes();
+        s.edit_entries += chunk.edits.len();
+        if let Some(wire) = &chunk.wire {
+            s.wire_built += 1;
+            s.heightmap_bytes +=
+                wire.heightmaps.iter().map(|(_, longs)| longs.len() * 8).sum::<usize>();
+            s.light_bytes += wire.light.heap_bytes();
+            s.frame_bytes += wire.frame.len();
+        }
+    }
+    s
 }
 
 /// Evict a single chunk column the moment its last player reference is dropped —
@@ -671,12 +728,7 @@ mod tests {
     fn generate(cx: i32, cz: i32) -> ChunkColumns {
         let gen = GenChunk::generate(cx, cz);
         let edits = HashMap::new();
-        ChunkColumns {
-            blob: encode_blob(&gen, &edits),
-            heightmaps: compute_heightmaps(&gen, &edits),
-            light: crate::world::light::compute_light(&gen, &edits),
-            level_chunk_frame: OnceLock::new(),
-        }
+        ChunkColumns::build(cx, cz, &gen, &edits)
     }
 
     #[test]

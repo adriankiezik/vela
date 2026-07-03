@@ -638,92 +638,13 @@ pub fn set_entity_data(entity_id: i32, sneaking: bool, sprinting: bool) -> Bytes
 /// per-section sky/block light come from `crate::world` and vary per chunk
 /// `(cx, cz)`.
 pub fn level_chunk(cx: i32, cz: i32) -> Bytes {
-    let columns = crate::world::chunk_columns(cx, cz);
-
-    // The framed packet is a pure function of `(cx, cz)` and this column's cached
-    // wire data — identical bytes for every recipient (see the invariance note on
-    // `ChunkColumns::level_chunk_frame`) — so serialize it once and hand each
-    // additional viewer a refcount clone. The `OnceLock` lives inside the
-    // `Arc<ChunkColumns>` wire cache, so an edit that invalidates the wire
-    // (`wire = None`) drops this frame with it; the next stream rebuilds both.
-    // `get_or_init` may race across the send + prefetch threads, but every builder
-    // produces the same bytes, so whichever wins is correct.
-    columns
-        .level_chunk_frame
-        .get_or_init(|| {
-            let mut p = PacketWriter::new();
-            p.write_i32(cx);
-            p.write_i32(cz);
-            // --- ClientboundLevelChunkPacketData ---
-            // Heightmaps: a map of type-id -> packed long[] (ByteBufCodecs.map + LONG_ARRAY).
-            p.write_varint(columns.heightmaps.len() as i32);
-            for (type_id, longs) in &columns.heightmaps {
-                p.write_varint(*type_id);
-                p.write_varint(longs.len() as i32);
-                for &l in longs {
-                    p.write_i64(l);
-                }
-            }
-            p.write_varint(columns.blob.len() as i32); // section blob length
-            p.write_bytes(&columns.blob);
-            p.write_varint(0); // block entities: none
-            // --- ClientboundLightUpdatePacketData ---
-            write_light(&mut p, &columns.light);
-            frame(CB_PLAY_LEVEL_CHUNK, &p.buf)
-        })
-        .clone()
-}
-
-/// Serialize a chunk's light into a `ClientboundLightUpdatePacketData` body: four
-/// `BitSet`s (which sections carry sky data, block data, empty sky, empty block)
-/// then the two lists of 2048-byte `DataLayer`s. A `Some` section sets the data
-/// mask and contributes its bytes; a `None` (all-zero) section sets the *empty*
-/// mask and sends nothing (`ClientboundLightUpdatePacketData.prepareSectionData`).
-fn write_light(p: &mut PacketWriter, light: &crate::world::ChunkLight) {
-    let sky_mask: Vec<bool> = light.sky.iter().map(Option::is_some).collect();
-    let block_mask: Vec<bool> = light.block.iter().map(Option::is_some).collect();
-    let empty_sky: Vec<bool> = light.sky.iter().map(Option::is_none).collect();
-    let empty_block: Vec<bool> = light.block.iter().map(Option::is_none).collect();
-
-    write_bitset(p, &sky_mask);
-    write_bitset(p, &block_mask);
-    write_bitset(p, &empty_sky);
-    write_bitset(p, &empty_block);
-    write_light_arrays(p, &light.sky);
-    write_light_arrays(p, &light.block);
-}
-
-/// Write one light layer's data list: a VarInt count of present sections, then
-/// each as a length-prefixed 2048-byte array (`ByteBufCodecs.byteArray(2048)`),
-/// in ascending section order.
-fn write_light_arrays(p: &mut PacketWriter, layer: &[Option<Vec<u8>>]) {
-    let present = layer.iter().filter(|s| s.is_some()).count();
-    p.write_varint(present as i32);
-    for section in layer.iter().flatten() {
-        p.write_varint(section.len() as i32);
-        p.write_bytes(section);
-    }
-}
-
-/// Write a `java.util.BitSet` as `FriendlyByteBuf.writeBitSet` does — a `long[]`
-/// (VarInt length + big-endian longs) with trailing all-zero words dropped
-/// (`BitSet.toLongArray`). `bits[i]` is bit `i`; bit `i` lands in word `i / 64`
-/// at position `i % 64`.
-fn write_bitset(p: &mut PacketWriter, bits: &[bool]) {
-    let mut words: Vec<u64> = Vec::new();
-    for (i, &set) in bits.iter().enumerate() {
-        if set {
-            let word = i / 64;
-            if word >= words.len() {
-                words.resize(word + 1, 0);
-            }
-            words[word] |= 1u64 << (i % 64);
-        }
-    }
-    p.write_varint(words.len() as i32);
-    for w in words {
-        p.write_i64(w as i64);
-    }
+    // The framed packet is a pure function of `(cx, cz)` and the column's wire
+    // data — identical bytes for every recipient — and is serialized *with* the
+    // wire cache (see `world::encoding::encode_level_chunk_frame`, which also
+    // guards that the frame carries `CB_PLAY_LEVEL_CHUNK` below), so streaming a
+    // column to any number of viewers is a refcount clone. An edit invalidates
+    // the whole wire cache and the next stream rebuilds frame and blob together.
+    crate::world::chunk_columns(cx, cz).frame.clone()
 }
 
 /// ClientboundForgetLevelChunkPacket — tell the client to drop a chunk column it

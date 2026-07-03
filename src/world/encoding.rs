@@ -1,13 +1,117 @@
 //! Per-chunk wire encoding: the 24-section block blob, mirroring vanilla's
-//! `LevelChunkSection` / `PalettedContainer` serialization.
+//! `LevelChunkSection` / `PalettedContainer` serialization, plus the fully
+//! framed `ClientboundLevelChunkWithLightPacket` those bytes ship inside.
+
+use bytes::Bytes;
 
 use crate::ids::BlockState;
 use crate::protocol::buffer::PacketWriter;
+use crate::protocol::framing::frame;
 
 use super::bitpack::pack_bits;
 use super::chunk_data::cell_state;
 use super::gen::{biome_registry_size, GenChunk};
+use super::light::{ChunkLight, LightLayer};
 use super::{states, CELLS, MIN_Y, SECTION_COUNT};
+
+/// `ClientboundLevelChunkWithLightPacket` — mirrors `CB_PLAY_LEVEL_CHUNK` in
+/// `sim::packets`, whose unframe round-trip test guards the value. The frame is
+/// built here (not in `sim`) so the chunk store can cache the framed packet as
+/// the *primary* wire bytes and hand out the section blob as a zero-copy slice
+/// of it, instead of holding both allocations.
+const CB_PLAY_LEVEL_CHUNK: i32 = 45;
+
+/// Serialize the complete framed `ClientboundLevelChunkWithLightPacket` for
+/// chunk `(cx, cz)` and return it together with the byte range the section
+/// `blob` occupies inside it (so callers can slice the blob back out without a
+/// second copy). The frame is the *uncompressed* wire form ([`frame`]); `net`
+/// applies per-connection compression on send.
+pub(super) fn encode_level_chunk_frame(
+    cx: i32,
+    cz: i32,
+    blob: &[u8],
+    heightmaps: &[(i32, Vec<i64>)],
+    light: &ChunkLight,
+) -> (Bytes, std::ops::Range<usize>) {
+    let mut p = PacketWriter::new();
+    p.write_i32(cx);
+    p.write_i32(cz);
+    // --- ClientboundLevelChunkPacketData ---
+    // Heightmaps: a map of type-id -> packed long[] (ByteBufCodecs.map + LONG_ARRAY).
+    p.write_varint(heightmaps.len() as i32);
+    for (type_id, longs) in heightmaps {
+        p.write_varint(*type_id);
+        p.write_varint(longs.len() as i32);
+        for &l in longs {
+            p.write_i64(l);
+        }
+    }
+    p.write_varint(blob.len() as i32); // section blob length
+    let blob_start = p.buf.len();
+    p.write_bytes(blob);
+    let blob_end = p.buf.len();
+    p.write_varint(0); // block entities: none
+    // --- ClientboundLightUpdatePacketData ---
+    write_light(&mut p, light);
+    let body_len = p.buf.len();
+    let framed = frame(CB_PLAY_LEVEL_CHUNK, &p.buf);
+    // `frame` only *prepends* (length + id VarInts), so the body — and the blob
+    // inside it — sits at a fixed offset from the end.
+    let prefix = framed.len() - body_len;
+    (framed, prefix + blob_start..prefix + blob_end)
+}
+
+/// Serialize a chunk's light into a `ClientboundLightUpdatePacketData` body: four
+/// `BitSet`s (which sections carry sky data, block data, empty sky, empty block)
+/// then the two lists of 2048-byte `DataLayer`s. A present section sets the data
+/// mask and contributes its bytes; an empty (all-zero) section sets the *empty*
+/// mask and sends nothing (`ClientboundLightUpdatePacketData.prepareSectionData`).
+fn write_light(p: &mut PacketWriter, light: &ChunkLight) {
+    let sky_mask: Vec<bool> = light.sky.iter().map(|s| s.bytes().is_some()).collect();
+    let block_mask: Vec<bool> = light.block.iter().map(|s| s.bytes().is_some()).collect();
+    let empty_sky: Vec<bool> = light.sky.iter().map(|s| s.bytes().is_none()).collect();
+    let empty_block: Vec<bool> = light.block.iter().map(|s| s.bytes().is_none()).collect();
+
+    write_bitset(p, &sky_mask);
+    write_bitset(p, &block_mask);
+    write_bitset(p, &empty_sky);
+    write_bitset(p, &empty_block);
+    write_light_arrays(p, &light.sky);
+    write_light_arrays(p, &light.block);
+}
+
+/// Write one light layer's data list: a VarInt count of present sections, then
+/// each as a length-prefixed 2048-byte array (`ByteBufCodecs.byteArray(2048)`),
+/// in ascending section order.
+fn write_light_arrays(p: &mut PacketWriter, layer: &[LightLayer]) {
+    let present = layer.iter().filter(|s| s.bytes().is_some()).count();
+    p.write_varint(present as i32);
+    for section in layer.iter().filter_map(LightLayer::bytes) {
+        p.write_varint(section.len() as i32);
+        p.write_bytes(section);
+    }
+}
+
+/// Write a `java.util.BitSet` as `FriendlyByteBuf.writeBitSet` does — a `long[]`
+/// (VarInt length + big-endian longs) with trailing all-zero words dropped
+/// (`BitSet.toLongArray`). `bits[i]` is bit `i`; bit `i` lands in word `i / 64`
+/// at position `i % 64`.
+fn write_bitset(p: &mut PacketWriter, bits: &[bool]) {
+    let mut words: Vec<u64> = Vec::new();
+    for (i, &set) in bits.iter().enumerate() {
+        if set {
+            let word = i / 64;
+            if word >= words.len() {
+                words.resize(word + 1, 0);
+            }
+            words[word] |= 1u64 << (i % 64);
+        }
+    }
+    p.write_varint(words.len() as i32);
+    for w in words {
+        p.write_i64(w as i64);
+    }
+}
 
 /// Encode the 24-section block blob for a chunk from its generated baseline and
 /// edits.
