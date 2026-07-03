@@ -23,19 +23,38 @@
 //!   land in the 8 neighboring chunks (`blockStateWriteRadius = 1`).
 //!
 //! ## Implemented features
-//! `ore`, `scattered_ore`, `spring_feature`, `disk`, `freeze_top_layer`. Between
-//! them these cover, block-for-block, the whole `underground_ores` step (ores +
-//! disks), the `fluid_springs` step, and `top_layer_modification` for the
-//! overworld.
+//! `ore`, `scattered_ore`, `spring_feature`, `disk`, the whole `tree` system,
+//! `random_selector`, `simple_block` (grass / ferns / flowers / mushrooms /
+//! gourds / bushes / lily pads / dead bush / dry grass / leaf litter / berries /
+//! double plants / lush-caves moss set), `block_column` (cactus, sugar cane),
+//! `bamboo`, `kelp`, `seagrass`, `sea_pickle`, and `lake` (lava lakes). Note MC
+//! 26.2 replaced the old `random_patch` feature with `simple_block` repeated by
+//! its placement chain, so grass/flower patches flow through `simple_block`.
 //!
 //! ## Deferred features (skipped, documented)
-//! `tree` and the whole trunk/foliage system, `simple_block` / `random_patch` /
-//! `vegetation_patch` and other vegetation, `lake`, `underwater_magma`, geodes,
-//! dripstone, coral/kelp/seagrass, mushrooms, fossils, monster rooms, and every
-//! nether/end feature. Most place block states outside the curated
-//! [`ParityBlock`] alphabet; a follow-up milestone can add them without touching
-//! the engine. Each deferred feature is recognized (so the sort/seed accounting
-//! is complete) but its placement is not run.
+//! `vegetation_patch` / `waterlogged_vegetation_patch` and the rest of the
+//! lush-caves set (`big_dripleaf`/`small_dripleaf`/`cave_vines`/`glow_lichen`/
+//! `spore_blossom`-ceiling via `multiface_growth`/`root_system`), coral, the pale
+//! garden `pale_moss_carpet` side-topper RNG, `freeze_top_layer`,
+//! `underwater_magma`, geodes, dripstone, monster rooms, fossils, icebergs,
+//! `desert_well`, `ice_spike`, `blue_ice`, `forest_rock`, and every nether/end
+//! feature. Each deferred feature is still recognized (so the sort/seed
+//! accounting is complete) but its placement is not run — parity-safe because the
+//! RNG is reseeded per feature.
+//!
+//! ## Documented parity deviations
+//! * Property-carrying plant blocks collapse to their default block state
+//!   (double-plant `half`, sugar-cane/cactus/kelp `age`, sea-pickle `pickles`),
+//!   while every vanilla RNG draw is still consumed 1:1.
+//! * `noise_provider` / `dual_noise_provider` (a few flower varieties) draw no
+//!   RNG and are collapsed to their first modeled state — RNG-exact, cosmetic
+//!   variety only. `noise_threshold_provider` is ported fully (RNG + block).
+//! * `pale_moss_carpet` is placed as a plain carpet; its 0–4 `nextBoolean`
+//!   side-topper draws (only non-zero next to walls) are elided.
+//! * `simple_block` survival checks that need light / face-sturdy / neighbor
+//!   scans (mushrooms, leaf litter, seagrass, sea pickle, spore blossom) are
+//!   approximated by `blocks_motion`; the check draws no RNG so it can only shift
+//!   a plant on/off marginal terrain, never desync a feature.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
@@ -48,8 +67,41 @@ use super::placement::{
     PlacementCtx, PlacementModifier, Pos, RuleTest,
 };
 use super::random::{RandomSource, WorldgenRandom};
-use super::synth::PerlinSimplexNoise;
+use super::synth::{NoiseParameters, NormalNoise, PerlinSimplexNoise};
 use super::vanilla_jsons;
+
+/// A shared, cheaply-cloned handle to a built [`NormalNoise`]. `StateProvider`
+/// derives `Clone`/`Debug`; `NormalNoise` does neither, so it is wrapped here.
+#[derive(Clone)]
+struct NoiseHandle(std::sync::Arc<NormalNoise>);
+
+impl std::fmt::Debug for NoiseHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NormalNoise")
+    }
+}
+
+/// `NoiseBasedStateProvider` — builds the `NormalNoise` from `NormalNoise.create(
+/// new WorldgenRandom(new LegacyRandomSource(seed)), parameters)`.
+fn build_noise(v: &Value) -> Option<NoiseHandle> {
+    let seed = v.get("seed").and_then(Value::as_i64)?;
+    let np = &v["noise"];
+    let params = NoiseParameters {
+        first_octave: np.get("firstOctave").and_then(Value::as_i64).unwrap_or(0) as i32,
+        amplitudes: np["amplitudes"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default(),
+    };
+    let noise = NormalNoise::create(&mut RandomSource::legacy(seed), &params);
+    Some(NoiseHandle(std::sync::Arc::new(noise)))
+}
+
+/// The `BlockState[]` of a noise state provider, collapsed to parity blocks. An
+/// unknown/absent entry is dropped (its variety collapses to a neighbor); the
+/// list must stay non-empty for the provider to select anything.
+fn parse_state_list(v: &Value) -> Vec<ParityBlock> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|s| s.get("Name").and_then(Value::as_str).and_then(ParityBlock::from_name)).collect())
+        .unwrap_or_default()
+}
 
 /// `Biome.BIOME_INFO_NOISE` — a `PerlinSimplexNoise` seeded 2345 on the legacy
 /// LCG. Only the noise-count placement modifiers use it (deferred vegetation).
@@ -76,6 +128,26 @@ enum StateProvider {
     /// identity default state, but both RNG draws are consumed 1:1 (mangrove
     /// propagule `age`).
     RandomizedInt { source: Box<StateProvider>, values: IntProvider },
+    /// `NoiseThresholdProvider` — the only noise state provider that consumes the
+    /// passed `RandomSource`. `getNoiseValue(pos)` is deterministic; below the
+    /// threshold it draws `Util.getRandom(low_states)` (one `nextInt`), otherwise
+    /// it draws `nextFloat()` (always) and, if `< high_chance`, another `nextInt`
+    /// over `high_states`. The block choice is exact (all in the alphabet); the
+    /// draw sequence is 1:1 so the enclosing `count`-repeat stays in lockstep.
+    NoiseThreshold {
+        noise: NoiseHandle,
+        scale: f64,
+        threshold: f32,
+        high_chance: f32,
+        default_state: Option<ParityBlock>,
+        low_states: Vec<ParityBlock>,
+        high_states: Vec<ParityBlock>,
+    },
+    /// `NoiseProvider` / `DualNoiseProvider` — select a state purely from the
+    /// deterministic noise value; they draw **no** RNG. Ported RNG-neutrally by
+    /// collapsing to the first modeled state (the variety choice is cosmetic and
+    /// cannot desync anything). Documented block-identity deviation.
+    NoiseCollapsed(ParityBlock),
     Unsupported,
 }
 
@@ -124,6 +196,25 @@ impl StateProvider {
                 source: Box::new(StateProvider::parse(&v["source"])),
                 values: IntProvider::parse(&v["values"]),
             },
+            "noise_threshold_provider" => match build_noise(v) {
+                Some(noise) => StateProvider::NoiseThreshold {
+                    noise,
+                    scale: v.get("scale").and_then(Value::as_f64).unwrap_or(1.0),
+                    threshold: v.get("threshold").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                    high_chance: v.get("high_chance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                    default_state: v["default_state"]["Name"].as_str().and_then(ParityBlock::from_name),
+                    low_states: parse_state_list(&v["low_states"]),
+                    high_states: parse_state_list(&v["high_states"]),
+                },
+                None => StateProvider::Unsupported,
+            },
+            // `noise_provider` / `dual_noise_provider` draw no RNG; collapse to the
+            // first modeled `states` entry (variety choice is cosmetic).
+            "noise_provider" | "dual_noise_provider" => parse_state_list(&v["states"])
+                .into_iter()
+                .next()
+                .map(StateProvider::NoiseCollapsed)
+                .unwrap_or(StateProvider::Unsupported),
             _ => StateProvider::Unsupported,
         }
     }
@@ -162,9 +253,34 @@ impl StateProvider {
                 let _ = values.sample(random);
                 base
             }
+            StateProvider::NoiseThreshold {
+                noise, scale, threshold, high_chance, default_state, low_states, high_states,
+            } => {
+                let local = noise.0.get_value(
+                    pos.x as f64 * *scale,
+                    pos.y as f64 * *scale,
+                    pos.z as f64 * *scale,
+                );
+                if (local as f32) < *threshold {
+                    util_get_random(low_states, random)
+                } else if random.next_float() < *high_chance {
+                    util_get_random(high_states, random)
+                } else {
+                    *default_state
+                }
+            }
+            StateProvider::NoiseCollapsed(b) => Some(*b),
             StateProvider::Unsupported => None,
         }
     }
+}
+
+/// `Util.getRandom(list, random)` — `list.get(random.nextInt(list.size()))`.
+fn util_get_random(list: &[ParityBlock], random: &mut WorldgenRandom) -> Option<ParityBlock> {
+    if list.is_empty() {
+        return None;
+    }
+    Some(list[random.next_int_bounded(list.len() as i32) as usize])
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +315,38 @@ struct DiskConfig {
     target: BlockPredicate,
     radius: IntProvider,
     half_height: i32,
+}
+
+/// `SimpleBlockConfiguration` (`to_place`, `schedule_tick`).
+#[derive(Clone, Debug)]
+struct SimpleBlockConfig {
+    to_place: StateProvider,
+}
+
+/// `BlockColumnConfiguration.Layer`.
+#[derive(Clone, Debug)]
+struct BlockColumnLayer {
+    height: IntProvider,
+    provider: StateProvider,
+}
+
+/// `BlockColumnConfiguration` (`up`-only direction is the overworld case;
+/// `allowed_placement` gates growth, `prioritize_tip` steers truncation).
+#[derive(Clone, Debug)]
+struct BlockColumnConfig {
+    layers: Vec<BlockColumnLayer>,
+    dir: (i32, i32, i32),
+    allowed_placement: BlockPredicate,
+    prioritize_tip: bool,
+}
+
+/// `LakeFeature.Configuration` (`lake_lava_*`).
+#[derive(Clone, Debug)]
+struct LakeConfig {
+    fluid: StateProvider,
+    barrier: StateProvider,
+    can_replace_with_air_or_fluid: BlockPredicate,
+    can_replace_with_barrier: BlockPredicate,
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +869,13 @@ enum ConfiguredFeature {
     Disk(DiskConfig),
     Tree(TreeConfig),
     RandomSelector(RandomSelectorConfig),
+    SimpleBlock(SimpleBlockConfig),
+    BlockColumn(BlockColumnConfig),
+    Bamboo { probability: f32 },
+    Kelp,
+    Seagrass { probability: f32 },
+    SeaPickle { count: IntProvider },
+    Lake(LakeConfig),
     Deferred(String),
 }
 
@@ -746,6 +901,37 @@ impl ConfiguredFeature {
             }),
             "tree" => ConfiguredFeature::Tree(parse_tree(cfg)),
             "random_selector" => ConfiguredFeature::RandomSelector(parse_random_selector(cfg)),
+            "simple_block" => ConfiguredFeature::SimpleBlock(SimpleBlockConfig {
+                to_place: StateProvider::parse(&cfg["to_place"]),
+            }),
+            "block_column" => ConfiguredFeature::BlockColumn(BlockColumnConfig {
+                layers: cfg["layers"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .map(|l| BlockColumnLayer {
+                        height: IntProvider::parse(&l["height"]),
+                        provider: StateProvider::parse(&l["provider"]),
+                    })
+                    .collect(),
+                dir: parse_direction(cfg["direction"].as_str().unwrap_or("up")).unwrap_or((0, 1, 0)),
+                allowed_placement: BlockPredicate::parse(&cfg["allowed_placement"]),
+                prioritize_tip: cfg.get("prioritize_tip").and_then(Value::as_bool).unwrap_or(false),
+            }),
+            "bamboo" => ConfiguredFeature::Bamboo {
+                probability: cfg.get("probability").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+            },
+            "kelp" => ConfiguredFeature::Kelp,
+            "seagrass" => ConfiguredFeature::Seagrass {
+                probability: cfg.get("probability").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+            },
+            "sea_pickle" => ConfiguredFeature::SeaPickle { count: IntProvider::parse(&cfg["count"]) },
+            "lake" => ConfiguredFeature::Lake(LakeConfig {
+                fluid: StateProvider::parse(&cfg["fluid"]),
+                barrier: StateProvider::parse(&cfg["barrier"]),
+                can_replace_with_air_or_fluid: BlockPredicate::parse(&cfg["can_replace_with_air_or_fluid"]),
+                can_replace_with_barrier: BlockPredicate::parse(&cfg["can_replace_with_barrier"]),
+            }),
             // `freeze_top_layer` (SnowAndFreezeFeature) is recognized but
             // deferred: its exact `Biome.shouldFreeze`/`shouldSnow` gates need
             // the biome-temperature/height-adjust plumbing (in surface_rules)
@@ -1209,6 +1395,13 @@ fn place_feature(
         ConfiguredFeature::Disk(cfg) => place_disk(cfg, ctx, random, origin),
         ConfiguredFeature::Tree(cfg) => place_tree(cfg, ctx, random, origin),
         ConfiguredFeature::RandomSelector(cfg) => place_random_selector(cfg, ctx, random, origin),
+        ConfiguredFeature::SimpleBlock(cfg) => place_simple_block(cfg, ctx, random, origin),
+        ConfiguredFeature::BlockColumn(cfg) => place_block_column(cfg, ctx, random, origin),
+        ConfiguredFeature::Bamboo { probability } => place_bamboo(*probability, ctx, random, origin),
+        ConfiguredFeature::Kelp => place_kelp(ctx, random, origin),
+        ConfiguredFeature::Seagrass { probability } => place_seagrass(*probability, ctx, random, origin),
+        ConfiguredFeature::SeaPickle { count } => place_sea_pickle(count, ctx, random, origin),
+        ConfiguredFeature::Lake(cfg) => place_lake(cfg, ctx, random, origin),
         ConfiguredFeature::Deferred(_) => {}
     }
 }
@@ -1516,6 +1709,396 @@ fn place_disk(cfg: &DiskConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRan
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Vegetal decoration — SimpleBlockFeature / BlockColumnFeature + survival
+// ---------------------------------------------------------------------------
+
+/// `#minecraft:supports_vegetation` over the parity alphabet (the plant floor).
+fn supports_vegetation(b: ParityBlock) -> bool {
+    BlockTag::SupportsVegetation.contains(b)
+}
+
+/// `#minecraft:supports_dry_vegetation` = `#sand ∪ #terracotta ∪ #supports_vegetation`.
+fn supports_dry_vegetation(b: ParityBlock) -> bool {
+    use ParityBlock::*;
+    supports_vegetation(b)
+        || matches!(
+            b,
+            Sand | RedSand
+                | Terracotta
+                | WhiteTerracotta
+                | OrangeTerracotta
+                | YellowTerracotta
+                | BrownTerracotta
+                | RedTerracotta
+                | LightGrayTerracotta
+        )
+}
+
+/// `#minecraft:beneath_bamboo_podzol_replaceable` = `#substrate_overworld`.
+fn bamboo_podzol_replaceable(b: ParityBlock) -> bool {
+    BlockTag::BeneathTreePodzolReplaceable.contains(b)
+}
+
+/// `#minecraft:supports_bamboo` = `#sand ∪ #substrate_overworld ∪ bamboo /
+/// bamboo_sapling / gravel / suspicious_gravel` over the parity alphabet.
+fn supports_bamboo(b: ParityBlock) -> bool {
+    use ParityBlock::*;
+    BlockTag::BeneathTreePodzolReplaceable.contains(b)
+        || matches!(b, Sand | RedSand | Gravel | Bamboo | BambooSapling)
+}
+
+/// `DoublePlantBlock` membership over the alphabet (their upper half collapses to
+/// the same default block per precedent).
+fn is_double_plant(b: ParityBlock) -> bool {
+    use ParityBlock::*;
+    matches!(b, TallGrass | LargeFern | Sunflower | Lilac | RoseBush | Peony)
+}
+
+/// `state.canSurvive(level, pos)` for the states a `simple_block` feature places.
+/// The check draws no RNG (it only gates whether the block appears), so any
+/// approximation here can never desync the enclosing feature — only shift a plant
+/// on/off marginal terrain. Tag-based cases are exact; the light/face-sturdy
+/// cases are approximated (`blocks_motion`), documented in the module notes.
+fn simple_block_can_survive(b: ParityBlock, level: &dyn DecorationLevel, p: Pos) -> bool {
+    use ParityBlock::*;
+    let below = level.get_block(p.x, p.y - 1, p.z);
+    match b {
+        ShortGrass | Fern | TallGrass | LargeFern | Bush | SweetBerryBush | FireflyBush | Sunflower
+        | Lilac | RoseBush | Peony | Dandelion | Poppy | BlueOrchid | Allium | AzureBluet | RedTulip
+        | OrangeTulip | WhiteTulip | PinkTulip | OxeyeDaisy | Cornflower | LilyOfTheValley | PinkPetals
+        | ClosedEyeblossom | Wildflowers => supports_vegetation(below),
+        // `AzaleaBlock.mayPlaceOn` = `#dirt ∪ clay ∪ farmland`, plus (in lush caves)
+        // the moss floor it is scattered on.
+        Azalea | FloweringAzalea => supports_vegetation(below) || below == Clay,
+        ShortDryGrass | TallDryGrass | DeadBush => supports_dry_vegetation(below),
+        // `LeafLitterBlock.mayPlaceOn` = below face-sturdy up (approx `blocks_motion`).
+        LeafLitter => below.blocks_motion(),
+        // `CarpetBlock` / `MossyCarpetBlock` base: below must not be air.
+        MossCarpet | PaleMossCarpet => !below.is_air(),
+        // `MushroomBlock`: below `isSolidRender` and light < 13 (worldgen light is
+        // unpopulated → always < 13). Approx solid-render as `blocks_motion` and
+        // not `#leaves`.
+        BrownMushroom | RedMushroom => below.blocks_motion() && !below.is_leaves(),
+        // Full solid blocks with no plant survival override.
+        Pumpkin | Melon | MossBlock | PaleMossBlock => true,
+        // `LilyPadBlock.mayPlaceOn`: below is water or ice, own cell fluid empty
+        // (origin is filtered to air by placement → empty).
+        LilyPad => matches!(below, Water | Ice),
+        // `spore_blossom` is a ceiling block: the block above must be face-sturdy
+        // down (approx `blocks_motion`).
+        SporeBlossom => level.get_block(p.x, p.y + 1, p.z).blocks_motion(),
+        _ => true,
+    }
+}
+
+/// `SimpleBlockFeature.place`. Draws the state provider (may consume RNG), then
+/// the survival gate (no RNG); double plants place both halves, everything else a
+/// single block. `schedule_tick` is a sim concern (no block write) and omitted.
+fn place_simple_block(cfg: &SimpleBlockConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    let state = match cfg.to_place.get_state(ctx.level, random, origin) {
+        Some(s) => s,
+        None => return,
+    };
+    if !simple_block_can_survive(state, ctx.level, origin) {
+        return;
+    }
+    if is_double_plant(state) {
+        if !ctx.level.get_block(origin.x, origin.y + 1, origin.z).is_air() {
+            return;
+        }
+        ctx.level.set_block(origin.x, origin.y, origin.z, state);
+        ctx.level.set_block(origin.x, origin.y + 1, origin.z, state);
+    } else {
+        // `MossyCarpetBlock.placeAt` (pale_moss_carpet) draws 0–4 `nextBoolean`
+        // for wall-side toppers; on open worldgen ground no wall sides exist so it
+        // draws none — collapsed here to a plain carpet placement (documented).
+        ctx.level.set_block(origin.x, origin.y, origin.z, state);
+    }
+}
+
+/// `BlockColumnFeature.truncate`.
+fn block_column_truncate(heights: &mut [i32], total: i32, new_height: i32, prioritize_tip: bool) {
+    let mut to_remove = total - new_height;
+    let dir: i32 = if prioritize_tip { 1 } else { -1 };
+    let start: i32 = if prioritize_tip { 0 } else { heights.len() as i32 - 1 };
+    let end: i32 = if prioritize_tip { heights.len() as i32 } else { -1 };
+    let mut i = start;
+    while i != end && to_remove > 0 {
+        let this = heights[i as usize];
+        let r = this.min(to_remove);
+        to_remove -= r;
+        heights[i as usize] -= r;
+        i += dir;
+    }
+}
+
+/// `BlockColumnFeature.place`. Samples each layer's height (RNG), grows the column
+/// up to the first blocked cell (truncating), then fills the layers bottom-up.
+fn place_block_column(cfg: &BlockColumnConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    let n = cfg.layers.len();
+    let mut heights = vec![0i32; n];
+    let mut total = 0;
+    for i in 0..n {
+        heights[i] = cfg.layers[i].height.sample(random);
+        total += heights[i];
+    }
+    if total == 0 {
+        return;
+    }
+    let (dx, dy, dz) = cfg.dir;
+    let mut next = origin.offset(dx, dy, dz);
+    for y in 0..total {
+        if !cfg.allowed_placement.test(ctx.level, next) {
+            block_column_truncate(&mut heights, total, y, cfg.prioritize_tip);
+            break;
+        }
+        next = next.offset(dx, dy, dz);
+    }
+    let mut place = origin;
+    for i in 0..n {
+        for _ in 0..heights[i] {
+            if let Some(s) = cfg.layers[i].provider.get_state(ctx.level, random, place) {
+                ctx.level.set_block(place.x, place.y, place.z, s);
+            }
+            place = place.offset(dx, dy, dz);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BambooFeature / KelpFeature / SeagrassFeature / SeaPickleFeature / LakeFeature
+// ---------------------------------------------------------------------------
+
+/// `BambooFeature.place`. A bamboo stalk (collapsed to the `bamboo` default state
+/// for every segment) with an optional podzol disc.
+fn place_bamboo(probability: f32, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    use ParityBlock::*;
+    if !ctx.level.get_block(origin.x, origin.y, origin.z).is_air() {
+        return;
+    }
+    if !supports_bamboo(ctx.level.get_block(origin.x, origin.y - 1, origin.z)) {
+        return;
+    }
+    let height = random.next_int_bounded(12) + 5;
+    if random.next_float() < probability {
+        let r = random.next_int_bounded(4) + 1;
+        for xx in origin.x - r..=origin.x + r {
+            for zz in origin.z - r..=origin.z + r {
+                let xd = xx - origin.x;
+                let zd = zz - origin.z;
+                if xd * xd + zd * zd <= r * r {
+                    let hy = ctx.level.get_height(Heightmap::WorldSurface, xx, zz) - 1;
+                    if bamboo_podzol_replaceable(ctx.level.get_block(xx, hy, zz)) {
+                        ctx.level.set_block(xx, hy, zz, Podzol);
+                    }
+                }
+            }
+        }
+    }
+    let mut by = origin.y;
+    let mut i = 0;
+    while i < height && ctx.level.get_block(origin.x, by, origin.z).is_air() {
+        ctx.level.set_block(origin.x, by, origin.z, Bamboo);
+        by += 1;
+        i += 1;
+    }
+    if by - origin.y >= 3 {
+        // BAMBOO_FINAL_LARGE / BAMBOO_TOP_LARGE / BAMBOO_TOP_SMALL all collapse to
+        // the `bamboo` default state (leaves/stage properties dropped).
+        ctx.level.set_block(origin.x, by, origin.z, Bamboo);
+        by -= 1;
+        ctx.level.set_block(origin.x, by, origin.z, Bamboo);
+        by -= 1;
+        ctx.level.set_block(origin.x, by, origin.z, Bamboo);
+    }
+}
+
+/// Kelp survival (`GrowingPlantBlock.canSurvive`, growth up): the block below is
+/// kelp or a face-sturdy top (approx `blocks_motion`).
+fn kelp_can_survive(level: &dyn DecorationLevel, plant: Pos) -> bool {
+    use ParityBlock::*;
+    let below = level.get_block(plant.x, plant.y - 1, plant.z);
+    matches!(below, Kelp | KelpPlant) || below.blocks_motion()
+}
+
+/// `KelpFeature.place`.
+fn place_kelp(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    use ParityBlock::*;
+    let y = ctx.level.get_height(Heightmap::OceanFloor, origin.x, origin.z);
+    let mut pos = Pos::new(origin.x, y, origin.z);
+    if ctx.level.get_block(pos.x, pos.y, pos.z) != Water {
+        return;
+    }
+    let height = 1 + random.next_int_bounded(10);
+    for h in 0..=height {
+        let here = ctx.level.get_block(pos.x, pos.y, pos.z);
+        let above = ctx.level.get_block(pos.x, pos.y + 1, pos.z);
+        if here == Water && above == Water && kelp_can_survive(ctx.level, pos) {
+            if h == height {
+                let _age = random.next_int_bounded(4) + 20;
+                ctx.level.set_block(pos.x, pos.y, pos.z, Kelp);
+            } else {
+                ctx.level.set_block(pos.x, pos.y, pos.z, KelpPlant);
+            }
+        } else if h > 0 {
+            let below = Pos::new(pos.x, pos.y - 1, pos.z);
+            if kelp_can_survive(ctx.level, below) && ctx.level.get_block(below.x, below.y - 1, below.z) != Kelp {
+                let _age = random.next_int_bounded(4) + 20;
+                ctx.level.set_block(below.x, below.y, below.z, Kelp);
+            }
+            break;
+        }
+        pos = Pos::new(pos.x, pos.y + 1, pos.z);
+    }
+}
+
+/// `SeagrassFeature.place`.
+fn place_seagrass(probability: f32, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    use ParityBlock::*;
+    let x = random.next_int_bounded(8) - random.next_int_bounded(8);
+    let z = random.next_int_bounded(8) - random.next_int_bounded(8);
+    let y = ctx.level.get_height(Heightmap::OceanFloor, origin.x + x, origin.z + z);
+    let p = Pos::new(origin.x + x, y, origin.z + z);
+    if ctx.level.get_block(p.x, p.y, p.z) != Water {
+        return;
+    }
+    let is_tall = random.next_double() < probability as f64;
+    // Seagrass survival: below is face-sturdy up and not magma (approx blocks_motion).
+    if !ctx.level.get_block(p.x, p.y - 1, p.z).blocks_motion() {
+        return;
+    }
+    if is_tall {
+        if ctx.level.get_block(p.x, p.y + 1, p.z) == Water {
+            ctx.level.set_block(p.x, p.y, p.z, TallSeagrass);
+            ctx.level.set_block(p.x, p.y + 1, p.z, TallSeagrass);
+        }
+    } else {
+        ctx.level.set_block(p.x, p.y, p.z, Seagrass);
+    }
+}
+
+/// `SeaPickleFeature.place`. Per attempt: 4 position draws + 1 `pickles` draw
+/// (consumed unconditionally, before the water/survival gate).
+fn place_sea_pickle(count: &IntProvider, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    use ParityBlock::*;
+    let n = count.sample(random);
+    for _ in 0..n {
+        let x = random.next_int_bounded(8) - random.next_int_bounded(8);
+        let z = random.next_int_bounded(8) - random.next_int_bounded(8);
+        let y = ctx.level.get_height(Heightmap::OceanFloor, origin.x + x, origin.z + z);
+        let p = Pos::new(origin.x + x, y, origin.z + z);
+        let _pickles = random.next_int_bounded(4) + 1;
+        if ctx.level.get_block(p.x, p.y, p.z) == Water && ctx.level.get_block(p.x, p.y - 1, p.z).blocks_motion() {
+            ctx.level.set_block(p.x, p.y, p.z, SeaPickle);
+        }
+    }
+}
+
+/// `LakeFeature.place` (`lake_lava_*`). Builds an ellipsoid-union carve grid, does
+/// the border-integrity scan (may abort), fills fluid/air, then the barrier shell.
+/// `scheduleTick` / `markAboveForPostProcessing` are post/sim flags (no block
+/// write) and omitted. The water-ice pass never runs for lava lakes.
+fn place_lake(cfg: &LakeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    if origin.y <= ctx.level.min_y() + 4 {
+        return;
+    }
+    let base = origin.offset(-8, -4, -8);
+    let mut grid = [false; 2048];
+    let idx = |xx: i32, zz: i32, yy: i32| ((xx * 16 + zz) * 8 + yy) as usize;
+    let spots = random.next_int_bounded(4) + 4;
+    for _ in 0..spots {
+        let xr = random.next_double() * 6.0 + 3.0;
+        let yr = random.next_double() * 4.0 + 2.0;
+        let zr = random.next_double() * 6.0 + 3.0;
+        let xp = random.next_double() * (16.0 - xr - 2.0) + 1.0 + xr / 2.0;
+        let yp = random.next_double() * (8.0 - yr - 4.0) + 2.0 + yr / 2.0;
+        let zp = random.next_double() * (16.0 - zr - 2.0) + 1.0 + zr / 2.0;
+        for xx in 1..15 {
+            for zz in 1..15 {
+                for yy in 1..7 {
+                    let xd = (xx as f64 - xp) / (xr / 2.0);
+                    let yd = (yy as f64 - yp) / (yr / 2.0);
+                    let zd = (zz as f64 - zp) / (zr / 2.0);
+                    if xd * xd + yd * yd + zd * zd < 1.0 {
+                        grid[idx(xx, zz, yy)] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let fluid = match cfg.fluid.get_state(ctx.level, random, base) {
+        Some(f) => f,
+        None => return,
+    };
+
+    // Border-integrity scan.
+    let border = |grid: &[bool; 2048], xx: i32, zz: i32, yy: i32| -> bool {
+        !grid[idx(xx, zz, yy)]
+            && (xx < 15 && grid[idx(xx + 1, zz, yy)]
+                || xx > 0 && grid[idx(xx - 1, zz, yy)]
+                || zz < 15 && grid[idx(xx, zz + 1, yy)]
+                || zz > 0 && grid[idx(xx, zz - 1, yy)]
+                || yy < 7 && grid[idx(xx, zz, yy + 1)]
+                || yy > 0 && grid[idx(xx, zz, yy - 1)])
+    };
+    for xx in 0..16 {
+        for zz in 0..16 {
+            for yy in 0..8 {
+                if border(&grid, xx, zz, yy) {
+                    let op = base.offset(xx, yy, zz);
+                    let bs = ctx.level.get_block(op.x, op.y, op.z);
+                    if yy >= 4 && bs.is_fluid() {
+                        return;
+                    }
+                    if yy < 4 && !bs.blocks_motion() && bs != fluid {
+                        return;
+                    }
+                    // `can_place_feature` is `true` for the lava lakes.
+                }
+            }
+        }
+    }
+
+    // Fill pass.
+    for xx in 0..16 {
+        for zz in 0..16 {
+            for yy in 0..8 {
+                if grid[idx(xx, zz, yy)] {
+                    let pp = base.offset(xx, yy, zz);
+                    if cfg.can_replace_with_air_or_fluid.test(ctx.level, pp) {
+                        let state = if yy >= 4 { ParityBlock::Air } else { fluid };
+                        ctx.level.set_block(pp.x, pp.y, pp.z, state);
+                    }
+                }
+            }
+        }
+    }
+
+    // Barrier shell.
+    let barrier = match cfg.barrier.get_state(ctx.level, random, base) {
+        Some(b) => b,
+        None => return,
+    };
+    if !barrier.is_air() {
+        for xx in 0..16 {
+            for zz in 0..16 {
+                for yy in 0..8 {
+                    if border(&grid, xx, zz, yy) && (yy < 4 || random.next_int_bounded(2) != 0) {
+                        let op = base.offset(xx, yy, zz);
+                        let bs = ctx.level.get_block(op.x, op.y, op.z);
+                        if bs.blocks_motion() && cfg.can_replace_with_barrier.test(ctx.level, op) {
+                            ctx.level.set_block(op.x, op.y, op.z, barrier);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Lava fluid → the water-ice pass is skipped.
 }
 
 // ---------------------------------------------------------------------------
@@ -3424,7 +4007,7 @@ mod tests {
         assert!(matches!(registry.configured.get("oak"), Some(ConfiguredFeature::Tree(_))));
         assert!(matches!(registry.configured.get("trees_plains"), Some(ConfiguredFeature::RandomSelector(_))));
         // A feature type this milestone still defers stays `Deferred`.
-        assert!(!registry.configured.get("lake_lava").map(|c| c.is_implemented()).unwrap_or(true));
+        assert!(!registry.configured.get("amethyst_geode").map(|c| c.is_implemented()).unwrap_or(true));
     }
 
     // --- Tree feature structural tests ---------------------------------------
@@ -3789,5 +4372,205 @@ mod tests {
             writes
         };
         assert_eq!(run(), run(), "beehive tree deterministic");
+    }
+
+    // --- Vegetal-decoration feature tests ------------------------------------
+
+    fn simple_cfg(reg: &FeatureRegistry, id: &str) -> SimpleBlockConfig {
+        match reg.configured.get(id) {
+            Some(ConfiguredFeature::SimpleBlock(c)) => c.clone(),
+            other => panic!("{id} is not a simple_block: {other:?}"),
+        }
+    }
+
+    /// `grass` (short_grass) and `flower_default` (weighted poppy/dandelion) place
+    /// on a grass floor, are deterministic, and draw the weighted RNG for flowers.
+    #[test]
+    fn simple_block_grass_and_flowers() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:plains"]);
+        let grass = simple_cfg(&reg, "grass");
+        let flower = simple_cfg(&reg, "flower_default");
+        let run = |cfg: &SimpleBlockConfig, seed: i64| {
+            let mut level = tree_level(70);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_simple_block(cfg, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            level.get_block(8, 70, 8)
+        };
+        assert_eq!(run(&grass, 1), ShortGrass, "short grass placed on grass floor");
+        assert_eq!(run(&grass, 1), run(&grass, 1), "deterministic");
+        // The weighted provider yields one of poppy/dandelion, deterministically.
+        let f = run(&flower, 5);
+        assert!(matches!(f, Poppy | Dandelion), "flower_default is poppy or dandelion, got {f:?}");
+        assert_eq!(run(&flower, 5), f, "flower deterministic for a fixed seed");
+        // A plant does not survive on bare stone (no grass floor below).
+        let mut bare = TestLevel::new(70);
+        let idx = AllBiome;
+        let mut ctx = PlacementCtx { level: &mut bare, biome_index: &idx, top_feature: "t" };
+        let mut r = WorldgenRandom::new(RandomSource::xoroshiro(1));
+        place_simple_block(&grass, &mut ctx, &mut r, Pos::new(8, 70, 8));
+        assert_eq!(bare.get_block(8, 70, 8), Air, "grass fails to survive on bare stone (no soil)");
+    }
+
+    /// Double plants place both halves (collapsed to the default block).
+    #[test]
+    fn simple_block_double_plant_places_two_halves() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:plains"]);
+        let tall = simple_cfg(&reg, "tall_grass");
+        let mut level = tree_level(70);
+        let idx = AllBiome;
+        let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+        let mut random = WorldgenRandom::new(RandomSource::xoroshiro(3));
+        place_simple_block(&tall, &mut ctx, &mut random, Pos::new(8, 70, 8));
+        assert_eq!(level.get_block(8, 70, 8), TallGrass, "lower half");
+        assert_eq!(level.get_block(8, 71, 8), TallGrass, "upper half");
+    }
+
+    /// `cactus` (block_column) stacks cacti with a flower tip, deterministically;
+    /// the trunk height matches the replayed layer-height draws.
+    #[test]
+    fn block_column_cactus_stacks() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:desert"]);
+        let cactus = match reg.configured.get("cactus") {
+            Some(ConfiguredFeature::BlockColumn(c)) => c.clone(),
+            other => panic!("cactus is not a block_column: {other:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = tree_level(70);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_block_column(&cactus, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut writes: Vec<_> = level.blocks.into_iter().collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(9);
+        assert_eq!(a, run(9), "cactus column deterministic");
+        let cacti = a.iter().filter(|(_, b)| *b == Cactus).count();
+        assert!(cacti >= 1, "at least one cactus segment");
+        // The flower tip is a 1/4 weighted layer — find a seed that grows one.
+        let flower_seed = (0..64).find(|s| run(*s).iter().any(|(_, b)| *b == CactusFlower));
+        assert!(flower_seed.is_some(), "some seed places a cactus flower tip");
+        // Only cactus/cactus_flower written into the air column (plus grass floor).
+        for ((_, y, _), b) in &a {
+            if *y >= 70 {
+                assert!(matches!(b, Cactus | CactusFlower), "unexpected {b:?} in column");
+            }
+        }
+    }
+
+    /// Bamboo grows a stalk (collapsed `bamboo` segments) on a sand floor and lays
+    /// a podzol disc for the `some_podzol` variant; deterministic.
+    #[test]
+    fn bamboo_grows_stalk_and_podzol() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:bamboo_jungle"]);
+        let (prob, _) = match reg.configured.get("bamboo_some_podzol") {
+            Some(ConfiguredFeature::Bamboo { probability }) => (*probability, ()),
+            other => panic!("bamboo_some_podzol is not bamboo: {other:?}"),
+        };
+        assert!(prob > 0.0, "some_podzol has a non-zero podzol chance");
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(70);
+            for z in -8..24 {
+                for x in -8..24 {
+                    level.set_block(x, 69, z, ParityBlock::Sand);
+                }
+            }
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_bamboo(prob, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut writes: Vec<_> = level.blocks.into_iter().collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(2);
+        assert_eq!(a, run(2), "bamboo deterministic");
+        let stalk = a.iter().filter(|((x, _, z), b)| *x == 8 && *z == 8 && *b == Bamboo).count();
+        assert!(stalk >= 5, "a bamboo stalk at least 5 tall, got {stalk}");
+    }
+
+    /// A water column: stone below `floor`, water in `[floor, top)`.
+    fn water_level(floor: i32, top: i32) -> TestLevel {
+        let mut level = TestLevel::new(floor);
+        for z in -8..24 {
+            for x in -8..24 {
+                for y in floor..top {
+                    level.set_block(x, y, z, ParityBlock::Water);
+                }
+            }
+        }
+        level
+    }
+
+    /// Kelp and seagrass grow in a water column off the ocean floor; deterministic.
+    #[test]
+    fn kelp_and_seagrass_grow_in_water() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:ocean"]);
+        let run_kelp = |seed: i64| {
+            let mut level = water_level(60, 75);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_kelp(&mut ctx, &mut random, Pos::new(8, 60, 8));
+            level.blocks.values().filter(|b| matches!(b, Kelp | KelpPlant)).count()
+        };
+        assert!(run_kelp(4) > 0, "kelp grows off the floor");
+        assert_eq!(run_kelp(4), run_kelp(4), "kelp deterministic");
+
+        let (prob,) = match reg.configured.get("seagrass_short") {
+            Some(ConfiguredFeature::Seagrass { probability }) => (*probability,),
+            other => panic!("seagrass_short is not seagrass: {other:?}"),
+        };
+        let run_sg = |seed: i64| {
+            let mut level = water_level(60, 75);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_seagrass(prob, &mut ctx, &mut random, Pos::new(8, 60, 8));
+            let mut writes: Vec<_> = level.blocks.iter().filter(|(_, b)| matches!(b, Seagrass | TallSeagrass)).map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        // Sweep seeds to find one that lands seagrass, then assert determinism.
+        let seed = (0..64).find(|s| !run_sg(*s).is_empty()).expect("some seed places seagrass");
+        assert_eq!(run_sg(seed), run_sg(seed), "seagrass deterministic");
+    }
+
+    /// The lava lake carves an air/lava pocket underground, deterministically, and
+    /// never replaces bedrock.
+    #[test]
+    fn lake_lava_carves_pocket() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:plains"]);
+        let lake = match reg.configured.get("lake_lava") {
+            Some(ConfiguredFeature::Lake(c)) => c.clone(),
+            other => panic!("lake_lava is not a lake: {other:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(120); // solid stone through the lake band
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_lake(&lake, &mut ctx, &mut random, Pos::new(8, 40, 8));
+            let mut writes: Vec<_> = level.blocks.into_iter().collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(11);
+        assert_eq!(a, run(11), "lava lake deterministic");
+        assert!(a.iter().any(|(_, b)| *b == Lava), "lava fills the lower pocket");
+        assert!(a.iter().any(|(_, b)| *b == Air), "air caps the pocket");
+        // Only lava / air / stone-barrier written (no bedrock replaced — none present).
+        for (_, b) in &a {
+            assert!(matches!(b, Lava | Air | Stone), "unexpected lake block {b:?}");
+        }
     }
 }

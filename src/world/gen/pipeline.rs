@@ -1291,6 +1291,68 @@ mod tests {
         assert!(props > 0, "the attached_to_leaves decorator hung propagules");
     }
 
+    /// Vegetal decoration reaches the live world: the forested/grassy seed-0
+    /// origin region grows grass and flowers (the `simple_block` feature driven by
+    /// its placement chain), deterministically. Guards the vegetation wiring
+    /// against silently dropping back out of the live pipeline.
+    #[test]
+    fn live_features_grow_grass_and_flowers() {
+        use ParityBlock::*;
+        let scan = || {
+            let mut p = ChunkPipeline::new_overworld(0);
+            let (mut grass, mut flowers) = (0u64, 0u64);
+            for cz in -2..2 {
+                for cx in -2..2 {
+                    let fc = p.feature_extract(cx, cz).blocks.expect("featured blocks");
+                    grass += fc.blocks.iter().filter(|b| matches!(b, ShortGrass | Fern | TallGrass | LargeFern)).count() as u64;
+                    flowers += fc
+                        .blocks
+                        .iter()
+                        .filter(|b| {
+                            matches!(
+                                b,
+                                Dandelion | Poppy | Allium | AzureBluet | RedTulip | OrangeTulip | WhiteTulip
+                                    | PinkTulip | OxeyeDaisy | Cornflower | LilyOfTheValley | BlueOrchid
+                            )
+                        })
+                        .count() as u64;
+                }
+            }
+            (grass, flowers)
+        };
+        let (grass, flowers) = scan();
+        assert!(grass > 0, "the live FEATURES path placed grass/ferns");
+        assert!(flowers > 0, "flowers bloom in the live pipeline");
+        assert_eq!(scan(), (grass, flowers), "the featured vegetation output is deterministic");
+    }
+
+    /// Sea vegetation reaches the live world: seed 0x5EEDC0DE's mangrove-swamp /
+    /// ocean region around chunk (7, -12) has water columns, so the live FEATURES
+    /// path grows seagrass and/or kelp there, deterministically. Guards the
+    /// `kelp`/`seagrass` wiring.
+    #[test]
+    fn live_features_grow_sea_vegetation() {
+        use ParityBlock::*;
+        let scan = || {
+            let mut p = ChunkPipeline::new_overworld(1592639710);
+            let mut sea = 0u64;
+            for cz in -16..-6 {
+                for cx in 2..12 {
+                    let fc = p.feature_extract(cx, cz).blocks.expect("featured blocks");
+                    sea += fc
+                        .blocks
+                        .iter()
+                        .filter(|b| matches!(b, Seagrass | TallSeagrass | Kelp | KelpPlant | SeaPickle))
+                        .count() as u64;
+                }
+            }
+            sea
+        };
+        let sea = scan();
+        assert!(sea > 0, "the live FEATURES path grew sea vegetation");
+        assert_eq!(scan(), sea, "the featured sea vegetation output is deterministic");
+    }
+
     /// The live FEATURES path (`feature_extract`) is a pure function of the seed:
     /// the featured center is byte-identical whether or not other chunks were
     /// served first. This is the invariant that keeps `generate_full` safe for
