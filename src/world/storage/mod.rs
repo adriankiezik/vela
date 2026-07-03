@@ -22,7 +22,7 @@
 mod chunk_nbt;
 pub mod level_dat;
 pub mod player_dat;
-mod region;
+pub mod region;
 
 use std::collections::HashMap;
 use std::io::{self, Write};
