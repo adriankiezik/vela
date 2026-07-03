@@ -351,6 +351,7 @@ impl ChunkPyramid {
 /// bottom-up, 4×4×4 quart biomes at container index `(y·4 + z)·4 + x`);
 /// `blocks` appears at NOISE and is mutated in place by SURFACE (and, later,
 /// CARVERS/FEATURES).
+#[derive(Clone)]
 pub struct ProtoChunk {
     pub pos: (i32, i32),
     pub status: ChunkStatus,
@@ -761,6 +762,106 @@ impl ChunkPipeline {
             sea_level,
         }
     }
+
+    /// Run the FEATURES decoration for chunk `pos` over `chunks` — a scratch map
+    /// (not `self.chunks`) holding the CARVERS-state neighborhood. Identical to
+    /// the staged FEATURES `run_step` branch, but parameterized over the map so a
+    /// served chunk can be decorated in isolation without ever featuring the
+    /// shared cache (which must stay a pure, radius-0 CARVERS function — see
+    /// [`Self::feature_extract`]). Borrows `self` immutably (settings + registry)
+    /// alongside the separate `&mut chunks`.
+    fn decorate_into(&self, chunks: &mut HashMap<(i32, i32), ProtoChunk>, pos: (i32, i32)) {
+        let settings = &self.generator.inner.random_state.settings;
+        let noise = settings.noise;
+        let (min_y, height, sea_level, seed) = (noise.min_y, noise.height, settings.sea_level, self.seed);
+        let registry = overworld_feature_registry(&self.generator.source);
+        let step = ChunkPyramid::generation().step_to(ChunkStatus::Features);
+
+        // `possibleBiomes`: every fill value in the 3×3 neighborhood's stored
+        // biome sections (exactly the staged FEATURES step's union).
+        let mut possible: HashSet<u16> = HashSet::new();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if let Some(chunk) = chunks.get(&(pos.0 + dx, pos.1 + dz)) {
+                    if let Some(sections) = &chunk.biome_sections {
+                        for section in sections {
+                            possible.extend(section.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut region =
+            WorldGenRegion { chunks, center: pos, step, min_y, height, seed, sea_level };
+        features::apply_biome_decoration(registry, &mut region, &possible, seed, pos.0 * 16, pos.1 * 16);
+    }
+
+    /// Produce the fully-featured center chunk `(cx, cz)` for the live world.
+    ///
+    /// FEATURES has `blockStateWriteRadius` 1, so `(cx, cz)`'s final blocks are
+    /// the union of its own decoration and every one of its 8 neighbors'
+    /// decoration writing into it. The naive fix — feature the shared cache in
+    /// place and serve at FULL — is unusable here: (a) the live column loader
+    /// (`ChunkData::from_grid`) regenerates the baseline on *every* load and
+    /// stores edits as a diff against it, so `generate_full` MUST be a
+    /// deterministic pure function of the seed, but in-place cross-chunk feature
+    /// writes make a chunk's blocks depend on the order neighbors decorate into
+    /// it; and (b) `advance(_, Full)` pulls a 17×17 neighborhood
+    /// (`structure_starts` radius 8), so per-serve regeneration is far too slow.
+    ///
+    /// Instead: bring the 5×5 to CARVERS in the shared cache (safe to amortize —
+    /// CARVERS is write-radius 0, a pure function of the seed), then **clone** it
+    /// and decorate the 3×3 on the copy in a fixed order — the center first, then
+    /// the distance-1 ring in `dz`-outer/`dx`-inner order. Every serve clones the
+    /// identical CARVERS base and applies the identical decoration order, so the
+    /// featured center is a pure function of the seed (the invariant
+    /// `from_grid` needs); the shared cache is never featured, so it stays pure
+    /// and keeps amortizing across serves. A cross-border feature is captured in
+    /// full for the chunk it overhangs into, because that neighbor is one of the
+    /// 3×3 decorated here.
+    ///
+    /// KNOWN GAP (not yet vanilla-exact, deferred to the serve-once lifecycle +
+    /// `.mca` diff): the decoration order here is per-serve-local, not the global
+    /// chunk-generation order. When serving C the center decorates first (reading
+    /// clean CARVERS); when serving a neighbor N the same center decorates
+    /// mid-sequence (reading N's partial writes). If a cross-border feature's
+    /// placement validity depends on those differing reads, the two serves can
+    /// disagree on that feature — a possible seam at chunk boundaries. Ores,
+    /// springs, disks, and any feature that stays within one chunk are unaffected
+    /// (no cross-border read/write); most trees place identically (trunk validity
+    /// keys off the CARVERS ground, which is shared). Border-exactness needs each
+    /// chunk decorated exactly once in global order — the full FULL-lifecycle
+    /// integration tracked in docs/WORLDGEN_PARITY.md.
+    fn feature_extract(&mut self, cx: i32, cz: i32) -> ProtoChunk {
+        // 1. Base terrain: the 5×5 at CARVERS. Features read/write radius 1 from
+        //    each of the 3×3, reaching distance 2. Amortized by the shared cache.
+        for dz in -2..=2 {
+            for dx in -2..=2 {
+                self.advance(cx + dx, cz + dz, ChunkStatus::Carvers);
+            }
+        }
+        // 2. Clone the 5×5 CARVERS neighborhood into a scratch map.
+        let mut scratch: HashMap<(i32, i32), ProtoChunk> = HashMap::with_capacity(25);
+        for dz in -2..=2 {
+            for dx in -2..=2 {
+                let p = (cx + dx, cz + dz);
+                scratch.insert(p, self.chunks[&p].clone());
+            }
+        }
+        // 3. Decorate the 3×3 into the copy in canonical order: center, then the
+        //    distance-1 ring. Each chunk's radius-1 writes/reads stay inside the
+        //    5×5, and later chunks see earlier writes exactly as the staged pass.
+        self.decorate_into(&mut scratch, (cx, cz));
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if dx != 0 || dz != 0 {
+                    self.decorate_into(&mut scratch, (cx + dx, cz + dz));
+                }
+            }
+        }
+        scratch.remove(&(cx, cz)).expect("center chunk resident in scratch")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -823,41 +924,30 @@ fn with_pipeline<R>(f: impl FnOnce(&mut ChunkPipeline) -> R) -> R {
 const PROTO_CACHE_LIMIT: usize = 320;
 const PROTO_KEEP_RADIUS: i32 = 8;
 
-/// The status the live path generates to. Held at CARVERS: caves/ravines
-/// (P7 carvers) now run in the live world. CARVERS has `blockStateWriteRadius`
-/// 0 — it only mutates its own chunk — so a chunk extracted at this status is a
-/// deterministic pure function of the seed, unaffected by generation/cache
-/// order.
+/// The shared cache is held at CARVERS: caves/ravines (P7) run and, crucially,
+/// CARVERS has `blockStateWriteRadius` 0 — it only mutates its own chunk — so a
+/// cached proto is a deterministic pure function of the seed, unaffected by
+/// generation/cache/eviction order. That is what makes the trail-trim eviction
+/// above sound. FEATURES (write radius 1) is applied per serve on an isolated
+/// clone of the neighborhood ([`ChunkPipeline::feature_extract`]) and is never
+/// written back into the shared cache, so the cache's purity is preserved.
 ///
 /// Heightmap handling matches vanilla across the surface→carvers boundary
 /// (verified against `ChunkStatusTasks`/`Heightmap.primeHeightmaps`): the WG
 /// heightmaps (`OCEAN_FLOOR_WG`/`WORLD_SURFACE_WG`) are built at NOISE and are
 /// **not** re-primed after carving — vanilla's carvers touch only the FINAL
 /// heightmaps, and the WG pair keeps its pre-carve value (which is what
-/// `surface_height`/spawn read).
+/// `surface_height`/spawn read). Light/spawn/FULL stay no-ops (Vela lights at
+/// encode time, spawns in the sim).
 ///
-/// FEATURES is deliberately **not** live yet. It has write radius 1 (a chunk's
-/// decoration writes into its neighbors), so a chunk cannot be served until its
-/// whole 3×3 neighborhood has completed FEATURES — vanilla's FULL requirement.
-/// Vela's live path generates on demand and *consumes* the center proto (then
-/// trims the cache), so a served chunk would (a) miss the feature writes its
-/// not-yet-featured neighbors owe it, and (b) on re-serve regenerate fresh while
-/// those neighbors won't re-run features into it — order-dependent, non-
-/// deterministic output. Making FEATURES live therefore needs the real chunk-
-/// lifecycle finalization (serve at FULL, hold protos resident until the
-/// neighborhood is featured, run each chunk's features exactly once) — the
-/// live-pipeline integration the roadmap defers. Tracked in docs/WORLDGEN_PARITY.md.
-/// Light/spawn/FULL stay no-ops (Vela lights at encode time, spawns in the sim).
-const LIVE_TARGET: ChunkStatus = ChunkStatus::Carvers;
-
-/// Generate chunk `(cx, cz)` through the pipeline (to [`LIVE_TARGET`]) and
-/// extract it. The consumed proto leaves the cache (its data moves into the
-/// returned `ParityChunk`); partially generated neighbors stay resident so
-/// the dependency pyramid amortizes as the player moves.
+/// Generate chunk `(cx, cz)` through the pipeline — CARVERS base terrain in the
+/// shared cache, then FEATURES decoration on an isolated copy (see
+/// [`ChunkPipeline::feature_extract`]) — and extract it. The shared cache keeps
+/// its CARVERS-state protos resident so the dependency pyramid amortizes as the
+/// player moves; the featured center is a pure function of the seed.
 pub fn generate_full(cx: i32, cz: i32) -> ParityChunk {
     with_pipeline(|pipeline| {
-        pipeline.advance(cx, cz, LIVE_TARGET);
-        let proto = pipeline.chunks.remove(&(cx, cz)).expect("chunk just advanced");
+        let proto = pipeline.feature_extract(cx, cz);
         let blocks = proto.blocks.expect("surfaced chunk has blocks");
         let sections = proto.biome_sections.expect("surfaced chunk has biomes");
 
@@ -986,6 +1076,37 @@ mod tests {
         let after = feat.chunk(0, 0).unwrap().blocks.as_ref().unwrap().blocks.clone();
 
         assert_ne!(before, after, "decoration changed the center chunk");
+    }
+
+    /// The live FEATURES path (`feature_extract`) is a pure function of the seed:
+    /// the featured center is byte-identical whether or not other chunks were
+    /// served first. This is the invariant that keeps `generate_full` safe for
+    /// the column loader, which diffs saved edits against a *regenerated*
+    /// baseline (`ChunkData::from_grid`) — a serve-order-dependent baseline would
+    /// silently corrupt saved worlds. It also confirms the pass actually
+    /// decorates (the featured center differs from the CARVERS-only blocks).
+    #[test]
+    fn feature_extract_is_serve_order_independent() {
+        let seed = 4242;
+        // Cold: a fresh pipeline serves (0, 0) directly.
+        let mut cold = ChunkPipeline::new_overworld(seed);
+        let a = cold.feature_extract(0, 0).blocks.expect("featured blocks");
+
+        // Warm: serve a spread of other chunks first, then (0, 0). The shared
+        // CARVERS cache is populated and trail state differs, yet the featured
+        // center must be identical.
+        let mut warm = ChunkPipeline::new_overworld(seed);
+        for (cx, cz) in [(5, 5), (-3, 2), (1, -4), (0, 1), (-1, -1), (2, 2)] {
+            let _ = warm.feature_extract(cx, cz);
+        }
+        let b = warm.feature_extract(0, 0).blocks.expect("featured blocks");
+        assert_eq!(a.blocks, b.blocks, "featured center is independent of serve order");
+
+        // It genuinely decorated: the featured center differs from CARVERS-only.
+        let mut carv = ChunkPipeline::new_overworld(seed);
+        carv.advance(0, 0, Carvers);
+        let base = carv.chunk(0, 0).unwrap().blocks.as_ref().unwrap().blocks.clone();
+        assert_ne!(a.blocks, base, "decoration wrote blocks into the center");
     }
 
     /// The vanilla GENERATION_PYRAMID dependency tables, derived by hand from
