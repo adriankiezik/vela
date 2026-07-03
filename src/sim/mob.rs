@@ -2117,12 +2117,19 @@ mod tests {
         // A pig spawned in the air over the generated surface falls, lands, and
         // its movement/landing is broadcast to a viewer.
         let mut world = world_with_id();
-        let sy = crate::world::surface_height(0, 0);
         // The collision `is_solid` is now non-generating: it treats a cold column
         // as solid, so a mob only falls through a *resident* one. In production the
         // mob's chunk is loaded; warm it here so the fall reaches the surface
         // instead of the pig resting in mid-air over an ungenerated column.
         let _ = crate::world::chunk_columns(0, 0);
+        // The landing floor is the topmost non-air block in the column — `is_solid`
+        // treats every non-air state as an obstacle, so a tree canopy over the
+        // terrain (the default seed grows mangroves near the origin) is what the
+        // pig actually comes to rest on, not the terrain surface below it.
+        let sy = (crate::world::MIN_Y..crate::world::MIN_Y + crate::world::SECTION_COUNT * 16)
+            .rev()
+            .find(|&y| crate::world::block_state_at(0, y, 0) != crate::world::AIR_STATE)
+            .expect("column has ground");
         let mut rx = spawn_viewer(&mut world, &[(0, 0)]);
         spawn_mob(&mut world, MobKind::Pig, (0.5, (sy + 10) as f64, 0.5));
         let _ = drain(&mut rx); // discard the spawn pair
