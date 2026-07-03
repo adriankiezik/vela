@@ -20,7 +20,7 @@ use super::density::ParityBlock;
 use super::random::WorldgenRandom;
 
 /// A block position (`BlockPos`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Pos {
     pub x: i32,
     pub y: i32,
@@ -33,6 +33,21 @@ impl Pos {
     }
     pub fn at_y(self, y: i32) -> Self {
         Self { y, ..self }
+    }
+    pub fn above(self, n: i32) -> Self {
+        Self { y: self.y + n, ..self }
+    }
+    pub fn below(self) -> Self {
+        Self { y: self.y - 1, ..self }
+    }
+    pub fn east(self) -> Self {
+        Self { x: self.x + 1, ..self }
+    }
+    pub fn south(self) -> Self {
+        Self { z: self.z + 1, ..self }
+    }
+    pub fn offset(self, dx: i32, dy: i32, dz: i32) -> Self {
+        Self { x: self.x + dx, y: self.y + dy, z: self.z + dz }
     }
 }
 
@@ -446,6 +461,23 @@ pub enum BlockTag {
     StoneOreReplaceables,
     DeepslateOreReplaceables,
     BaseStoneOverworld,
+    /// `#minecraft:logs` — over the parity alphabet, the plain overworld logs.
+    Logs,
+    /// `#minecraft:leaves`.
+    Leaves,
+    /// `#minecraft:dirt`.
+    Dirt,
+    /// `#minecraft:replaceable_by_trees` (leaves ∪ vegetation ∪ water; only the
+    /// parity-alphabet members: leaves and water — air is handled separately by
+    /// `TreeFeature.validTreePos`).
+    ReplaceableByTrees,
+    /// `#minecraft:cannot_replace_below_tree_trunk`.
+    CannotReplaceBelowTreeTrunk,
+    /// `#minecraft:supports_vegetation` (sapling floor — used by `would_survive`).
+    SupportsVegetation,
+    /// `#minecraft:air` — not a vanilla tag, but lets `matching_block_tag`/vegetation
+    /// predicates resolve air instead of silently failing.
+    Air,
 }
 
 impl BlockTag {
@@ -454,6 +486,13 @@ impl BlockTag {
             "stone_ore_replaceables" => BlockTag::StoneOreReplaceables,
             "deepslate_ore_replaceables" => BlockTag::DeepslateOreReplaceables,
             "base_stone_overworld" => BlockTag::BaseStoneOverworld,
+            "logs" => BlockTag::Logs,
+            "leaves" => BlockTag::Leaves,
+            "dirt" => BlockTag::Dirt,
+            "replaceable_by_trees" => BlockTag::ReplaceableByTrees,
+            "cannot_replace_below_tree_trunk" => BlockTag::CannotReplaceBelowTreeTrunk,
+            "supports_vegetation" => BlockTag::SupportsVegetation,
+            "air" => BlockTag::Air,
             _ => return None,
         })
     }
@@ -466,6 +505,13 @@ impl BlockTag {
             BlockTag::BaseStoneOverworld => {
                 matches!(b, Stone | Granite | Diorite | Andesite | Tuff | Deepslate)
             }
+            BlockTag::Logs => matches!(b, OakLog | BirchLog | SpruceLog | DarkOakLog),
+            BlockTag::Leaves => b.is_leaves(),
+            BlockTag::Dirt => matches!(b, Dirt | CoarseDirt),
+            BlockTag::ReplaceableByTrees => b.is_leaves() || matches!(b, Water),
+            BlockTag::CannotReplaceBelowTreeTrunk => matches!(b, Dirt | CoarseDirt | Podzol),
+            BlockTag::SupportsVegetation => matches!(b, GrassBlock | Dirt | CoarseDirt | Podzol),
+            BlockTag::Air => b.is_air(),
         }
     }
 }
@@ -487,6 +533,12 @@ pub enum BlockPredicate {
     Replaceable { offset: (i32, i32, i32) },
     Solid { offset: (i32, i32, i32) },
     InsideWorldBounds { offset: (i32, i32, i32) },
+    /// `would_survive` — restricted to the sapling states the tree placed
+    /// features use: `state.canSurvive(pos)` for a sapling reduces to "the block
+    /// below is in `#supports_vegetation`" (`VegetationBlock.mayPlaceOn`). Any
+    /// non-sapling state is conservative (`false`), matching the deferred-only
+    /// note on the other unsupported predicates.
+    WouldSurvive { sapling: bool, offset: (i32, i32, i32) },
     Not(Box<BlockPredicate>),
     AllOf(Vec<BlockPredicate>),
     AnyOf(Vec<BlockPredicate>),
@@ -533,6 +585,11 @@ impl BlockPredicate {
             "replaceable" => BlockPredicate::Replaceable { offset: off },
             "solid" => BlockPredicate::Solid { offset: off },
             "inside_world_bounds" => BlockPredicate::InsideWorldBounds { offset: off },
+            "would_survive" => {
+                let name = v["state"]["Name"].as_str().unwrap_or("");
+                let sapling = name.strip_prefix("minecraft:").unwrap_or(name).ends_with("_sapling");
+                BlockPredicate::WouldSurvive { sapling, offset: off }
+            }
             "not" => BlockPredicate::Not(Box::new(BlockPredicate::parse(&v["predicate"]))),
             "all_of" => BlockPredicate::AllOf(
                 v["predicates"].as_array().unwrap_or(&vec![]).iter().map(BlockPredicate::parse).collect(),
@@ -561,6 +618,15 @@ impl BlockPredicate {
             BlockPredicate::Solid { offset } => at(*offset).blocks_motion(),
             BlockPredicate::InsideWorldBounds { offset } => {
                 !level.is_outside_build_height(pos.y + offset.1)
+            }
+            BlockPredicate::WouldSurvive { sapling, offset } => {
+                if !*sapling {
+                    return false;
+                }
+                let bx = pos.x + offset.0;
+                let by = pos.y + offset.1;
+                let bz = pos.z + offset.2;
+                BlockTag::SupportsVegetation.contains(level.get_block(bx, by - 1, bz))
             }
             BlockPredicate::Not(p) => !p.test(level, pos),
             BlockPredicate::AllOf(ps) => ps.iter().all(|p| p.test(level, pos)),

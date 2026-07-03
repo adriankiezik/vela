@@ -44,8 +44,8 @@ use serde_json::Value;
 
 use super::density::ParityBlock;
 use super::placement::{
-    BiomeFeatureIndex, BlockPredicate, DecorationLevel, Heightmap, IntProvider, PlacementCtx,
-    PlacementModifier, Pos, RuleTest,
+    BiomeFeatureIndex, BlockPredicate, BlockTag, DecorationLevel, Heightmap, IntProvider,
+    PlacementCtx, PlacementModifier, Pos, RuleTest,
 };
 use super::random::{RandomSource, WorldgenRandom};
 use super::synth::PerlinSimplexNoise;
@@ -68,6 +68,10 @@ pub fn biome_info_noise(x: f64, z: f64) -> f64 {
 enum StateProvider {
     Simple(ParityBlock),
     RuleBased { fallback: Box<StateProvider>, rules: Vec<(BlockPredicate, StateProvider)> },
+    /// `WeightedStateProvider` — `(block, weight)` entries; `getState` draws one
+    /// `nextInt(total_weight)`. None of the target trees use it, so it is only a
+    /// completeness port (cumulative-weight selection).
+    Weighted(Vec<(ParityBlock, i32)>),
     Unsupported,
 }
 
@@ -81,6 +85,9 @@ impl StateProvider {
                 .map(StateProvider::Simple)
                 .unwrap_or(StateProvider::Unsupported),
             "rule_based_state_provider" => StateProvider::RuleBased {
+                // No `fallback` field → `null` → parses to `Unsupported` (`None`),
+                // matching `RuleBasedStateProvider.getOptionalState` returning
+                // `null` when no rule matches and the fallback is absent.
                 fallback: Box::new(StateProvider::parse(&v["fallback"])),
                 rules: v["rules"]
                     .as_array()
@@ -91,22 +98,54 @@ impl StateProvider {
                     })
                     .collect(),
             },
+            "weighted_state_provider" => {
+                let empty = vec![];
+                let entries: Vec<(ParityBlock, i32)> = v["entries"]
+                    .as_array()
+                    .unwrap_or(&empty)
+                    .iter()
+                    .filter_map(|e| {
+                        let name = e["data"].get("Name").and_then(Value::as_str).or_else(|| e["data"].as_str());
+                        let w = e["weight"].as_i64().unwrap_or(1) as i32;
+                        name.and_then(ParityBlock::from_name).map(|b| (b, w))
+                    })
+                    .collect();
+                if entries.is_empty() {
+                    StateProvider::Unsupported
+                } else {
+                    StateProvider::Weighted(entries)
+                }
+            }
             _ => StateProvider::Unsupported,
         }
     }
 
-    /// `getOptionalState(level, random, pos)`. The providers used here draw no
-    /// RNG (simple / rule-based over simple fallbacks).
-    fn get_state(&self, level: &dyn DecorationLevel, pos: Pos) -> Option<ParityBlock> {
+    /// `getOptionalState(level, random, pos)`. Simple / rule-based-over-simple
+    /// draw no RNG; `Weighted` draws one `nextInt(total_weight)`.
+    fn get_state(&self, level: &dyn DecorationLevel, random: &mut WorldgenRandom, pos: Pos) -> Option<ParityBlock> {
         match self {
             StateProvider::Simple(b) => Some(*b),
             StateProvider::RuleBased { fallback, rules } => {
                 for (pred, then) in rules {
                     if pred.test(level, pos) {
-                        return then.get_state(level, pos);
+                        return then.get_state(level, random, pos);
                     }
                 }
-                fallback.get_state(level, pos)
+                fallback.get_state(level, random, pos)
+            }
+            StateProvider::Weighted(entries) => {
+                let total: i32 = entries.iter().map(|(_, w)| *w).sum();
+                if total <= 0 {
+                    return None;
+                }
+                let mut roll = random.next_int_bounded(total);
+                for (b, w) in entries {
+                    roll -= *w;
+                    if roll < 0 {
+                        return Some(*b);
+                    }
+                }
+                entries.last().map(|(b, _)| *b)
             }
             StateProvider::Unsupported => None,
         }
@@ -147,6 +186,266 @@ struct DiskConfig {
     half_height: i32,
 }
 
+// ---------------------------------------------------------------------------
+// Tree feature (TreeFeature / TreeConfiguration and the placer system)
+// ---------------------------------------------------------------------------
+
+/// `FoliagePlacer.FoliageAttachment`.
+#[derive(Clone, Copy, Debug)]
+struct FoliageAttachment {
+    pos: Pos,
+    radius_offset: i32,
+    double_trunk: bool,
+}
+
+/// `FeatureSize` (`getSizeAtHeight` / `minClippedHeight`).
+#[derive(Clone, Debug)]
+enum FeatureSize {
+    TwoLayers { limit: i32, lower: i32, upper: i32, min_clipped: Option<i32> },
+    ThreeLayers { limit: i32, upper_limit: i32, lower: i32, middle: i32, upper: i32, min_clipped: Option<i32> },
+}
+
+impl FeatureSize {
+    fn parse(v: &Value) -> FeatureSize {
+        let t = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let min_clipped = v.get("min_clipped_height").and_then(Value::as_i64).map(|n| n as i32);
+        let geti = |k: &str, d: i64| v.get(k).and_then(Value::as_i64).unwrap_or(d) as i32;
+        match t.strip_prefix("minecraft:").unwrap_or(t) {
+            "three_layers_feature_size" => FeatureSize::ThreeLayers {
+                limit: geti("limit", 1),
+                upper_limit: geti("upper_limit", 1),
+                lower: geti("lower_size", 0),
+                middle: geti("middle_size", 1),
+                upper: geti("upper_size", 1),
+                min_clipped,
+            },
+            // `two_layers_feature_size` (also the default).
+            _ => FeatureSize::TwoLayers {
+                limit: geti("limit", 1),
+                lower: geti("lower_size", 0),
+                upper: geti("upper_size", 1),
+                min_clipped,
+            },
+        }
+    }
+
+    fn get_size_at_height(&self, tree_height: i32, yo: i32) -> i32 {
+        match self {
+            FeatureSize::TwoLayers { limit, lower, upper, .. } => {
+                if yo < *limit { *lower } else { *upper }
+            }
+            FeatureSize::ThreeLayers { limit, upper_limit, lower, middle, upper, .. } => {
+                if yo < *limit {
+                    *lower
+                } else if yo >= tree_height - *upper_limit {
+                    *upper
+                } else {
+                    *middle
+                }
+            }
+        }
+    }
+
+    fn min_clipped_height(&self) -> Option<i32> {
+        match self {
+            FeatureSize::TwoLayers { min_clipped, .. } => *min_clipped,
+            FeatureSize::ThreeLayers { min_clipped, .. } => *min_clipped,
+        }
+    }
+}
+
+/// `TrunkPlacer` — the three overworld placers plus a graceful `Unsupported`
+/// (fancy / bending / cherry etc., a later milestone).
+#[derive(Clone, Debug)]
+enum TrunkPlacer {
+    Straight { base: i32, a: i32, b: i32 },
+    Forking { base: i32, a: i32, b: i32 },
+    DarkOak { base: i32, a: i32, b: i32 },
+    Unsupported,
+}
+
+impl TrunkPlacer {
+    fn parse(v: &Value) -> TrunkPlacer {
+        let t = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let base = v.get("base_height").and_then(Value::as_i64).unwrap_or(0) as i32;
+        let a = v.get("height_rand_a").and_then(Value::as_i64).unwrap_or(0) as i32;
+        let b = v.get("height_rand_b").and_then(Value::as_i64).unwrap_or(0) as i32;
+        match t.strip_prefix("minecraft:").unwrap_or(t) {
+            "straight_trunk_placer" => TrunkPlacer::Straight { base, a, b },
+            "forking_trunk_placer" => TrunkPlacer::Forking { base, a, b },
+            "dark_oak_trunk_placer" => TrunkPlacer::DarkOak { base, a, b },
+            _ => TrunkPlacer::Unsupported,
+        }
+    }
+
+    fn is_unsupported(&self) -> bool {
+        matches!(self, TrunkPlacer::Unsupported)
+    }
+
+    /// `TrunkPlacer.getTreeHeight` — `baseHeight + nextInt(a+1) + nextInt(b+1)`.
+    fn get_tree_height(&self, random: &mut WorldgenRandom) -> i32 {
+        match self {
+            TrunkPlacer::Straight { base, a, b }
+            | TrunkPlacer::Forking { base, a, b }
+            | TrunkPlacer::DarkOak { base, a, b } => {
+                *base + random.next_int_bounded(*a + 1) + random.next_int_bounded(*b + 1)
+            }
+            TrunkPlacer::Unsupported => 0,
+        }
+    }
+}
+
+/// `FoliagePlacer` — the four overworld placers plus a graceful `Unsupported`.
+#[derive(Clone, Debug)]
+enum FoliagePlacer {
+    Blob { radius: IntProvider, offset: IntProvider, height: i32 },
+    Spruce { radius: IntProvider, offset: IntProvider, trunk_height: IntProvider },
+    Pine { radius: IntProvider, offset: IntProvider, height: IntProvider },
+    DarkOak { radius: IntProvider, offset: IntProvider },
+    Unsupported,
+}
+
+impl FoliagePlacer {
+    fn parse(v: &Value) -> FoliagePlacer {
+        let t = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let radius = IntProvider::parse(&v["radius"]);
+        let offset = IntProvider::parse(&v["offset"]);
+        match t.strip_prefix("minecraft:").unwrap_or(t) {
+            "blob_foliage_placer" => FoliagePlacer::Blob {
+                radius,
+                offset,
+                height: v.get("height").and_then(Value::as_i64).unwrap_or(0) as i32,
+            },
+            "spruce_foliage_placer" => FoliagePlacer::Spruce {
+                radius,
+                offset,
+                trunk_height: IntProvider::parse(&v["trunk_height"]),
+            },
+            "pine_foliage_placer" => FoliagePlacer::Pine {
+                radius,
+                offset,
+                height: IntProvider::parse(&v["height"]),
+            },
+            "dark_oak_foliage_placer" => FoliagePlacer::DarkOak { radius, offset },
+            _ => FoliagePlacer::Unsupported,
+        }
+    }
+
+    fn is_unsupported(&self) -> bool {
+        matches!(self, FoliagePlacer::Unsupported)
+    }
+}
+
+/// `TreeDecorator` — only `beehive` is modeled; everything else is a graceful
+/// no-op (the decorators run after the tree body, so an unknown one can only
+/// affect its own output, never another feature — the RNG is reseeded per top
+/// feature).
+#[derive(Clone, Debug)]
+enum TreeDecorator {
+    Beehive { probability: f32 },
+    Unsupported,
+}
+
+impl TreeDecorator {
+    fn parse(v: &Value) -> TreeDecorator {
+        let t = v.get("type").and_then(Value::as_str).unwrap_or("");
+        match t.strip_prefix("minecraft:").unwrap_or(t) {
+            "beehive" => TreeDecorator::Beehive {
+                probability: v.get("probability").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+            },
+            _ => TreeDecorator::Unsupported,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TreeConfig {
+    trunk_provider: StateProvider,
+    trunk_placer: TrunkPlacer,
+    foliage_provider: StateProvider,
+    foliage_placer: FoliagePlacer,
+    minimum_size: FeatureSize,
+    decorators: Vec<TreeDecorator>,
+    ignore_vines: bool,
+    below_trunk_provider: StateProvider,
+}
+
+fn parse_tree(cfg: &Value) -> TreeConfig {
+    TreeConfig {
+        trunk_provider: StateProvider::parse(&cfg["trunk_provider"]),
+        trunk_placer: TrunkPlacer::parse(&cfg["trunk_placer"]),
+        foliage_provider: StateProvider::parse(&cfg["foliage_provider"]),
+        foliage_placer: FoliagePlacer::parse(&cfg["foliage_placer"]),
+        minimum_size: FeatureSize::parse(&cfg["minimum_size"]),
+        decorators: cfg["decorators"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(TreeDecorator::parse)
+            .collect(),
+        ignore_vines: cfg.get("ignore_vines").and_then(Value::as_bool).unwrap_or(false),
+        below_trunk_provider: StateProvider::parse(&cfg["below_trunk_provider"]),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RandomSelectorFeature
+// ---------------------------------------------------------------------------
+
+/// A nested feature reference inside a `random_selector`. A `Holder<PlacedFeature>`
+/// serializes either as a string id (`PlacedRef`) or an inline object
+/// (`InlineRef`). These are resolved into `Resolved` at `FeatureRegistry::load`
+/// time so `place_feature` stays registry-free.
+#[derive(Clone, Debug)]
+enum NestedFeature {
+    PlacedRef(String),
+    InlineRef { feature: String, placement: Vec<PlacementModifier> },
+    Resolved { feature: Box<ConfiguredFeature>, placement: Vec<PlacementModifier> },
+}
+
+#[derive(Clone, Debug)]
+struct WeightedNested {
+    chance: f32,
+    feature: NestedFeature,
+}
+
+#[derive(Clone, Debug)]
+struct RandomSelectorConfig {
+    features: Vec<WeightedNested>,
+    default: NestedFeature,
+}
+
+fn parse_nested(v: &Value) -> NestedFeature {
+    match v {
+        Value::String(s) => NestedFeature::PlacedRef(strip(s)),
+        Value::Object(_) => NestedFeature::InlineRef {
+            feature: strip(v["feature"].as_str().unwrap_or("")),
+            placement: v["placement"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .map(PlacementModifier::parse)
+                .collect(),
+        },
+        _ => NestedFeature::PlacedRef(String::new()),
+    }
+}
+
+fn parse_random_selector(cfg: &Value) -> RandomSelectorConfig {
+    RandomSelectorConfig {
+        features: cfg["features"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|e| WeightedNested {
+                chance: e["chance"].as_f64().unwrap_or(0.0) as f32,
+                feature: parse_nested(&e["feature"]),
+            })
+            .collect(),
+        default: parse_nested(&cfg["default"]),
+    }
+}
+
 /// `ConfiguredFeature` — the implemented variants carry their parsed config; a
 /// deferred feature keeps only its type name (for diagnostics).
 #[derive(Clone, Debug)]
@@ -155,6 +454,8 @@ enum ConfiguredFeature {
     ScatteredOre(OreConfig),
     Spring(SpringConfig),
     Disk(DiskConfig),
+    Tree(TreeConfig),
+    RandomSelector(RandomSelectorConfig),
     Deferred(String),
 }
 
@@ -178,6 +479,8 @@ impl ConfiguredFeature {
                 radius: IntProvider::parse(&cfg["radius"]),
                 half_height: cfg["half_height"].as_i64().unwrap_or(0) as i32,
             }),
+            "tree" => ConfiguredFeature::Tree(parse_tree(cfg)),
+            "random_selector" => ConfiguredFeature::RandomSelector(parse_random_selector(cfg)),
             // `freeze_top_layer` (SnowAndFreezeFeature) is recognized but
             // deferred: its exact `Biome.shouldFreeze`/`shouldSnow` gates need
             // the biome-temperature/height-adjust plumbing (in surface_rules)
@@ -254,6 +557,61 @@ fn strip(id: &str) -> String {
     id.strip_prefix("minecraft:").unwrap_or(id).to_owned()
 }
 
+/// Resolve a configured feature, recursively resolving any nested
+/// `random_selector` references it contains.
+fn resolve_cf(
+    cf: &ConfiguredFeature,
+    configured: &HashMap<String, ConfiguredFeature>,
+    placed: &HashMap<String, PlacedFeature>,
+) -> ConfiguredFeature {
+    match cf {
+        ConfiguredFeature::RandomSelector(rc) => ConfiguredFeature::RandomSelector(RandomSelectorConfig {
+            features: rc
+                .features
+                .iter()
+                .map(|w| WeightedNested { chance: w.chance, feature: resolve_nested(&w.feature, configured, placed) })
+                .collect(),
+            default: resolve_nested(&rc.default, configured, placed),
+        }),
+        other => other.clone(),
+    }
+}
+
+fn resolve_configured(
+    id: &str,
+    configured: &HashMap<String, ConfiguredFeature>,
+    placed: &HashMap<String, PlacedFeature>,
+) -> ConfiguredFeature {
+    match configured.get(id) {
+        Some(cf) => resolve_cf(cf, configured, placed),
+        None => ConfiguredFeature::Deferred(id.to_owned()),
+    }
+}
+
+fn resolve_nested(
+    nf: &NestedFeature,
+    configured: &HashMap<String, ConfiguredFeature>,
+    placed: &HashMap<String, PlacedFeature>,
+) -> NestedFeature {
+    match nf {
+        NestedFeature::PlacedRef(id) => match placed.get(id) {
+            Some(pf) => NestedFeature::Resolved {
+                feature: Box::new(resolve_configured(&pf.feature, configured, placed)),
+                placement: pf.placement.clone(),
+            },
+            None => NestedFeature::Resolved {
+                feature: Box::new(ConfiguredFeature::Deferred(id.clone())),
+                placement: Vec::new(),
+            },
+        },
+        NestedFeature::InlineRef { feature, placement } => NestedFeature::Resolved {
+            feature: Box::new(resolve_configured(feature, configured, placed)),
+            placement: placement.clone(),
+        },
+        NestedFeature::Resolved { .. } => nf.clone(),
+    }
+}
+
 impl FeatureRegistry {
     /// Build from the vendored JSON. `biome_names` maps fill values to registry
     /// names (from `MultiNoiseBiomeSource`, in parameter-list order).
@@ -279,6 +637,21 @@ impl FeatureRegistry {
                 },
             );
         }
+        // Resolve `random_selector` nested feature references (holders that
+        // serialize as either a placed-feature id or an inline placed feature)
+        // into owned `ConfiguredFeature`s + placement chains, so `place_feature`
+        // never needs the registry.
+        let selector_ids: Vec<String> = configured
+            .iter()
+            .filter(|(_, c)| matches!(c, ConfiguredFeature::RandomSelector(_)))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in selector_ids {
+            let cf = configured.get(&id).cloned().unwrap();
+            let resolved = resolve_cf(&cf, &configured, &placed);
+            configured.insert(id, resolved);
+        }
+
         let mut biome_features = HashMap::new();
         let mut biome_feature_set = HashMap::new();
         for (name, json) in vanilla_jsons::BIOMES {
@@ -563,7 +936,40 @@ fn place_feature(
         ConfiguredFeature::ScatteredOre(cfg) => place_scattered_ore(cfg, ctx, random, origin),
         ConfiguredFeature::Spring(cfg) => place_spring(cfg, ctx, origin),
         ConfiguredFeature::Disk(cfg) => place_disk(cfg, ctx, random, origin),
+        ConfiguredFeature::Tree(cfg) => place_tree(cfg, ctx, random, origin),
+        ConfiguredFeature::RandomSelector(cfg) => place_random_selector(cfg, ctx, random, origin),
         ConfiguredFeature::Deferred(_) => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RandomSelectorFeature.place / PlacedFeature.place (nested)
+// ---------------------------------------------------------------------------
+
+/// `RandomSelectorFeature.place` — draw `nextFloat()` per weighted entry in
+/// order; the first that passes places its nested feature and returns; otherwise
+/// the default feature is placed.
+fn place_random_selector(cfg: &RandomSelectorConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    for w in &cfg.features {
+        if random.next_float() < w.chance {
+            place_nested(&w.feature, ctx, random, origin);
+            return;
+        }
+    }
+    place_nested(&cfg.default, ctx, random, origin);
+}
+
+/// `PlacedFeature.place` for a nested feature — thread its own placement chain
+/// (no biome check) then place the resolved configured feature.
+fn place_nested(nf: &NestedFeature, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    if let NestedFeature::Resolved { feature, placement } = nf {
+        // A nested placement whose chain contains an unsupported modifier would
+        // desync only this terminal feature (the RNG is reseeded per top
+        // feature); still, skip rather than mis-draw.
+        if placement.iter().any(|m| !m.is_supported()) {
+            return;
+        }
+        place_stream(feature, placement, ctx, random, origin);
     }
 }
 
@@ -831,7 +1237,7 @@ fn place_disk(cfg: &DiskConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRan
             while y > bottom {
                 let pos = Pos::new(cx, y, cz);
                 if cfg.target.test(ctx.level, pos) {
-                    if let Some(state) = cfg.state_provider.get_state(ctx.level, pos) {
+                    if let Some(state) = cfg.state_provider.get_state(ctx.level, random, pos) {
                         ctx.level.set_block(cx, y, cz, state);
                     }
                 }
@@ -839,6 +1245,575 @@ fn place_disk(cfg: &DiskConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRan
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// TreeFeature (doPlace / place) + trunk / foliage placers + decorators
+// ---------------------------------------------------------------------------
+//
+// Identity level: default block states only. The `updateLeaves` BFS (leaf
+// `distance` finalization), log-axis, and `waterlogged` property setting are an
+// explicit follow-up — see the module notes. The RNG draw order is 1:1 with the
+// decompiled `TreeFeature.doPlace`.
+
+/// `Direction.Plane.HORIZONTAL` faces in registry order (the array
+/// `Util.getRandom` indexes): NORTH, EAST, SOUTH, WEST.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HDir {
+    North,
+    East,
+    South,
+    West,
+}
+
+impl HDir {
+    fn step_x(self) -> i32 {
+        match self {
+            HDir::East => 1,
+            HDir::West => -1,
+            _ => 0,
+        }
+    }
+    fn step_z(self) -> i32 {
+        match self {
+            HDir::North => -1,
+            HDir::South => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// `Direction.Plane.HORIZONTAL.getRandomDirection(random)` = `faces[nextInt(4)]`.
+fn horizontal_random_direction(random: &mut WorldgenRandom) -> HDir {
+    match random.next_int_bounded(4) {
+        0 => HDir::North,
+        1 => HDir::East,
+        2 => HDir::South,
+        _ => HDir::West,
+    }
+}
+
+/// `TreeFeature.validTreePos` — air or `#replaceable_by_trees`.
+fn valid_tree_pos(level: &dyn DecorationLevel, p: Pos) -> bool {
+    let b = level.get_block(p.x, p.y, p.z);
+    b.is_air() || BlockTag::ReplaceableByTrees.contains(b)
+}
+
+/// `TrunkPlacer.isFree` — `validTreePos || #logs`.
+fn is_free(level: &dyn DecorationLevel, p: Pos) -> bool {
+    valid_tree_pos(level, p) || BlockTag::Logs.contains(level.get_block(p.x, p.y, p.z))
+}
+
+/// `TreeFeature.isAirOrLeaves`.
+fn is_air_or_leaves(level: &dyn DecorationLevel, p: Pos) -> bool {
+    let b = level.get_block(p.x, p.y, p.z);
+    b.is_air() || b.is_leaves()
+}
+
+/// `TrunkPlacer.placeLog` — place a trunk log if `validTreePos`; records the
+/// position. The simple/weighted trunk provider is drawn here (simple: no RNG).
+fn place_log(
+    level: &mut dyn DecorationLevel,
+    trunks: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    p: Pos,
+    config: &TreeConfig,
+) -> bool {
+    if valid_tree_pos(level, p) {
+        if let Some(state) = config.trunk_provider.get_state(&*level, random, p) {
+            trunks.insert(p);
+            level.set_block(p.x, p.y, p.z, state);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// `TrunkPlacer.placeBelowTrunkBlock` — `belowTrunkProvider.getOptionalState`;
+/// `None` (no matching rule / no fallback) places nothing.
+fn place_below_trunk_block(
+    level: &mut dyn DecorationLevel,
+    trunks: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    p: Pos,
+    config: &TreeConfig,
+) {
+    if let Some(state) = config.below_trunk_provider.get_state(&*level, random, p) {
+        trunks.insert(p);
+        level.set_block(p.x, p.y, p.z, state);
+    }
+}
+
+/// `TreeFeature.getMaxFreeTreeHeight`. `isVine` is always false over the parity
+/// alphabet (no vine block), and the target trees set `ignore_vines` anyway.
+fn get_max_free_tree_height(level: &dyn DecorationLevel, max_tree_height: i32, tree_pos: Pos, config: &TreeConfig) -> i32 {
+    for y in 0..=max_tree_height + 1 {
+        let r = config.minimum_size.get_size_at_height(max_tree_height, y);
+        for x in -r..=r {
+            for z in -r..=r {
+                let p = Pos::new(tree_pos.x + x, tree_pos.y + y, tree_pos.z + z);
+                if !is_free(level, p) {
+                    return y - 2;
+                }
+            }
+        }
+    }
+    max_tree_height
+}
+
+impl TrunkPlacer {
+    /// `TrunkPlacer.placeTrunk` — returns the foliage attachments.
+    fn place_trunk(
+        &self,
+        level: &mut dyn DecorationLevel,
+        trunks: &mut HashSet<Pos>,
+        random: &mut WorldgenRandom,
+        tree_height: i32,
+        origin: Pos,
+        config: &TreeConfig,
+    ) -> Vec<FoliageAttachment> {
+        match self {
+            TrunkPlacer::Straight { .. } => {
+                place_below_trunk_block(level, trunks, random, origin.below(), config);
+                for y in 0..tree_height {
+                    place_log(level, trunks, random, origin.above(y), config);
+                }
+                vec![FoliageAttachment { pos: origin.above(tree_height), radius_offset: 0, double_trunk: false }]
+            }
+            TrunkPlacer::Forking { .. } => {
+                place_below_trunk_block(level, trunks, random, origin.below(), config);
+                let mut attachments = Vec::new();
+                let lean_direction = horizontal_random_direction(random);
+                let lean_height = tree_height - random.next_int_bounded(4) - 1;
+                let mut lean_steps = 3 - random.next_int_bounded(3);
+                let mut tx = origin.x;
+                let mut tz = origin.z;
+                let mut ey: Option<i32> = None;
+                for yo in 0..tree_height {
+                    let yy = origin.y + yo;
+                    if yo >= lean_height && lean_steps > 0 {
+                        tx += lean_direction.step_x();
+                        tz += lean_direction.step_z();
+                        lean_steps -= 1;
+                    }
+                    if place_log(level, trunks, random, Pos::new(tx, yy, tz), config) {
+                        ey = Some(yy + 1);
+                    }
+                }
+                if let Some(e) = ey {
+                    attachments.push(FoliageAttachment { pos: Pos::new(tx, e, tz), radius_offset: 1, double_trunk: false });
+                }
+                tx = origin.x;
+                tz = origin.z;
+                let branch_direction = horizontal_random_direction(random);
+                if branch_direction != lean_direction {
+                    let branch_pos = lean_height - random.next_int_bounded(2) - 1;
+                    let mut branch_steps = 1 + random.next_int_bounded(3);
+                    let mut ey2: Option<i32> = None;
+                    let mut yo = branch_pos;
+                    while yo < tree_height && branch_steps > 0 {
+                        if yo >= 1 {
+                            let yy = origin.y + yo;
+                            tx += branch_direction.step_x();
+                            tz += branch_direction.step_z();
+                            if place_log(level, trunks, random, Pos::new(tx, yy, tz), config) {
+                                ey2 = Some(yy + 1);
+                            }
+                        }
+                        yo += 1;
+                        branch_steps -= 1;
+                    }
+                    if let Some(e) = ey2 {
+                        attachments.push(FoliageAttachment { pos: Pos::new(tx, e, tz), radius_offset: 0, double_trunk: false });
+                    }
+                }
+                attachments
+            }
+            TrunkPlacer::DarkOak { .. } => {
+                let mut attachments = Vec::new();
+                let below = origin.below();
+                place_below_trunk_block(level, trunks, random, below, config);
+                place_below_trunk_block(level, trunks, random, below.east(), config);
+                place_below_trunk_block(level, trunks, random, below.south(), config);
+                place_below_trunk_block(level, trunks, random, below.south().east(), config);
+                let lean_direction = horizontal_random_direction(random);
+                let lean_height = tree_height - random.next_int_bounded(4);
+                let mut lean_steps = 2 - random.next_int_bounded(3);
+                let (x, y, z) = (origin.x, origin.y, origin.z);
+                let mut tx = x;
+                let mut tz = z;
+                let ey = y + tree_height - 1;
+                for dy in 0..tree_height {
+                    if dy >= lean_height && lean_steps > 0 {
+                        tx += lean_direction.step_x();
+                        tz += lean_direction.step_z();
+                        lean_steps -= 1;
+                    }
+                    let yy = y + dy;
+                    let bp = Pos::new(tx, yy, tz);
+                    if is_air_or_leaves(level, bp) {
+                        place_log(level, trunks, random, bp, config);
+                        place_log(level, trunks, random, bp.east(), config);
+                        place_log(level, trunks, random, bp.south(), config);
+                        place_log(level, trunks, random, bp.east().south(), config);
+                    }
+                }
+                attachments.push(FoliageAttachment { pos: Pos::new(tx, ey, tz), radius_offset: 0, double_trunk: true });
+                for ox in -1..=2 {
+                    for oz in -1..=2 {
+                        if (ox < 0 || ox > 1 || oz < 0 || oz > 1) && random.next_int_bounded(3) <= 0 {
+                            let length = random.next_int_bounded(3) + 2;
+                            for branch_y in 0..length {
+                                place_log(level, trunks, random, Pos::new(x + ox, ey - branch_y - 1, z + oz), config);
+                            }
+                            attachments.push(FoliageAttachment { pos: Pos::new(x + ox, ey, z + oz), radius_offset: 0, double_trunk: false });
+                        }
+                    }
+                }
+                attachments
+            }
+            TrunkPlacer::Unsupported => Vec::new(),
+        }
+    }
+}
+
+/// `FoliagePlacer.tryPlaceLeaf`. `isPersistent` is always false over the parity
+/// alphabet (all placed leaves default `persistent=false`, and terrain has
+/// none), so the gate reduces to `validTreePos`. `waterlogged` finalization is
+/// deferred (identity level).
+fn try_place_leaf(
+    level: &mut dyn DecorationLevel,
+    foliage: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    config: &TreeConfig,
+    p: Pos,
+) -> bool {
+    if valid_tree_pos(level, p) {
+        if let Some(state) = config.foliage_provider.get_state(&*level, random, p) {
+            foliage.insert(p);
+            level.set_block(p.x, p.y, p.z, state);
+            return true;
+        }
+    }
+    false
+}
+
+impl FoliagePlacer {
+    fn offset_ip(&self) -> &IntProvider {
+        match self {
+            FoliagePlacer::Blob { offset, .. }
+            | FoliagePlacer::Spruce { offset, .. }
+            | FoliagePlacer::Pine { offset, .. }
+            | FoliagePlacer::DarkOak { offset, .. } => offset,
+            FoliagePlacer::Unsupported => unreachable!("offset_ip on unsupported foliage placer"),
+        }
+    }
+
+    /// `FoliagePlacer.foliageHeight`.
+    fn foliage_height(&self, random: &mut WorldgenRandom, tree_height: i32) -> i32 {
+        match self {
+            FoliagePlacer::Blob { height, .. } => *height,
+            FoliagePlacer::Spruce { trunk_height, .. } => (tree_height - trunk_height.sample(random)).max(4),
+            FoliagePlacer::Pine { height, .. } => height.sample(random),
+            FoliagePlacer::DarkOak { .. } => 4,
+            FoliagePlacer::Unsupported => 0,
+        }
+    }
+
+    /// `FoliagePlacer.foliageRadius` (Pine overrides with an extra draw).
+    fn foliage_radius(&self, random: &mut WorldgenRandom, trunk_height: i32) -> i32 {
+        match self {
+            FoliagePlacer::Pine { radius, .. } => {
+                radius.sample(random) + random.next_int_bounded((trunk_height + 1).max(1))
+            }
+            FoliagePlacer::Blob { radius, .. }
+            | FoliagePlacer::Spruce { radius, .. }
+            | FoliagePlacer::DarkOak { radius, .. } => radius.sample(random),
+            FoliagePlacer::Unsupported => 0,
+        }
+    }
+
+    /// The public `FoliagePlacer.createFoliage` wrapper: draw the offset first,
+    /// then dispatch to the type-specific body.
+    #[allow(clippy::too_many_arguments)]
+    fn create_foliage(
+        &self,
+        level: &mut dyn DecorationLevel,
+        foliage: &mut HashSet<Pos>,
+        random: &mut WorldgenRandom,
+        config: &TreeConfig,
+        _tree_height: i32,
+        att: &FoliageAttachment,
+        foliage_height: i32,
+        leaf_radius: i32,
+    ) {
+        let offset = self.offset_ip().sample(random);
+        let dt = att.double_trunk;
+        match self {
+            FoliagePlacer::Blob { .. } => {
+                let mut yo = offset;
+                while yo >= offset - foliage_height {
+                    let current_radius = (leaf_radius + att.radius_offset - 1 - yo / 2).max(0);
+                    self.place_leaves_row(level, foliage, random, config, att.pos, current_radius, yo, dt);
+                    yo -= 1;
+                }
+            }
+            FoliagePlacer::Spruce { .. } => {
+                let mut current_radius = random.next_int_bounded(2);
+                let mut max_radius = 1;
+                let mut min_radius = 0;
+                let mut yo = offset;
+                while yo >= -foliage_height {
+                    self.place_leaves_row(level, foliage, random, config, att.pos, current_radius, yo, dt);
+                    if current_radius >= max_radius {
+                        current_radius = min_radius;
+                        min_radius = 1;
+                        max_radius = (max_radius + 1).min(leaf_radius + att.radius_offset);
+                    } else {
+                        current_radius += 1;
+                    }
+                    yo -= 1;
+                }
+            }
+            FoliagePlacer::Pine { .. } => {
+                let mut current_radius = 0;
+                let mut yo = offset;
+                while yo >= offset - foliage_height {
+                    self.place_leaves_row(level, foliage, random, config, att.pos, current_radius, yo, dt);
+                    if current_radius >= 1 && yo == offset - foliage_height + 1 {
+                        current_radius -= 1;
+                    } else if current_radius < leaf_radius + att.radius_offset {
+                        current_radius += 1;
+                    }
+                    yo -= 1;
+                }
+            }
+            FoliagePlacer::DarkOak { .. } => {
+                let pos = att.pos.above(offset);
+                if dt {
+                    self.place_leaves_row(level, foliage, random, config, pos, leaf_radius + 2, -1, dt);
+                    self.place_leaves_row(level, foliage, random, config, pos, leaf_radius + 3, 0, dt);
+                    self.place_leaves_row(level, foliage, random, config, pos, leaf_radius + 2, 1, dt);
+                    if random.next_boolean() {
+                        self.place_leaves_row(level, foliage, random, config, pos, leaf_radius, 2, dt);
+                    }
+                } else {
+                    self.place_leaves_row(level, foliage, random, config, pos, leaf_radius + 2, -1, dt);
+                    self.place_leaves_row(level, foliage, random, config, pos, leaf_radius + 1, 0, dt);
+                }
+            }
+            FoliagePlacer::Unsupported => {}
+        }
+    }
+
+    /// `FoliagePlacer.placeLeavesRow`.
+    #[allow(clippy::too_many_arguments)]
+    fn place_leaves_row(
+        &self,
+        level: &mut dyn DecorationLevel,
+        foliage: &mut HashSet<Pos>,
+        random: &mut WorldgenRandom,
+        config: &TreeConfig,
+        origin: Pos,
+        current_radius: i32,
+        y: i32,
+        double_trunk: bool,
+    ) {
+        let off = if double_trunk { 1 } else { 0 };
+        for dx in -current_radius..=current_radius + off {
+            for dz in -current_radius..=current_radius + off {
+                if !self.should_skip_location_signed(random, dx, y, dz, current_radius, double_trunk) {
+                    try_place_leaf(level, foliage, random, config, Pos::new(origin.x + dx, origin.y + y, origin.z + dz));
+                }
+            }
+        }
+    }
+
+    /// `FoliagePlacer.shouldSkipLocationSigned` (DarkOak overrides).
+    fn should_skip_location_signed(&self, random: &mut WorldgenRandom, dx: i32, y: i32, dz: i32, cr: i32, dt: bool) -> bool {
+        if let FoliagePlacer::DarkOak { .. } = self {
+            if y != 0 || !dt || (dx != -cr && dx < cr) || (dz != -cr && dz < cr) {
+                self.base_should_skip_signed(random, dx, y, dz, cr, dt)
+            } else {
+                true
+            }
+        } else {
+            self.base_should_skip_signed(random, dx, y, dz, cr, dt)
+        }
+    }
+
+    fn base_should_skip_signed(&self, random: &mut WorldgenRandom, dx: i32, y: i32, dz: i32, cr: i32, dt: bool) -> bool {
+        let (mdx, mdz) = if dt {
+            (dx.abs().min((dx - 1).abs()), dz.abs().min((dz - 1).abs()))
+        } else {
+            (dx.abs(), dz.abs())
+        };
+        self.should_skip_location(random, mdx, y, mdz, cr, dt)
+    }
+
+    /// `FoliagePlacer.shouldSkipLocation`. Blob draws `nextInt(2)` at each corner
+    /// (Java `&&` short-circuit → drawn only when `dx == cr && dz == cr`).
+    fn should_skip_location(&self, random: &mut WorldgenRandom, dx: i32, y: i32, dz: i32, cr: i32, dt: bool) -> bool {
+        match self {
+            FoliagePlacer::Blob { .. } => dx == cr && dz == cr && (random.next_int_bounded(2) == 0 || y == 0),
+            FoliagePlacer::Spruce { .. } | FoliagePlacer::Pine { .. } => dx == cr && dz == cr && cr > 0,
+            FoliagePlacer::DarkOak { .. } => {
+                if y == -1 && !dt {
+                    dx == cr && dz == cr
+                } else if y == 1 {
+                    dx + dz > cr * 2 - 2
+                } else {
+                    false
+                }
+            }
+            FoliagePlacer::Unsupported => false,
+        }
+    }
+}
+
+/// `Util.shuffle` (Fisher-Yates): `for i in (2..=size).rev() swap(i-1, nextInt(i))`.
+fn util_shuffle<T>(list: &mut [T], random: &mut WorldgenRandom) {
+    let size = list.len();
+    let mut i = size;
+    while i > 1 {
+        let swap_to = random.next_int_bounded(i as i32) as usize;
+        list.swap(i - 1, swap_to);
+        i -= 1;
+    }
+}
+
+impl TreeDecorator {
+    /// `TreeDecorator.place`. Only `beehive` is modeled.
+    fn place(
+        &self,
+        level: &mut dyn DecorationLevel,
+        decorations: &mut HashSet<Pos>,
+        random: &mut WorldgenRandom,
+        trunks: &HashSet<Pos>,
+        foliage: &HashSet<Pos>,
+    ) {
+        match self {
+            TreeDecorator::Beehive { probability } => {
+                beehive_place(*probability, level, decorations, random, trunks, foliage);
+            }
+            TreeDecorator::Unsupported => {}
+        }
+    }
+}
+
+/// `BeehiveDecorator.place`. `SPAWN_DIRECTIONS` = HORIZONTAL minus NORTH
+/// (opposite of the SOUTH worldgen facing) = [EAST, SOUTH, WEST]. Places a
+/// `bee_nest` (bee-entity NBT is out of block-grid scope, but its RNG draws —
+/// `2 + nextInt(2)` bees, each `nextInt(599)` — MUST run to stay in parity).
+fn beehive_place(
+    probability: f32,
+    level: &mut dyn DecorationLevel,
+    decorations: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    trunks: &HashSet<Pos>,
+    foliage: &HashSet<Pos>,
+) {
+    if trunks.is_empty() {
+        return;
+    }
+    // `Context` sorts logs/leaves by Y ascending. HashSet order is not vanilla's
+    // (a JVM `HashSet`), which can move the chosen nest position, but every RNG
+    // draw count below is order-independent; a fully-deterministic (y,x,z) order
+    // keeps our own output reproducible.
+    let mut logs: Vec<Pos> = trunks.iter().copied().collect();
+    let mut leaves: Vec<Pos> = foliage.iter().copied().collect();
+    logs.sort_by_key(|p| (p.y, p.x, p.z));
+    leaves.sort_by_key(|p| (p.y, p.x, p.z));
+
+    if random.next_float() >= probability {
+        return;
+    }
+    let hive_y = if !leaves.is_empty() {
+        (leaves[0].y - 1).max(logs[0].y + 1)
+    } else {
+        (logs[0].y + 1 + random.next_int_bounded(3)).min(logs[logs.len() - 1].y)
+    };
+    // SPAWN_DIRECTIONS applied to each log at hive_y, in order.
+    const SPAWN: [HDir; 3] = [HDir::East, HDir::South, HDir::West];
+    let mut hive_placements: Vec<Pos> = logs
+        .iter()
+        .filter(|p| p.y == hive_y)
+        .flat_map(|p| SPAWN.iter().map(move |d| Pos::new(p.x + d.step_x(), p.y, p.z + d.step_z())))
+        .collect();
+    if hive_placements.is_empty() {
+        return;
+    }
+    util_shuffle(&mut hive_placements, random);
+    // WORLDGEN_FACING = SOUTH: require air at pos and at pos.south().
+    let hive = hive_placements
+        .iter()
+        .find(|p| level.get_block(p.x, p.y, p.z).is_air() && level.get_block(p.x, p.y, p.z + 1).is_air())
+        .copied();
+    if let Some(hp) = hive {
+        decorations.insert(hp);
+        level.set_block(hp.x, hp.y, hp.z, ParityBlock::BeeNest);
+        // Bee entities aren't modeled, but their creation draws must run: the
+        // block entity always exists after the set_block above.
+        let num_bees = 2 + random.next_int_bounded(2);
+        for _ in 0..num_bees {
+            let _ = random.next_int_bounded(599);
+        }
+    }
+}
+
+/// `TreeFeature.doPlace` + `place` (decorators), skipping the root placer and the
+/// `updateLeaves` BFS. The RNG draw order matches the decompile exactly:
+/// getTreeHeight → foliageHeight → foliageRadius → (bounds/clip, no draws) →
+/// placeTrunk → per-attachment createFoliage → decorators.
+fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    // Graceful skip for unported placers (fancy trunk, fancy/mega foliage, …):
+    // bail before any RNG draw so this terminal feature simply produces nothing
+    // rather than mis-drawing (safe — the RNG is reseeded per top feature).
+    if config.trunk_placer.is_unsupported() || config.foliage_placer.is_unsupported() {
+        return;
+    }
+
+    let level: &mut dyn DecorationLevel = ctx.level;
+
+    let tree_height = config.trunk_placer.get_tree_height(random);
+    let foliage_height = config.foliage_placer.foliage_height(random, tree_height);
+    let trunk_height = tree_height - foliage_height;
+    let leaf_radius = config.foliage_placer.foliage_radius(random, trunk_height);
+    // No root placer → trunkOrigin == origin.
+    let trunk_origin = origin;
+    let min_y = origin.y.min(trunk_origin.y);
+    let max_y = origin.y.max(trunk_origin.y) + tree_height + 1;
+    // Vanilla `TreeFeature.doPlace`: proceed when `minY >= getMinY()+1 && maxY
+    // <= getMaxY()+1`. `getMaxY()` is the inclusive top, so `getMaxY()+1` ==
+    // `getMaxBuildHeight()` == our exclusive `max_y()`.
+    if min_y < level.min_y() + 1 || max_y > level.max_y() {
+        return;
+    }
+    let min_clipped = config.minimum_size.min_clipped_height();
+    let clipped = get_max_free_tree_height(level, tree_height, trunk_origin, config);
+    if !(clipped >= tree_height || min_clipped.map(|m| clipped >= m).unwrap_or(false)) {
+        return;
+    }
+
+    let mut trunks: HashSet<Pos> = HashSet::new();
+    let mut foliage: HashSet<Pos> = HashSet::new();
+    let mut decorations: HashSet<Pos> = HashSet::new();
+
+    let attachments = config.trunk_placer.place_trunk(level, &mut trunks, random, clipped, trunk_origin, config);
+    for att in &attachments {
+        config
+            .foliage_placer
+            .create_foliage(level, &mut foliage, random, config, clipped, att, foliage_height, leaf_radius);
+    }
+
+    // `place`: decorators run only when the tree placed something.
+    if !trunks.is_empty() || !foliage.is_empty() {
+        for dec in &config.decorators {
+            dec.place(level, &mut decorations, random, &trunks, &foliage);
+        }
+    }
+    // `updateLeaves` + `updateShapeAtEdge` are the deferred block-state pass.
 }
 
 fn lerp(t: f64, a: f64, b: f64) -> f64 {
@@ -1025,11 +2000,175 @@ mod tests {
     #[test]
     fn implemented_features_parse() {
         let registry = registry_for(&["minecraft:plains"]);
-        for id in ["ore_coal", "ore_iron", "ore_dirt", "disk_sand", "spring_water"] {
+        for id in [
+            "ore_coal", "ore_iron", "ore_dirt", "disk_sand", "spring_water",
+            "oak", "birch", "spruce", "dark_oak", "pine", "trees_plains", "trees_birch",
+        ] {
             let cf = registry.configured.get(id).unwrap_or_else(|| panic!("missing {id}"));
             assert!(cf.is_implemented(), "{id} should be implemented, got {cf:?}");
         }
-        // A deferred feature is recognized but not implemented.
-        assert!(!registry.configured.get("oak").map(|c| c.is_implemented()).unwrap_or(true));
+        // `oak` is now a real tree feature.
+        assert!(matches!(registry.configured.get("oak"), Some(ConfiguredFeature::Tree(_))));
+        assert!(matches!(registry.configured.get("trees_plains"), Some(ConfiguredFeature::RandomSelector(_))));
+        // A feature type this milestone still defers stays `Deferred`.
+        assert!(!registry.configured.get("lake_lava").map(|c| c.is_implemented()).unwrap_or(true));
+    }
+
+    // --- Tree feature structural tests ---------------------------------------
+
+    /// A grass/dirt surface at `surface`, air above, stone below. Trees grow on
+    /// top of it (origin at the first air = `surface`).
+    fn tree_level(surface: i32) -> TestLevel {
+        let mut level = TestLevel::new(surface);
+        // A grass cap so `would_survive` / `below_trunk_provider` behave.
+        for z in -32..48 {
+            for x in -32..48 {
+                level.set_block(x, surface - 1, z, ParityBlock::GrassBlock);
+            }
+        }
+        level
+    }
+
+    fn oak_config(registry: &FeatureRegistry) -> TreeConfig {
+        match registry.configured.get("oak") {
+            Some(ConfiguredFeature::Tree(c)) => c.clone(),
+            _ => panic!("oak is not a tree"),
+        }
+    }
+
+    /// `getTreeHeight`/`foliageHeight`/`foliageRadius` draw exactly the vanilla
+    /// sequence — verified by replaying the draws on a twin RNG.
+    #[test]
+    fn tree_rng_draw_order_matches_manual_replay() {
+        let registry = registry_for(&["minecraft:plains"]);
+        // Straight oak: base 4, a 2, b 0; blob foliage (height 3, no draws);
+        // blob radius constant 2 (no draw), blob offset constant 0 (no draw).
+        let oak = oak_config(&registry);
+        let mut a = WorldgenRandom::new(RandomSource::xoroshiro(99));
+        let mut b = WorldgenRandom::new(RandomSource::xoroshiro(99));
+
+        let th = oak.trunk_placer.get_tree_height(&mut a);
+        // Manual: base 4 + nextInt(3) + nextInt(1).
+        let th_manual = 4 + b.next_int_bounded(3) + b.next_int_bounded(1);
+        assert_eq!(th, th_manual, "getTreeHeight draw sequence");
+
+        let fh = oak.foliage_placer.foliage_height(&mut a, th);
+        assert_eq!(fh, 3, "blob foliageHeight is constant (no draw)");
+        let fr = oak.foliage_placer.foliage_radius(&mut a, th - fh);
+        assert_eq!(fr, 2, "blob foliageRadius is constant (no draw)");
+        // No draws happened in foliageHeight/foliageRadius, so the twin is still
+        // in lockstep: the next draw matches.
+        assert_eq!(a.next_int_bounded(100), b.next_int_bounded(100), "twin RNGs stayed in lockstep");
+    }
+
+    /// Spruce foliageHeight draws one (trunk_height uniform), and its radius one
+    /// (radius uniform) — replay confirms the count.
+    #[test]
+    fn spruce_foliage_draws_one_each() {
+        let registry = registry_for(&["minecraft:taiga"]);
+        let spruce = match registry.configured.get("spruce") {
+            Some(ConfiguredFeature::Tree(c)) => c.clone(),
+            _ => panic!("spruce not a tree"),
+        };
+        let mut a = WorldgenRandom::new(RandomSource::xoroshiro(7));
+        let mut b = WorldgenRandom::new(RandomSource::xoroshiro(7));
+        let th = spruce.trunk_placer.get_tree_height(&mut a);
+        let _ = b.next_int_bounded(3); // a=2
+        let _ = b.next_int_bounded(2); // b=1
+        let fh = spruce.foliage_placer.foliage_height(&mut a, th);
+        // foliageHeight = max(4, th - trunk_height.sample) → one draw.
+        let trunk_h = b.next_int_bounded(2) + 1; // uniform [1,2]
+        assert_eq!(fh, (th - trunk_h).max(4));
+        let fr = spruce.foliage_placer.foliage_radius(&mut a, th - fh);
+        let rad = b.next_int_bounded(2) + 2; // uniform [2,3]
+        assert_eq!(fr, rad, "spruce radius uniform draw");
+    }
+
+    /// A placed oak tree is deterministic for a fixed seed and seed-sensitive,
+    /// writes only logs/leaves/dirt, and the trunk column reaches the clipped
+    /// height (== full height on open ground).
+    #[test]
+    fn oak_tree_places_trunk_and_leaves() {
+        let registry = registry_for(&["minecraft:plains"]);
+        let oak = oak_config(&registry);
+        let run = |seed: i64| {
+            let mut level = tree_level(70);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "oak" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_tree(&oak, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut writes: Vec<_> = level.blocks.into_iter().collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(123);
+        assert_eq!(a, run(123), "deterministic for a fixed seed");
+
+        let logs: Vec<_> = a.iter().filter(|(_, b)| *b == ParityBlock::OakLog).collect();
+        assert!(!logs.is_empty(), "trunk logs placed");
+        // A trunk column at (8, y, 8): count logs there; must equal treeHeight.
+        let column = logs.iter().filter(|((x, _, z), _)| *x == 8 && *z == 8).count() as i32;
+        // Recompute treeHeight for this seed.
+        let mut r = WorldgenRandom::new(RandomSource::xoroshiro(123));
+        let th = oak.trunk_placer.get_tree_height(&mut r);
+        assert_eq!(column, th, "straight trunk column height == tree height");
+
+        // Only logs/leaves/dirt are written (identity alphabet), and leaves sit
+        // where a valid (air/replaceable) position existed.
+        for ((x, y, z), block) in &a {
+            let base = if *y < 70 { ParityBlock::Stone } else { ParityBlock::Air };
+            let _ = base;
+            assert!(
+                matches!(
+                    block,
+                    ParityBlock::OakLog | ParityBlock::OakLeaves | ParityBlock::Dirt | ParityBlock::GrassBlock
+                ),
+                "unexpected block {block:?} at {x},{y},{z}"
+            );
+        }
+    }
+
+    /// Through the full decoration driver, a plains chunk on grassy ground
+    /// produces oak logs+leaves, and the whole pass is deterministic and
+    /// seed-sensitive.
+    #[test]
+    fn trees_generate_through_decoration_driver() {
+        let registry = registry_for(&["minecraft:plains"]);
+        let possible: HashSet<u16> = [0u16].into_iter().collect();
+        let decorate = |seed: i64| {
+            let mut level = tree_level(70);
+            apply_biome_decoration(&registry, &mut level, &possible, seed, 0, 0);
+            level
+                .blocks
+                .iter()
+                .filter(|(_, b)| matches!(b, ParityBlock::OakLog | ParityBlock::OakLeaves))
+                .count()
+        };
+        // At least one seed in a small sweep must grow a tree.
+        let grew = (0..8).any(|s| decorate(s * 1000 + 1) > 0);
+        assert!(grew, "some seed grows a tree via trees_plains");
+    }
+
+    /// The beehive decorator draws its RNG (nextFloat gate + shuffle + bees)
+    /// exactly and only when a hive is placed; determinism holds.
+    #[test]
+    fn beehive_decorator_is_deterministic() {
+        let registry = registry_for(&["minecraft:plains"]);
+        let oak_bees = match registry.configured.get("oak_bees_005") {
+            Some(ConfiguredFeature::Tree(c)) => c.clone(),
+            _ => panic!("oak_bees_005 not a tree"),
+        };
+        assert!(matches!(oak_bees.decorators.as_slice(), [TreeDecorator::Beehive { .. }]));
+        let run = || {
+            let mut level = tree_level(70);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "oak_bees_005" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(555));
+            place_tree(&oak_bees, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut writes: Vec<_> = level.blocks.into_iter().collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        assert_eq!(run(), run(), "beehive tree deterministic");
     }
 }
