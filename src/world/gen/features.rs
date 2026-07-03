@@ -900,6 +900,8 @@ enum ConfiguredFeature {
     BlueIce,
     Spike(SpikeConfig),
     Iceberg(IcebergConfig),
+    BlockBlob(BlockBlobConfig),
+    DesertWell,
     Deferred(String),
 }
 
@@ -965,6 +967,11 @@ impl ConfiguredFeature {
             "iceberg" => ConfiguredFeature::Iceberg(IcebergConfig {
                 state: cfg["state"]["Name"].as_str().and_then(ParityBlock::from_name).unwrap_or(ParityBlock::PackedIce),
             }),
+            "block_blob" => ConfiguredFeature::BlockBlob(BlockBlobConfig {
+                state: cfg["state"]["Name"].as_str().and_then(ParityBlock::from_name).unwrap_or(ParityBlock::MossyCobblestone),
+                can_place_on: BlockPredicate::parse(&cfg["can_place_on"]),
+            }),
+            "desert_well" => ConfiguredFeature::DesertWell,
             // `freeze_top_layer` (SnowAndFreezeFeature) is recognized but
             // deferred: its exact `Biome.shouldFreeze`/`shouldSnow` gates need
             // the biome-temperature/height-adjust plumbing (in surface_rules)
@@ -1438,6 +1445,8 @@ fn place_feature(
         ConfiguredFeature::BlueIce => place_blue_ice(ctx, random, origin),
         ConfiguredFeature::Spike(cfg) => place_spike(cfg, ctx, random, origin),
         ConfiguredFeature::Iceberg(cfg) => place_iceberg(cfg, ctx, random, origin),
+        ConfiguredFeature::BlockBlob(cfg) => place_block_blob(cfg, ctx, random, origin),
+        ConfiguredFeature::DesertWell => place_desert_well(ctx, random, origin),
         ConfiguredFeature::Deferred(_) => {}
     }
 }
@@ -2555,6 +2564,124 @@ fn place_iceberg(cfg: &IcebergConfig, ctx: &mut PlacementCtx, random: &mut World
     if do_cutout {
         iceberg_generate_cutout(ctx, random, width, over, origin, is_ellipse, shape_a, shape_angle, shape_c);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Desert / rock group: forest_rock (BlockBlobFeature), desert_well
+// ---------------------------------------------------------------------------
+
+/// `BlockBlobFeature.place` (`forest_rock`).
+fn place_block_blob(cfg: &BlockBlobConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    let mut origin = origin;
+    while origin.y > ctx.level.min_y() + 3
+        && !cfg.can_place_on.test(ctx.level, Pos::new(origin.x, origin.y - 1, origin.z))
+    {
+        origin.y -= 1;
+    }
+    if origin.y <= ctx.level.min_y() + 3 {
+        return;
+    }
+    for _ in 0..3 {
+        let xr = random.next_int_bounded(2);
+        let yr = random.next_int_bounded(2);
+        let zr = random.next_int_bounded(2);
+        let tr = (xr + yr + zr) as f32 * 0.333 + 0.5;
+        let tr2 = (tr * tr) as f64;
+        // `BlockPos.betweenClosed` — no RNG in the fill; iteration order is
+        // irrelevant (every in-range cell is set to the same state).
+        for bx in origin.x - xr..=origin.x + xr {
+            for by in origin.y - yr..=origin.y + yr {
+                for bz in origin.z - zr..=origin.z + zr {
+                    let dx = (bx - origin.x) as f64;
+                    let dy = (by - origin.y) as f64;
+                    let dz = (bz - origin.z) as f64;
+                    if dx * dx + dy * dy + dz * dz <= tr2 {
+                        ctx.level.set_block(bx, by, bz, cfg.state);
+                    }
+                }
+            }
+        }
+        let ox = -1 + random.next_int_bounded(2);
+        let oy = -random.next_int_bounded(2);
+        let oz = -1 + random.next_int_bounded(2);
+        origin = Pos::new(origin.x + ox, origin.y + oy, origin.z + oz);
+    }
+}
+
+/// `DesertWellFeature.place`. Suspicious-sand block entities carry a loot table
+/// that Vela does not model in worldgen — the block state is placed and the
+/// exact RNG (two `nextInt(5)` position picks) is consumed, but the archaeology
+/// loot NBT is deferred (block-entity scope, documented).
+fn place_desert_well(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    use ParityBlock::{Sand, Sandstone, SandstoneSlab, SuspiciousSand, Water};
+    let mut origin = Pos::new(origin.x, origin.y + 1, origin.z);
+    while ctx.level.get_block(origin.x, origin.y, origin.z).is_air() && origin.y > ctx.level.min_y() + 2 {
+        origin.y -= 1;
+    }
+    if ctx.level.get_block(origin.x, origin.y, origin.z) != Sand {
+        return;
+    }
+    for ox in -2..=2 {
+        for oz in -2..=2 {
+            if ctx.level.get_block(origin.x + ox, origin.y - 1, origin.z + oz).is_air()
+                && ctx.level.get_block(origin.x + ox, origin.y - 2, origin.z + oz).is_air()
+            {
+                return;
+            }
+        }
+    }
+    let set = |ctx: &mut PlacementCtx, dx: i32, dy: i32, dz: i32, s: ParityBlock| {
+        ctx.level.set_block(origin.x + dx, origin.y + dy, origin.z + dz, s);
+    };
+    for oy in -2..=0 {
+        for ox in -2..=2 {
+            for oz in -2..=2 {
+                set(ctx, ox, oy, oz, Sandstone);
+            }
+        }
+    }
+    set(ctx, 0, 0, 0, Water);
+    // Direction.Plane.HORIZONTAL: NORTH, SOUTH, WEST, EAST (relative offsets).
+    const HORIZ: [(i32, i32); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
+    for &(dx, dz) in HORIZ.iter() {
+        set(ctx, dx, 0, dz, Water);
+    }
+    set(ctx, 0, -1, 0, Sand);
+    for &(dx, dz) in HORIZ.iter() {
+        set(ctx, dx, -1, dz, Sand);
+    }
+    for ox in -2..=2 {
+        for oz in -2..=2 {
+            if ox == -2 || ox == 2 || oz == -2 || oz == 2 {
+                set(ctx, ox, 1, oz, Sandstone);
+            }
+        }
+    }
+    set(ctx, 2, 1, 0, SandstoneSlab);
+    set(ctx, -2, 1, 0, SandstoneSlab);
+    set(ctx, 0, 1, 2, SandstoneSlab);
+    set(ctx, 0, 1, -2, SandstoneSlab);
+    for ox in -1..=1 {
+        for oz in -1..=1 {
+            if ox == 0 && oz == 0 {
+                set(ctx, ox, 4, oz, Sandstone);
+            } else {
+                set(ctx, ox, 4, oz, SandstoneSlab);
+            }
+        }
+    }
+    for oy in 1..=3 {
+        set(ctx, -1, oy, -1, Sandstone);
+        set(ctx, -1, oy, 1, Sandstone);
+        set(ctx, 1, oy, -1, Sandstone);
+        set(ctx, 1, oy, 1, Sandstone);
+    }
+    // `List.of(center, east, south, west, north)` — the water block offsets.
+    const WATER_POS: [(i32, i32); 5] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1)];
+    let pick1 = WATER_POS[random.next_int_bounded(5) as usize];
+    ctx.level.set_block(origin.x + pick1.0, origin.y - 1, origin.z + pick1.1, SuspiciousSand);
+    let pick2 = WATER_POS[random.next_int_bounded(5) as usize];
+    ctx.level.set_block(origin.x + pick2.0, origin.y - 2, origin.z + pick2.1, SuspiciousSand);
 }
 
 // ---------------------------------------------------------------------------
@@ -5129,5 +5256,61 @@ mod tests {
         for (_, b) in &a {
             assert!(matches!(b, PackedIce | SnowBlock | Snow | Air | Water), "unexpected iceberg block {b:?}");
         }
+    }
+
+    /// `forest_rock` (block_blob) piles mossy cobblestone on a grass floor,
+    /// deterministically, writing only mossy cobblestone.
+    #[test]
+    fn forest_rock_piles_mossy_cobble() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:windswept_hills"]);
+        let cfg = match reg.configured.get("forest_rock") {
+            Some(ConfiguredFeature::BlockBlob(c)) => c.clone(),
+            other => panic!("forest_rock is not a block_blob: {other:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = tree_level(70); // grass cap at 69 → can_place_on
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_block_blob(&cfg, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut writes: Vec<_> = level.blocks.iter().filter(|(_, b)| **b == MossyCobblestone).map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(6);
+        assert_eq!(a, run(6), "forest rock deterministic");
+        assert!(!a.is_empty(), "the blob places mossy cobblestone");
+    }
+
+    /// `desert_well` builds a sandstone well with a water core on a sand column,
+    /// deterministically, and drops two suspicious-sand blocks under the water.
+    #[test]
+    fn desert_well_builds_structure() {
+        use ParityBlock::*;
+        let run = |seed: i64| {
+            // A tall sand column with air above so the down-scan lands on sand.
+            let mut level = TestLevel::new(60);
+            for z in -4..5 {
+                for x in -4..5 {
+                    for y in 55..71 {
+                        level.set_block(x, y, z, Sand);
+                    }
+                }
+            }
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_desert_well(&mut ctx, &mut random, Pos::new(0, 70, 0));
+            let mut writes: Vec<_> = level.blocks.iter().map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(1);
+        assert_eq!(a, run(1), "desert well deterministic");
+        assert!(a.iter().any(|(_, b)| *b == Water), "the well has a water core");
+        assert!(a.iter().any(|(_, b)| *b == SandstoneSlab), "the well has a sandstone-slab rim");
+        let sus = a.iter().filter(|(_, b)| *b == SuspiciousSand).count();
+        assert!(sus >= 1, "at least one suspicious-sand block, got {sus}");
     }
 }
