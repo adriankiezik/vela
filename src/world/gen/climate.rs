@@ -526,6 +526,121 @@ impl MultiNoiseBiomeSource {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Climate.SpawnFinder
+// ---------------------------------------------------------------------------
+
+/// The overworld `spawn_target` climate points, from the vendored
+/// `noise_settings/overworld.json` (`OverworldBiomeBuilder.spawnTarget()`
+/// serialized). Each becomes a 7-interval parameter space — the offset is the
+/// degenerate `[offset, offset]` interval matched against 0, exactly as
+/// `ParameterPoint.parameterSpace()`/`fitness` treat it. The `depth` interval
+/// is `[0, 0]`, matching the zero-depth target the finder samples against.
+fn spawn_target() -> Vec<ParameterSpace> {
+    let v: Value = serde_json::from_str(vanilla_jsons::OVERWORLD_NOISE_SETTINGS)
+        .expect("bad noise settings JSON");
+    let entries = v["spawn_target"].as_array().expect("spawn_target array");
+    entries
+        .iter()
+        .map(|e| {
+            let param = |field: &str| -> Parameter {
+                let f = &e[field];
+                if let Some(pair) = f.as_array() {
+                    Parameter {
+                        min: quantize_coord(pair[0].as_f64().expect("min") as f32),
+                        max: quantize_coord(pair[1].as_f64().expect("max") as f32),
+                    }
+                } else {
+                    let q = quantize_coord(f.as_f64().expect("point") as f32);
+                    Parameter { min: q, max: q }
+                }
+            };
+            let offset = quantize_coord(e["offset"].as_f64().expect("offset") as f32);
+            [
+                param("temperature"),
+                param("humidity"),
+                param("continentalness"),
+                param("erosion"),
+                param("depth"),
+                param("weirdness"),
+                Parameter { min: offset, max: offset },
+            ]
+        })
+        .collect()
+}
+
+/// `Mth.square(2048L)` — the fitness weight that dominates the origin distance
+/// bias in `SpawnFinder.getSpawnPositionAndFitness`.
+const SPAWN_RADIUS_SQ: i64 = 2048 * 2048;
+
+/// `SpawnFinder.getSpawnPositionAndFitness` — the climate fitness at a block
+/// column, biased toward the world origin. Lower is better. The climate is
+/// sampled at depth 0 (`zeroDepthTargetPoint`), then the minimum fitness over
+/// the spawn-target points is scaled by `2048²` and the squared origin distance
+/// is added.
+fn spawn_fitness(targets: &[ParameterSpace], sampler: &Sampler, block_x: i32, block_z: i32) -> i64 {
+    // `sampler.sample(QuartPos.fromBlock(x), 0, QuartPos.fromBlock(z))`.
+    let mut target = sampler.sample(block_x >> 2, 0, block_z >> 2).0;
+    target[4] = 0; // zero the depth dimension
+    let mut min_fitness = i64::MAX;
+    for space in targets {
+        min_fitness = min_fitness.min(fitness(space, &target));
+    }
+    let dx = block_x as i64;
+    let dz = block_z as i64;
+    let distance_bias = dx * dx + dz * dz;
+    min_fitness * SPAWN_RADIUS_SQ + distance_bias
+}
+
+/// `SpawnFinder.radialSearch` — sweep an Archimedean spiral of increasing
+/// radius around a fixed origin, keeping the lowest-fitness column found. The
+/// float arithmetic (and the `(int)(Math.sin(angle) * radius)` truncation, with
+/// `Math.sin` promoting the `float` angle to `double`) is reproduced exactly.
+#[allow(clippy::too_many_arguments)]
+fn radial_search(
+    targets: &[ParameterSpace],
+    sampler: &Sampler,
+    best_x: &mut i32,
+    best_z: &mut i32,
+    best_fitness: &mut i64,
+    max_radius: f32,
+    radius_increment: f32,
+) {
+    let mut angle: f32 = 0.0;
+    let mut radius: f32 = radius_increment;
+    // `searchOrigin = this.result.location()` — captured once for the sweep.
+    let (origin_x, origin_z) = (*best_x, *best_z);
+    while radius <= max_radius {
+        let x = origin_x + (f64::sin(angle as f64) * radius as f64) as i32;
+        let z = origin_z + (f64::cos(angle as f64) * radius as f64) as i32;
+        let f = spawn_fitness(targets, sampler, x, z);
+        if f < *best_fitness {
+            *best_fitness = f;
+            *best_x = x;
+            *best_z = z;
+        }
+        angle += radius_increment / radius;
+        if (angle as f64) > std::f64::consts::PI * 2.0 {
+            angle = 0.0;
+            radius += radius_increment;
+        }
+    }
+}
+
+/// `Climate.findSpawnPosition` / `Climate.SpawnFinder` — the coarse-to-fine
+/// climate-space spawn search. Starts at the origin, then two radial sweeps
+/// (2048→512, then 512→32), returning the block `(x, z)` of the best column.
+/// This is what steers the world spawn toward temperate, inland, non-river
+/// climates instead of whatever sits at the origin.
+pub fn find_spawn_position(sampler: &Sampler) -> (i32, i32) {
+    let targets = spawn_target();
+    let (mut best_x, mut best_z) = (0i32, 0i32);
+    let mut best_fitness = spawn_fitness(&targets, sampler, 0, 0);
+    radial_search(&targets, sampler, &mut best_x, &mut best_z, &mut best_fitness, 2048.0, 512.0);
+    radial_search(&targets, sampler, &mut best_x, &mut best_z, &mut best_fitness, 512.0, 32.0);
+    (best_x, best_z)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::density::VanillaWorldgenData;
@@ -640,5 +755,75 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 801, "fixture line count");
+    }
+
+    fn overworld_sampler(seed: i64) -> Sampler {
+        let data = VanillaWorldgenData::load_overworld();
+        Sampler::new(&RandomState::new_overworld(&data, seed))
+    }
+
+    #[test]
+    fn spawn_target_loads_two_points() {
+        // The vendored overworld spawn_target: two ParameterPoints differing only
+        // in the weirdness band (the two non-river slices), depth pinned to 0.
+        let targets = spawn_target();
+        assert_eq!(targets.len(), 2);
+        let q = quantize_coord;
+        for space in &targets {
+            assert_eq!(space[4], Parameter { min: 0, max: 0 }, "depth must be [0,0]");
+            assert_eq!(space[6], Parameter { min: 0, max: 0 }, "offset must be [0,0]");
+            // continentalness = span(inlandContinentalness.min, FULL_RANGE.max)
+            // = [-0.11, 1.0]; temperature/humidity/erosion are FULL_RANGE.
+            assert_eq!(space[2], Parameter { min: q(-0.11), max: q(1.0) });
+            assert_eq!(space[0], Parameter { min: q(-1.0), max: q(1.0) });
+        }
+        // weirdness slices: [-1.0, -0.16] and [0.16, 1.0].
+        assert_eq!(targets[0][5], Parameter { min: q(-1.0), max: q(-0.16) });
+        assert_eq!(targets[1][5], Parameter { min: q(0.16), max: q(1.0) });
+    }
+
+    #[test]
+    fn spawn_finder_is_deterministic() {
+        // The search is a pure function of the seed's climate router.
+        for seed in [0i64, 1, 0x5EED_C0DE] {
+            let sampler = overworld_sampler(seed);
+            let a = find_spawn_position(&sampler);
+            let b = find_spawn_position(&sampler);
+            assert_eq!(a, b, "spawn search must be deterministic for seed {seed}");
+        }
+    }
+
+    #[test]
+    fn spawn_finder_beats_the_origin() {
+        // The finder only ever replaces the incumbent with a strictly better
+        // column, so the chosen spot's fitness is <= the origin's, and for real
+        // seeds it strictly improves (the origin is rarely the global optimum).
+        let targets = spawn_target();
+        let mut improved = 0;
+        for seed in [0i64, 1, 42, 0x5EED_C0DE] {
+            let sampler = overworld_sampler(seed);
+            let (sx, sz) = find_spawn_position(&sampler);
+            let origin_fitness = spawn_fitness(&targets, &sampler, 0, 0);
+            let spawn_fitness_v = spawn_fitness(&targets, &sampler, sx, sz);
+            assert!(
+                spawn_fitness_v <= origin_fitness,
+                "seed {seed}: spawn fitness {spawn_fitness_v} worse than origin {origin_fitness}"
+            );
+            if spawn_fitness_v < origin_fitness {
+                improved += 1;
+            }
+        }
+        assert!(improved > 0, "the finder should improve on the origin for some seed");
+    }
+
+    #[test]
+    fn spawn_finder_stays_in_search_range() {
+        // Both sweeps are bounded by MAX_RADIUS (2048) around the origin, so the
+        // result never escapes ~[-2048, 2048] on either axis.
+        for seed in [0i64, 7, 1234] {
+            let sampler = overworld_sampler(seed);
+            let (sx, sz) = find_spawn_position(&sampler);
+            assert!(sx.abs() <= 2048 && sz.abs() <= 2048, "seed {seed}: ({sx},{sz}) out of range");
+        }
     }
 }
