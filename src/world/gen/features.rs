@@ -370,6 +370,46 @@ struct BlockBlobConfig {
     can_place_on: BlockPredicate,
 }
 
+/// `UnderwaterMagmaConfiguration`.
+#[derive(Clone, Debug)]
+struct UnderwaterMagmaConfig {
+    floor_search_range: i32,
+    placement_radius_around_floor: i32,
+    placement_probability: f32,
+}
+
+/// `GeodeConfiguration` (+ the layer/crack/block settings the feature reads).
+#[derive(Clone, Debug)]
+struct GeodeConfig {
+    filling: StateProvider,
+    inner_layer: StateProvider,
+    alternate_inner_layer: StateProvider,
+    middle_layer: StateProvider,
+    outer_layer: StateProvider,
+    inner_placements: Vec<ParityBlock>,
+    cannot_replace: Option<BlockTag>,
+    invalid_blocks: Option<BlockTag>,
+    // GeodeLayerSettings (defaults 1.7/2.2/3.2/4.2/5.0).
+    layer_filling: f64,
+    layer_inner: f64,
+    layer_middle: f64,
+    layer_outer: f64,
+    // GeodeCrackSettings.
+    generate_crack_chance: f64,
+    base_crack_size: f64,
+    crack_point_offset: i32,
+    use_potential_placements_chance: f64,
+    use_alternate_layer0_chance: f64,
+    placements_require_layer0_alternate: bool,
+    outer_wall_distance: IntProvider,
+    distribution_points: IntProvider,
+    point_offset: IntProvider,
+    min_gen_offset: i32,
+    max_gen_offset: i32,
+    noise_multiplier: f64,
+    invalid_blocks_threshold: i32,
+}
+
 // ---------------------------------------------------------------------------
 // Tree feature (TreeFeature / TreeConfiguration and the placer system)
 // ---------------------------------------------------------------------------
@@ -902,6 +942,9 @@ enum ConfiguredFeature {
     Iceberg(IcebergConfig),
     BlockBlob(BlockBlobConfig),
     DesertWell,
+    MonsterRoom,
+    UnderwaterMagma(UnderwaterMagmaConfig),
+    Geode(GeodeConfig),
     Deferred(String),
 }
 
@@ -972,6 +1015,13 @@ impl ConfiguredFeature {
                 can_place_on: BlockPredicate::parse(&cfg["can_place_on"]),
             }),
             "desert_well" => ConfiguredFeature::DesertWell,
+            "monster_room" => ConfiguredFeature::MonsterRoom,
+            "underwater_magma" => ConfiguredFeature::UnderwaterMagma(UnderwaterMagmaConfig {
+                floor_search_range: cfg["floor_search_range"].as_i64().unwrap_or(0) as i32,
+                placement_radius_around_floor: cfg["placement_radius_around_floor"].as_i64().unwrap_or(0) as i32,
+                placement_probability: cfg["placement_probability_per_valid_position"].as_f64().unwrap_or(0.0) as f32,
+            }),
+            "geode" => ConfiguredFeature::Geode(parse_geode(cfg)),
             // `freeze_top_layer` (SnowAndFreezeFeature) is recognized but
             // deferred: its exact `Biome.shouldFreeze`/`shouldSnow` gates need
             // the biome-temperature/height-adjust plumbing (in surface_rules)
@@ -1447,6 +1497,9 @@ fn place_feature(
         ConfiguredFeature::Iceberg(cfg) => place_iceberg(cfg, ctx, random, origin),
         ConfiguredFeature::BlockBlob(cfg) => place_block_blob(cfg, ctx, random, origin),
         ConfiguredFeature::DesertWell => place_desert_well(ctx, random, origin),
+        ConfiguredFeature::MonsterRoom => place_monster_room(ctx, random, origin),
+        ConfiguredFeature::UnderwaterMagma(cfg) => place_underwater_magma(cfg, ctx, random, origin),
+        ConfiguredFeature::Geode(cfg) => place_geode(cfg, ctx, random, origin),
         ConfiguredFeature::Deferred(_) => {}
     }
 }
@@ -2682,6 +2735,388 @@ fn place_desert_well(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin
     ctx.level.set_block(origin.x + pick1.0, origin.y - 1, origin.z + pick1.1, SuspiciousSand);
     let pick2 = WATER_POS[random.next_int_bounded(5) as usize];
     ctx.level.set_block(origin.x + pick2.0, origin.y - 2, origin.z + pick2.1, SuspiciousSand);
+}
+
+// ---------------------------------------------------------------------------
+// Underground group: monster_room, underwater_magma, geode
+// ---------------------------------------------------------------------------
+
+/// `BlockState.isSolid()` over the parity alphabet — approximated by
+/// `blocksMotion` (full cubes and the like; water/lava/air/snow-layer are not
+/// solid). Documented approximation; draws no RNG so it can only nudge which
+/// dungeon cells become cobblestone, never desync a feature.
+fn is_solid(b: ParityBlock) -> bool {
+    b.blocks_motion()
+}
+
+/// `MonsterRoomFeature.place`. The spawner's mob and the chests' loot tables are
+/// block-entity NBT that Vela does not model in worldgen — the block states are
+/// placed and the exact RNG is consumed (per chest a `nextLong` loot seed, and a
+/// `nextInt(4)` spawner mob pick), but the NBT is deferred (documented).
+fn place_monster_room(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    use ParityBlock::{Air, Chest, Cobblestone, MossyCobblestone, Spawner};
+    let can_replace = |b: ParityBlock| !BlockTag::FeaturesCannotReplace.contains(b);
+    let safe_set = |ctx: &mut PlacementCtx, x: i32, y: i32, z: i32, s: ParityBlock| {
+        if can_replace(ctx.level.get_block(x, y, z)) {
+            ctx.level.set_block(x, y, z, s);
+        }
+    };
+    let xr = random.next_int_bounded(2) + 2;
+    let min_x = -xr - 1;
+    let max_x = xr + 1;
+    let zr = random.next_int_bounded(2) + 2;
+    let min_z = -zr - 1;
+    let max_z = zr + 1;
+    let mut hole_count = 0;
+    for dx in min_x..=max_x {
+        for dy in -1..=4 {
+            for dz in min_z..=max_z {
+                let (x, y, z) = (origin.x + dx, origin.y + dy, origin.z + dz);
+                let solid = is_solid(ctx.level.get_block(x, y, z));
+                if dy == -1 && !solid {
+                    return;
+                }
+                if dy == 4 && !solid {
+                    return;
+                }
+                if (dx == min_x || dx == max_x || dz == min_z || dz == max_z)
+                    && dy == 0
+                    && ctx.level.get_block(x, y, z).is_air()
+                    && ctx.level.get_block(x, y + 1, z).is_air()
+                {
+                    hole_count += 1;
+                }
+            }
+        }
+    }
+    if !(1..=5).contains(&hole_count) {
+        return;
+    }
+    for dx in min_x..=max_x {
+        for dy in (-1..=3).rev() {
+            for dz in min_z..=max_z {
+                let (x, y, z) = (origin.x + dx, origin.y + dy, origin.z + dz);
+                let wall_state = ctx.level.get_block(x, y, z);
+                if dx == min_x || dy == -1 || dz == min_z || dx == max_x || dy == 4 || dz == max_z {
+                    if y >= ctx.level.min_y() && !is_solid(ctx.level.get_block(x, y - 1, z)) {
+                        ctx.level.set_block(x, y, z, Air);
+                    } else if is_solid(wall_state) && wall_state != Chest {
+                        if dy == -1 && random.next_int_bounded(4) != 0 {
+                            safe_set(ctx, x, y, z, MossyCobblestone);
+                        } else {
+                            safe_set(ctx, x, y, z, Cobblestone);
+                        }
+                    }
+                } else if wall_state != Chest && wall_state != Spawner {
+                    safe_set(ctx, x, y, z, Air);
+                }
+            }
+        }
+    }
+    // Direction.Plane.HORIZONTAL: NORTH, EAST, SOUTH, WEST.
+    const HORIZ: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
+    for _cc in 0..2 {
+        for _i in 0..3 {
+            let xc = origin.x + random.next_int_bounded(xr * 2 + 1) - xr;
+            let yc = origin.y;
+            let zc = origin.z + random.next_int_bounded(zr * 2 + 1) - zr;
+            if ctx.level.get_block(xc, yc, zc).is_air() {
+                let wall_count = HORIZ
+                    .iter()
+                    .filter(|&&(dx, dz)| is_solid(ctx.level.get_block(xc + dx, yc, zc + dz)))
+                    .count();
+                if wall_count == 1 {
+                    safe_set(ctx, xc, yc, zc, Chest);
+                    // RandomizableContainer.setBlockEntityLootTable → one nextLong
+                    // (the loot seed); the loot NBT itself is deferred.
+                    let _loot_seed = random.next_long();
+                    break;
+                }
+            }
+        }
+    }
+    safe_set(ctx, origin.x, origin.y, origin.z, Spawner);
+    // MonsterRoomFeature.randomEntityId → Util.getRandom(MOBS, random) = one
+    // nextInt(4); the spawned mob NBT is deferred.
+    let _mob = random.next_int_bounded(4);
+}
+
+/// `Column.scan` reduced to the floor Y — the down-scan edge below the water
+/// column at `origin` (used by underwater_magma). Returns `None` when `origin`
+/// is not water or no non-water floor is within `search_range`.
+fn magma_floor_y(ctx: &PlacementCtx, origin: Pos, search_range: i32) -> Option<i32> {
+    let is_water = |b: ParityBlock| b == ParityBlock::Water;
+    if !is_water(ctx.level.get_block(origin.x, origin.y, origin.z)) {
+        return None;
+    }
+    let mut y = origin.y;
+    let mut i = 1;
+    while i < search_range && is_water(ctx.level.get_block(origin.x, y, origin.z)) {
+        y -= 1;
+        i += 1;
+    }
+    if !is_water(ctx.level.get_block(origin.x, y, origin.z)) {
+        Some(y)
+    } else {
+        None
+    }
+}
+
+/// `UnderwaterMagmaFeature.isVisibleFromOutside` — a face is visible when its
+/// occlusion shape is not a full block. Approximated over the parity alphabet by
+/// "air or fluid" (the empty-occlusion cases); draws no RNG.
+fn magma_visible_from_outside(b: ParityBlock) -> bool {
+    b.is_air() || b.is_fluid()
+}
+
+fn magma_valid_placement(ctx: &PlacementCtx, p: Pos) -> bool {
+    let s = ctx.level.get_block(p.x, p.y, p.z);
+    let water_or_air = s == ParityBlock::Water || s.is_air();
+    if !water_or_air && !magma_visible_from_outside(ctx.level.get_block(p.x, p.y - 1, p.z)) {
+        // Direction.Plane.HORIZONTAL.
+        const HORIZ: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
+        for &(dx, dz) in HORIZ.iter() {
+            if magma_visible_from_outside(ctx.level.get_block(p.x + dx, p.y, p.z + dz)) {
+                return false;
+            }
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// `UnderwaterMagmaFeature.place`.
+fn place_underwater_magma(cfg: &UnderwaterMagmaConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    let floor_y = match magma_floor_y(ctx, origin, cfg.floor_search_range) {
+        Some(y) => y,
+        None => return,
+    };
+    let r = cfg.placement_radius_around_floor;
+    let (min_x, max_x) = (origin.x - r, origin.x + r);
+    let (min_y, max_y) = (floor_y - r, floor_y + r);
+    let (min_z, max_z) = (origin.z - r, origin.z + r);
+    // `BlockPos.betweenClosedStream` order: x fastest, then y, then z. The first
+    // stream filter draws one nextFloat per position in that order.
+    for z in min_z..=max_z {
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                if random.next_float() < cfg.placement_probability && magma_valid_placement(ctx, Pos::new(x, y, z)) {
+                    ctx.level.set_block(x, y, z, ParityBlock::MagmaBlock);
+                }
+            }
+        }
+    }
+}
+
+fn parse_geode(cfg: &Value) -> GeodeConfig {
+    let blocks = &cfg["blocks"];
+    let layers = &cfg["layers"];
+    let crack = &cfg["crack"];
+    let int_or = |v: &Value, min: i32, max: i32| {
+        if v.is_null() {
+            IntProvider::Uniform { min, max }
+        } else {
+            IntProvider::parse(v)
+        }
+    };
+    let tag_of = |v: &Value| v.as_str().map(|s| s.trim_start_matches('#')).and_then(BlockTag::from_id);
+    GeodeConfig {
+        filling: StateProvider::parse(&blocks["filling_provider"]),
+        inner_layer: StateProvider::parse(&blocks["inner_layer_provider"]),
+        alternate_inner_layer: StateProvider::parse(&blocks["alternate_inner_layer_provider"]),
+        middle_layer: StateProvider::parse(&blocks["middle_layer_provider"]),
+        outer_layer: StateProvider::parse(&blocks["outer_layer_provider"]),
+        inner_placements: blocks["inner_placements"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|s| s["Name"].as_str().and_then(ParityBlock::from_name))
+            .collect(),
+        cannot_replace: tag_of(&blocks["cannot_replace"]),
+        invalid_blocks: tag_of(&blocks["invalid_blocks"]),
+        layer_filling: layers.get("filling").and_then(Value::as_f64).unwrap_or(1.7),
+        layer_inner: layers.get("inner_layer").and_then(Value::as_f64).unwrap_or(2.2),
+        layer_middle: layers.get("middle_layer").and_then(Value::as_f64).unwrap_or(3.2),
+        layer_outer: layers.get("outer_layer").and_then(Value::as_f64).unwrap_or(4.2),
+        generate_crack_chance: crack.get("generate_crack_chance").and_then(Value::as_f64).unwrap_or(1.0),
+        base_crack_size: crack.get("base_crack_size").and_then(Value::as_f64).unwrap_or(2.0),
+        crack_point_offset: crack.get("crack_point_offset").and_then(Value::as_i64).unwrap_or(2) as i32,
+        use_potential_placements_chance: cfg.get("use_potential_placements_chance").and_then(Value::as_f64).unwrap_or(0.35),
+        use_alternate_layer0_chance: cfg.get("use_alternate_layer0_chance").and_then(Value::as_f64).unwrap_or(0.0),
+        placements_require_layer0_alternate: cfg
+            .get("placements_require_layer0_alternate")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        outer_wall_distance: int_or(&cfg["outer_wall_distance"], 4, 5),
+        distribution_points: int_or(&cfg["distribution_points"], 3, 4),
+        point_offset: int_or(&cfg["point_offset"], 1, 2),
+        min_gen_offset: cfg.get("min_gen_offset").and_then(Value::as_i64).unwrap_or(-16) as i32,
+        max_gen_offset: cfg.get("max_gen_offset").and_then(Value::as_i64).unwrap_or(16) as i32,
+        noise_multiplier: cfg.get("noise_multiplier").and_then(Value::as_f64).unwrap_or(0.05),
+        invalid_blocks_threshold: cfg["invalid_blocks_threshold"].as_i64().unwrap_or(0) as i32,
+    }
+}
+
+/// `org.joml.Math.invsqrt(double)` = `1.0 / sqrt(x)` (JOML default).
+fn inv_sqrt(x: f64) -> f64 {
+    1.0 / x.sqrt()
+}
+
+/// `BuddingAmethystBlock.canClusterGrowAtState` — air, or a full-source water.
+fn amethyst_can_cluster_grow(b: ParityBlock) -> bool {
+    b.is_air() || b == ParityBlock::Water
+}
+
+/// `GeodeFeature.place`.
+fn place_geode(cfg: &GeodeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    let mut points: Vec<(Pos, i32)> = Vec::new();
+    let num_points = cfg.distribution_points.sample(random);
+    // NormalNoise.create(new WorldgenRandom(new LegacyRandomSource(level.getSeed())), -4, 1.0).
+    let noise = {
+        let params = NoiseParameters { first_octave: -4, amplitudes: vec![1.0] };
+        NormalNoise::create(&mut RandomSource::legacy(ctx.level.seed()), &params)
+    };
+    let mut crack_points: Vec<Pos> = Vec::new();
+    let outer_max = match &cfg.outer_wall_distance {
+        IntProvider::Uniform { max, .. } => *max,
+        IntProvider::Constant(c) => *c,
+        _ => 5,
+    };
+    let crack_size_adjust = num_points as f64 / outer_max as f64;
+    let inner_air = 1.0 / cfg.layer_filling.sqrt();
+    let innermost_block_layer = 1.0 / (cfg.layer_inner + crack_size_adjust).sqrt();
+    let inner_crust = 1.0 / (cfg.layer_middle + crack_size_adjust).sqrt();
+    let outer_crust = 1.0 / (cfg.layer_outer + crack_size_adjust).sqrt();
+    let crack_size = 1.0
+        / (cfg.base_crack_size + random.next_double() / 2.0 + if num_points > 3 { crack_size_adjust } else { 0.0 }).sqrt();
+    let should_generate_crack = (random.next_float() as f64) < cfg.generate_crack_chance;
+    let mut num_invalid = 0;
+
+    for _ in 0..num_points {
+        let x = cfg.outer_wall_distance.sample(random);
+        let y = cfg.outer_wall_distance.sample(random);
+        let z = cfg.outer_wall_distance.sample(random);
+        let pos = Pos::new(origin.x + x, origin.y + y, origin.z + z);
+        let state = ctx.level.get_block(pos.x, pos.y, pos.z);
+        if state.is_air() || cfg.invalid_blocks.map(|t| t.contains(state)).unwrap_or(false) {
+            num_invalid += 1;
+            if num_invalid > cfg.invalid_blocks_threshold {
+                return;
+            }
+        }
+        points.push((pos, cfg.point_offset.sample(random)));
+    }
+
+    if should_generate_crack {
+        let idx = random.next_int_bounded(4);
+        let off = num_points * 2 + 1;
+        match idx {
+            0 => {
+                crack_points.push(Pos::new(origin.x + off, origin.y + 7, origin.z));
+                crack_points.push(Pos::new(origin.x + off, origin.y + 5, origin.z));
+                crack_points.push(Pos::new(origin.x + off, origin.y + 1, origin.z));
+            }
+            1 => {
+                crack_points.push(Pos::new(origin.x, origin.y + 7, origin.z + off));
+                crack_points.push(Pos::new(origin.x, origin.y + 5, origin.z + off));
+                crack_points.push(Pos::new(origin.x, origin.y + 1, origin.z + off));
+            }
+            2 => {
+                crack_points.push(Pos::new(origin.x + off, origin.y + 7, origin.z + off));
+                crack_points.push(Pos::new(origin.x + off, origin.y + 5, origin.z + off));
+                crack_points.push(Pos::new(origin.x + off, origin.y + 1, origin.z + off));
+            }
+            _ => {
+                crack_points.push(Pos::new(origin.x, origin.y + 7, origin.z));
+                crack_points.push(Pos::new(origin.x, origin.y + 5, origin.z));
+                crack_points.push(Pos::new(origin.x, origin.y + 1, origin.z));
+            }
+        }
+    }
+
+    let mut potential: Vec<Pos> = Vec::new();
+    let can_replace = |b: ParityBlock| !cfg.cannot_replace.map(|t| t.contains(b)).unwrap_or(false);
+    let safe_set = |ctx: &mut PlacementCtx, p: Pos, s: ParityBlock| {
+        if can_replace(ctx.level.get_block(p.x, p.y, p.z)) {
+            ctx.level.set_block(p.x, p.y, p.z, s);
+        }
+    };
+
+    // `BlockPos.betweenClosed` order: x fastest, then y, then z.
+    for pz in origin.z + cfg.min_gen_offset..=origin.z + cfg.max_gen_offset {
+        for py in origin.y + cfg.min_gen_offset..=origin.y + cfg.max_gen_offset {
+            for px in origin.x + cfg.min_gen_offset..=origin.x + cfg.max_gen_offset {
+                let inside = Pos::new(px, py, pz);
+                let noise_offset = noise.get_value(px as f64, py as f64, pz as f64) * cfg.noise_multiplier;
+                let mut dist_shell = 0.0;
+                let mut dist_crack = 0.0;
+                for (pp, poff) in &points {
+                    let d = pos_dist_sqr(inside, *pp) + *poff as f64;
+                    dist_shell += inv_sqrt(d) + noise_offset;
+                }
+                for cp in &crack_points {
+                    let d = pos_dist_sqr(inside, *cp) + cfg.crack_point_offset as f64;
+                    dist_crack += inv_sqrt(d) + noise_offset;
+                }
+                if dist_shell < outer_crust {
+                    continue;
+                }
+                if should_generate_crack && dist_crack >= crack_size && dist_shell < inner_air {
+                    safe_set(ctx, inside, ParityBlock::Air);
+                } else if dist_shell >= inner_air {
+                    if let Some(s) = cfg.filling.get_state(ctx.level, random, inside) {
+                        safe_set(ctx, inside, s);
+                    }
+                } else if dist_shell >= innermost_block_layer {
+                    let use_alt = (random.next_float() as f64) < cfg.use_alternate_layer0_chance;
+                    let provider = if use_alt { &cfg.alternate_inner_layer } else { &cfg.inner_layer };
+                    if let Some(s) = provider.get_state(ctx.level, random, inside) {
+                        safe_set(ctx, inside, s);
+                    }
+                    if (!cfg.placements_require_layer0_alternate || use_alt)
+                        && (random.next_float() as f64) < cfg.use_potential_placements_chance
+                    {
+                        potential.push(inside);
+                    }
+                } else if dist_shell >= inner_crust {
+                    if let Some(s) = cfg.middle_layer.get_state(ctx.level, random, inside) {
+                        safe_set(ctx, inside, s);
+                    }
+                } else if dist_shell >= outer_crust {
+                    if let Some(s) = cfg.outer_layer.get_state(ctx.level, random, inside) {
+                        safe_set(ctx, inside, s);
+                    }
+                }
+            }
+        }
+    }
+
+    // Direction.values(): DOWN, UP, NORTH, SOUTH, WEST, EAST.
+    const DIRS: [(i32, i32, i32); 6] =
+        [(0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)];
+    for crystal in &potential {
+        if cfg.inner_placements.is_empty() {
+            continue;
+        }
+        let block = cfg.inner_placements[random.next_int_bounded(cfg.inner_placements.len() as i32) as usize];
+        for &(dx, dy, dz) in DIRS.iter() {
+            let place = Pos::new(crystal.x + dx, crystal.y + dy, crystal.z + dz);
+            let place_state = ctx.level.get_block(place.x, place.y, place.z);
+            if amethyst_can_cluster_grow(place_state) {
+                safe_set(ctx, place, block);
+                break;
+            }
+        }
+    }
+}
+
+/// `Vec3i.distSqr(Vec3i)` — integer component differences, summed as doubles.
+fn pos_dist_sqr(a: Pos, b: Pos) -> f64 {
+    let dx = (a.x - b.x) as f64;
+    let dy = (a.y - b.y) as f64;
+    let dz = (a.z - b.z) as f64;
+    dx * dx + dy * dy + dz * dz
 }
 
 // ---------------------------------------------------------------------------
@@ -4589,8 +5024,9 @@ mod tests {
         // `oak` is now a real tree feature.
         assert!(matches!(registry.configured.get("oak"), Some(ConfiguredFeature::Tree(_))));
         assert!(matches!(registry.configured.get("trees_plains"), Some(ConfiguredFeature::RandomSelector(_))));
-        // A feature type this milestone still defers stays `Deferred`.
-        assert!(!registry.configured.get("amethyst_geode").map(|c| c.is_implemented()).unwrap_or(true));
+        // A feature type this milestone still defers (fossils need Mojang NBT
+        // structure templates — clean-room policy) stays `Deferred`.
+        assert!(!registry.configured.get("fossil_coal").map(|c| c.is_implemented()).unwrap_or(true));
     }
 
     // --- Tree feature structural tests ---------------------------------------
@@ -5312,5 +5748,91 @@ mod tests {
         assert!(a.iter().any(|(_, b)| *b == SandstoneSlab), "the well has a sandstone-slab rim");
         let sus = a.iter().filter(|(_, b)| *b == SuspiciousSand).count();
         assert!(sus >= 1, "at least one suspicious-sand block, got {sus}");
+    }
+
+    /// `monster_room` carves a cobblestone dungeon shell with a spawner core when
+    /// the room has 1–5 doorways; deterministic. The spawner mob and chest loot
+    /// are block-entity NBT (deferred) but the states + RNG are placed/consumed.
+    #[test]
+    fn monster_room_builds_dungeon() {
+        use ParityBlock::*;
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(300); // all stone below y=300
+            // Punch a two-high doorway at both candidate border columns so a
+            // hole is counted regardless of the room's random xr (2 or 3).
+            for &dx in &[3, 4] {
+                level.set_block(dx, 100, 0, Air);
+                level.set_block(dx, 101, 0, Air);
+            }
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_monster_room(&mut ctx, &mut random, Pos::new(0, 100, 0));
+            let mut writes: Vec<_> = level.blocks.iter().map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(2);
+        assert_eq!(a, run(2), "monster room deterministic");
+        assert_eq!(a.iter().filter(|(_, b)| *b == Spawner).count(), 1, "one spawner at the core");
+        assert!(a.iter().any(|(_, b)| matches!(b, Cobblestone | MossyCobblestone)), "cobblestone shell");
+    }
+
+    /// `underwater_magma` sows magma blocks in the ocean floor beneath a water
+    /// column, deterministically.
+    #[test]
+    fn underwater_magma_sows_magma() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:warm_ocean"]);
+        let cfg = match reg.configured.get("underwater_magma") {
+            Some(ConfiguredFeature::UnderwaterMagma(c)) => c.clone(),
+            other => panic!("underwater_magma is not underwater_magma: {other:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(56); // stone below 56
+            for z in -4..5 {
+                for x in -4..5 {
+                    for y in 56..70 {
+                        level.set_block(x, y, z, Water);
+                    }
+                }
+            }
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_underwater_magma(&cfg, &mut ctx, &mut random, Pos::new(0, 57, 0));
+            level.blocks.iter().filter(|(_, b)| **b == MagmaBlock).count()
+        };
+        let a = run(4);
+        assert_eq!(a, run(4), "underwater magma deterministic");
+        assert!(a >= 1, "at least one magma block in the floor, got {a}");
+    }
+
+    /// `geode` (amethyst_geode) grows nested amethyst / calcite / smooth-basalt
+    /// shells with budding amethyst and crystal placements, deterministically.
+    #[test]
+    fn geode_grows_amethyst_shells() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:dripstone_caves"]);
+        let cfg = match reg.configured.get("amethyst_geode") {
+            Some(ConfiguredFeature::Geode(c)) => c.clone(),
+            other => panic!("amethyst_geode is not a geode: {other:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(300); // all stone
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_geode(&cfg, &mut ctx, &mut random, Pos::new(0, 100, 0));
+            let mut writes: Vec<_> = level.blocks.iter().map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(3);
+        assert_eq!(a, run(3), "geode deterministic");
+        assert!(a.iter().any(|(_, b)| *b == Calcite), "the middle layer is calcite");
+        assert!(a.iter().any(|(_, b)| *b == AmethystBlock), "the inner layer is amethyst block");
+        assert!(a.iter().any(|(_, b)| *b == SmoothBasalt), "the outer crust is smooth basalt");
+        assert!(a.iter().any(|(_, b)| *b == BuddingAmethyst), "budding amethyst appears");
     }
 }

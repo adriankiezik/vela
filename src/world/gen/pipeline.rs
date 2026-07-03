@@ -524,6 +524,10 @@ impl DecorationLevel for WorldGenRegion<'_> {
     fn sea_level(&self) -> i32 {
         self.sea_level
     }
+
+    fn seed(&self) -> i64 {
+        self.seed
+    }
 }
 
 /// The process-wide overworld feature registry (parsed once from the vendored

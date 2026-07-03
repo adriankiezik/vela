@@ -75,6 +75,10 @@ pub trait DecorationLevel {
     fn min_y(&self) -> i32;
     fn gen_depth(&self) -> i32;
     fn sea_level(&self) -> i32;
+    /// `level.getSeed()` — the raw world seed (geode noise seeding).
+    fn seed(&self) -> i64 {
+        0
+    }
 
     fn max_y(&self) -> i32 {
         self.min_y() + self.gen_depth()
