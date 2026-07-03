@@ -586,6 +586,17 @@ pub enum BlockTag {
     MossReplaceable,
     /// `#minecraft:lush_ground_replaceable` (= `#moss_replaceable ∪ clay/gravel/sand`).
     LushGroundReplaceable,
+    /// `#minecraft:terracotta` — plain + coloured terracotta (parity-alphabet subset).
+    Terracotta,
+    /// `#minecraft:azalea_grows_on` (root_system rooted_azalea_tree floor).
+    AzaleaGrowsOn,
+    /// `#minecraft:azalea_root_replaceable` (root_system root dirt replaceable).
+    AzaleaRootReplaceable,
+    /// `#minecraft:sculk_replaceable_world_gen` (sculk_patch sculk substrate).
+    SculkReplaceableWorldGen,
+    /// `#minecraft:replaceable_by_mushrooms` — approximated by air / empty-collision
+    /// plants; only gates huge-mushroom block writes (draws no RNG), documented.
+    ReplaceableByMushrooms,
 }
 
 impl BlockTag {
@@ -614,6 +625,17 @@ impl BlockTag {
             "corals" => BlockTag::Corals,
             "moss_replaceable" => BlockTag::MossReplaceable,
             "lush_ground_replaceable" => BlockTag::LushGroundReplaceable,
+            "terracotta" => BlockTag::Terracotta,
+            "azalea_grows_on" => BlockTag::AzaleaGrowsOn,
+            "azalea_root_replaceable" => BlockTag::AzaleaRootReplaceable,
+            "sculk_replaceable_world_gen" | "sculk_replaceable" => BlockTag::SculkReplaceableWorldGen,
+            "replaceable_by_mushrooms" => BlockTag::ReplaceableByMushrooms,
+            // `#huge_{red,brown}_mushroom_can_place_on` = `#substrate_overworld ∪
+            // mycelium/podzol (∪ nylium, not in alphabet)` = `#substrate_overworld`
+            // over the parity alphabet.
+            "huge_red_mushroom_can_place_on" | "huge_brown_mushroom_can_place_on" => {
+                BlockTag::BeneathTreePodzolReplaceable
+            }
             _ => return None,
         })
     }
@@ -695,6 +717,40 @@ impl BlockTag {
             BlockTag::LushGroundReplaceable => {
                 BlockTag::MossReplaceable.contains(b) || matches!(b, Clay | Gravel | Sand)
             }
+            // `#terracotta` — the coloured terracotta in the parity alphabet.
+            BlockTag::Terracotta => matches!(
+                b,
+                Terracotta | WhiteTerracotta | OrangeTerracotta | YellowTerracotta
+                    | BrownTerracotta | RedTerracotta | LightGrayTerracotta
+            ),
+            // `#substrate_overworld ∪ #sand ∪ #terracotta ∪ snow_block ∪ powder_snow`.
+            BlockTag::AzaleaGrowsOn => {
+                BlockTag::BeneathTreePodzolReplaceable.contains(b)
+                    || BlockTag::Terracotta.contains(b)
+                    || matches!(b, Sand | RedSand | SnowBlock | PowderSnow)
+            }
+            // `#base_stone_overworld ∪ #substrate_overworld ∪ #terracotta ∪ red_sand
+            // ∪ clay ∪ gravel ∪ sand ∪ snow_block ∪ powder_snow`.
+            BlockTag::AzaleaRootReplaceable => {
+                BlockTag::BaseStoneOverworld.contains(b)
+                    || BlockTag::BeneathTreePodzolReplaceable.contains(b)
+                    || BlockTag::Terracotta.contains(b)
+                    || matches!(b, RedSand | Clay | Gravel | Sand | SnowBlock | PowderSnow)
+            }
+            // `#sculk_replaceable(_world_gen)` over the parity alphabet.
+            BlockTag::SculkReplaceableWorldGen => {
+                BlockTag::BaseStoneOverworld.contains(b)
+                    || BlockTag::BeneathTreePodzolReplaceable.contains(b)
+                    || BlockTag::Terracotta.contains(b)
+                    || matches!(
+                        b,
+                        Sand | RedSand | Gravel | Calcite | SmoothBasalt | Clay | DripstoneBlock
+                            | RedSandstone | Sandstone | Sulfur | Cinnabar
+                    )
+            }
+            // Approximated: air or an empty-collision plant/growth. Gates only
+            // huge-mushroom block writes (no RNG), documented deviation.
+            BlockTag::ReplaceableByMushrooms => b.is_air() || (!b.blocks_motion() && !b.is_fluid()),
         }
     }
 }

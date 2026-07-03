@@ -36,36 +36,42 @@
 //! the pointed_dripstone selector); the **coral** group (`coral_tree`/
 //! `coral_claw`/`coral_mushroom`); `vegetation_patch` /
 //! `waterlogged_vegetation_patch` (moss/clay patches — see the JavaHashSet note);
-//! and `freeze_top_layer`. Note MC 26.2 replaced the old `random_patch` feature
-//! with `simple_block` repeated by its placement chain, so grass/flower patches
-//! flow through `simple_block`.
+//! `freeze_top_layer`; the **lush-caves close-out** — `cave_vines`
+//! (`cave_vine`/`cave_vine_in_moss` via `block_column`), `dripleaf`
+//! (`big_dripleaf`/`big_dripleaf_stem`/`small_dripleaf` via
+//! `simple_random_selector`+`block_column`), `multiface_growth`
+//! (`glow_lichen`/`sculk_vein`; face booleans collapse, direction shuffles + the
+//! spread `nextFloat`/`allShuffled` consumed 1:1) and `root_system`
+//! (`rooted_azalea_tree`); `random_boolean_selector`, `sequence` (`sulfur_pool`)
+//! and `weighted_random_selector`; `fallen_tree`, `huge_red_mushroom` /
+//! `huge_brown_mushroom` (face booleans collapse), and `vines`. With
+//! `cave_vine`/`dripleaf`/`moss_vegetation`/`pale_moss_vegetation` all supported,
+//! the once-deferred patches `moss_patch_ceiling`, `clay_with_dripleaves`,
+//! `clay_pool_with_dripleaves` and `pale_moss_patch` now run fully. Note MC 26.2
+//! replaced the old `random_patch` feature with `simple_block` repeated by its
+//! placement chain, so grass/flower patches flow through `simple_block`.
 //!
 //! ## Deferred features (skipped, documented)
-//! Only two categories remain, each for a policy reason:
-//! * **Requires Mojang NBT structure-template assets** (clean-room policy —
-//!   Vela ships no Mojang assets): `fossil` (fossils are processor-based template
-//!   placements in 26.2).
-//! * **Requires a still-deferred nested vegetation feature** — the lush-caves
-//!   vegetation placers `cave_vines` / `big_dripleaf` / `small_dripleaf`
-//!   (`dripleaf`) / `glow_lichen`+`spore_blossom` via `multiface_growth` /
-//!   `root_system`, plus `pale_moss_vegetation` (not vendored). Because a
-//!   `vegetation_patch`'s `distributeVegetation` loop threads the nested
-//!   feature's RNG between its per-surface draws, any patch whose vegetation
-//!   feature is one of these is skipped **whole** (parity-safe: the RNG is
-//!   reseeded per top feature). This affects `moss_patch_ceiling`,
-//!   `clay_with_dripleaves`, `clay_pool_with_dripleaves`, and `pale_moss_patch`;
-//!   `moss_patch` (vegetation = `simple_block`) runs fully.
-//! * Every nether/end feature (out of overworld scope).
-//! * Standalone overworld features outside the groups ported here remain
-//!   recognized-but-skipped: `fallen_tree`, `block_pile`, `huge_brown_mushroom`/
-//!   `huge_red_mushroom`, `vines`, `sculk_patch`, and the lush-caves standalone
-//!   placers `root_system` / `multiface_growth` (glow_lichen/sculk_vein). These
-//!   are independent features (they do **not** gate the `vegetation_patch` work
-//!   above) left for a follow-up.
-//!
-//! Each deferred feature is still recognized (so the sort/seed accounting is
-//! complete) but its placement is not run — parity-safe because the RNG is
-//! reseeded per feature.
+//! Every remaining deferred **overworld** feature is either template-gated or
+//! blocked by the parity model; each stays recognized (so the sort/seed
+//! accounting is complete) but its placement is not run — parity-safe because the
+//! RNG is reseeded per top feature.
+//! * **Requires Mojang NBT structure-template assets** (clean-room policy — Vela
+//!   ships no Mojang assets): `fossil` (processor-based template placement), and
+//!   therefore `rooted_sulfur_spring` — its nested tree feature `sulfur_spring`
+//!   (`weighted_random_selector` → `sequence` → `template`) is template-gated, so
+//!   `root_system` skips that whole feature (`rooted_azalea_tree` runs fully).
+//! * **Incompatible with the property-collapse parity model** — `sculk_patch`.
+//!   The `SculkSpreader` charge simulation's RNG draw sequence (the per-cursor
+//!   `attemptSpreadVein` / `attemptUseCharge` branch selection, `availableFaces`,
+//!   the direction/neighbour shuffles) is driven by each block's tracked
+//!   multiface `facings` state, which this engine collapses (face booleans are
+//!   dropped, per the established property-collapse precedent). A bit-exact port
+//!   is therefore not achievable without modelling per-block face state, so
+//!   `sculk_patch` is skipped whole; `sculk_vein` on its own (`multiface_growth`)
+//!   *is* supported. (Skipping is parity-safe: reseeded per top feature.)
+//! * Every nether/end feature (out of overworld scope). `block_pile` is
+//!   nether-only in the vendored data (no overworld biome references it).
 //!
 //! ## Java HashSet iteration order (vegetation_patch)
 //! `VegetationPatchFeature` uses a plain `java.util.HashSet<BlockPos>` (verified
@@ -534,6 +540,59 @@ struct VegetationPatchConfig {
     waterlogged: bool,
 }
 
+/// `MultifaceGrowthConfiguration` (glow_lichen / sculk_vein). The multiface
+/// block collapses to its default state (face booleans dropped); every RNG draw
+/// (the direction shuffles and the spread `nextFloat`) is consumed 1:1.
+#[derive(Clone, Debug)]
+struct MultifaceGrowthConfig {
+    block: ParityBlock,
+    search_range: i32,
+    can_place_on_floor: bool,
+    can_place_on_ceiling: bool,
+    can_place_on_wall: bool,
+    chance_of_spreading: f32,
+    can_be_placed_on: Vec<ParityBlock>,
+}
+
+/// `RootSystemConfiguration` (rooted_azalea_tree / rooted_sulfur_spring).
+#[derive(Clone, Debug)]
+struct RootSystemConfig {
+    feature: NestedFeature,
+    required_vertical_space_for_tree: i32,
+    level_test_distance: i32,
+    max_level_deviation: i32,
+    root_radius: i32,
+    root_replaceable: Option<BlockTag>,
+    root_state_provider: StateProvider,
+    root_placement_attempts: i32,
+    root_column_max_height: i32,
+    hanging_root_radius: i32,
+    hanging_roots_vertical_span: i32,
+    hanging_root_state_provider: StateProvider,
+    hanging_root_placement_attempts: i32,
+    allowed_vertical_water_for_tree: i32,
+    allowed_tree_position: BlockPredicate,
+}
+
+/// `FallenTreeConfiguration`.
+#[derive(Clone, Debug)]
+struct FallenTreeConfig {
+    trunk_provider: StateProvider,
+    log_length: IntProvider,
+    stump_decorators: Vec<TreeDecorator>,
+    log_decorators: Vec<TreeDecorator>,
+}
+
+/// `HugeMushroomFeatureConfiguration` + the red/brown discriminant.
+#[derive(Clone, Debug)]
+struct HugeMushroomConfig {
+    cap_provider: StateProvider,
+    stem_provider: StateProvider,
+    foliage_radius: i32,
+    can_place_on: BlockPredicate,
+    brown: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Tree feature (TreeFeature / TreeConfiguration and the placer system)
 // ---------------------------------------------------------------------------
@@ -842,6 +901,8 @@ enum TreeDecorator {
     /// `AlterGroundDecorator` — replaces the ground under the trunk (podzol for
     /// mega spruce/pine).
     AlterGround { provider: StateProvider },
+    /// `AttachedToLogsDecorator` — hangs a block (mushrooms) off log faces.
+    AttachedToLogs { probability: f32, block_provider: StateProvider, directions: Vec<(i32, i32, i32)> },
     /// `AttachedToLeavesDecorator` — hangs a block (mangrove propagule) off leaves.
     AttachedToLeaves {
         probability: f32,
@@ -864,6 +925,16 @@ impl TreeDecorator {
             "trunk_vine" => TreeDecorator::TrunkVine,
             "leave_vine" => TreeDecorator::LeaveVine { probability: prob },
             "alter_ground" => TreeDecorator::AlterGround { provider: StateProvider::parse(&v["provider"]) },
+            "attached_to_logs" => TreeDecorator::AttachedToLogs {
+                probability: prob,
+                block_provider: StateProvider::parse(&v["block_provider"]),
+                directions: v["directions"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|d| parse_direction(d.as_str().unwrap_or("")))
+                    .collect(),
+            },
             "attached_to_leaves" => TreeDecorator::AttachedToLeaves {
                 probability: prob,
                 exclusion_radius_xz: v.get("exclusion_radius_xz").and_then(Value::as_i64).unwrap_or(0) as i32,
@@ -1085,6 +1156,17 @@ enum ConfiguredFeature {
     CoralMushroom,
     VegetationPatch(VegetationPatchConfig),
     FreezeTopLayer,
+    /// `RandomBooleanSelectorFeature` — one `nextBoolean` picks true/false branch.
+    RandomBooleanSelector { feature_true: NestedFeature, feature_false: NestedFeature },
+    /// `SequenceFeature` — place each nested placed feature in order.
+    Sequence(Vec<NestedFeature>),
+    /// `WeightedRandomSelectorFeature` — `nextInt(total_weight)` picks one entry.
+    WeightedRandomSelector(Vec<(NestedFeature, i32)>),
+    MultifaceGrowth(MultifaceGrowthConfig),
+    RootSystem(RootSystemConfig),
+    FallenTree(FallenTreeConfig),
+    HugeMushroom(HugeMushroomConfig),
+    Vines,
     Deferred(String),
 }
 
@@ -1174,6 +1256,37 @@ impl ConfiguredFeature {
             "vegetation_patch" => ConfiguredFeature::VegetationPatch(parse_vegetation_patch(cfg, false)),
             "waterlogged_vegetation_patch" => ConfiguredFeature::VegetationPatch(parse_vegetation_patch(cfg, true)),
             "freeze_top_layer" => ConfiguredFeature::FreezeTopLayer,
+            "random_boolean_selector" => ConfiguredFeature::RandomBooleanSelector {
+                feature_true: parse_nested(&cfg["feature_true"]),
+                feature_false: parse_nested(&cfg["feature_false"]),
+            },
+            "sequence" => ConfiguredFeature::Sequence(
+                cfg["features"].as_array().unwrap_or(&vec![]).iter().map(parse_nested).collect(),
+            ),
+            "weighted_random_selector" => ConfiguredFeature::WeightedRandomSelector(
+                cfg["features"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .map(|e| (parse_nested(&e["data"]), e["weight"].as_i64().unwrap_or(1) as i32))
+                    .collect(),
+            ),
+            "multiface_growth" => ConfiguredFeature::MultifaceGrowth(parse_multiface_growth(cfg)),
+            "root_system" => ConfiguredFeature::RootSystem(parse_root_system(cfg)),
+            "fallen_tree" => ConfiguredFeature::FallenTree(FallenTreeConfig {
+                trunk_provider: StateProvider::parse(&cfg["trunk_provider"]),
+                log_length: IntProvider::parse(&cfg["log_length"]),
+                stump_decorators: cfg["stump_decorators"].as_array().unwrap_or(&vec![]).iter().map(TreeDecorator::parse).collect(),
+                log_decorators: cfg["log_decorators"].as_array().unwrap_or(&vec![]).iter().map(TreeDecorator::parse).collect(),
+            }),
+            "huge_red_mushroom" => ConfiguredFeature::HugeMushroom(parse_huge_mushroom(cfg, false)),
+            "huge_brown_mushroom" => ConfiguredFeature::HugeMushroom(parse_huge_mushroom(cfg, true)),
+            "vines" => ConfiguredFeature::Vines,
+            // `sculk_patch` stays recognized-but-skipped: the SculkSpreader charge
+            // simulation's RNG draw order depends on tracked multiface `facings`
+            // state, which this engine collapses (face booleans dropped). A bit-
+            // exact port is therefore incompatible with the parity model; skipping
+            // is parity-safe (the RNG is reseeded per top feature). See the header.
             other => ConfiguredFeature::Deferred(other.to_owned()),
         }
     }
@@ -1280,6 +1393,22 @@ fn resolve_cf(
             vegetation_feature: resolve_nested(&vc.vegetation_feature, configured, placed),
             ..vc.clone()
         }),
+        ConfiguredFeature::RandomBooleanSelector { feature_true, feature_false } => {
+            ConfiguredFeature::RandomBooleanSelector {
+                feature_true: resolve_nested(feature_true, configured, placed),
+                feature_false: resolve_nested(feature_false, configured, placed),
+            }
+        }
+        ConfiguredFeature::Sequence(fs) => {
+            ConfiguredFeature::Sequence(fs.iter().map(|f| resolve_nested(f, configured, placed)).collect())
+        }
+        ConfiguredFeature::WeightedRandomSelector(fs) => ConfiguredFeature::WeightedRandomSelector(
+            fs.iter().map(|(f, w)| (resolve_nested(f, configured, placed), *w)).collect(),
+        ),
+        ConfiguredFeature::RootSystem(rc) => ConfiguredFeature::RootSystem(RootSystemConfig {
+            feature: resolve_nested(&rc.feature, configured, placed),
+            ..rc.clone()
+        }),
         other => other.clone(),
     }
 }
@@ -1356,6 +1485,10 @@ impl FeatureRegistry {
                     ConfiguredFeature::RandomSelector(_)
                         | ConfiguredFeature::SimpleRandomSelector(_)
                         | ConfiguredFeature::VegetationPatch(_)
+                        | ConfiguredFeature::RandomBooleanSelector { .. }
+                        | ConfiguredFeature::Sequence(_)
+                        | ConfiguredFeature::WeightedRandomSelector(_)
+                        | ConfiguredFeature::RootSystem(_)
                 )
             })
             .map(|(k, _)| k.clone())
@@ -1642,41 +1775,44 @@ fn place_stream(
     ctx: &mut PlacementCtx,
     random: &mut WorldgenRandom,
     pos: Pos,
-) {
+) -> bool {
     match modifiers.split_first() {
-        None => {
-            place_feature(configured, ctx, random, pos);
-        }
+        None => place_feature(configured, ctx, random, pos),
         Some((first, rest)) => {
             let positions = first.get_positions(ctx, random, pos);
+            let mut placed = false;
             for p in positions {
-                place_stream(configured, rest, ctx, random, p);
+                placed |= place_stream(configured, rest, ctx, random, p);
             }
+            placed
         }
     }
 }
 
-/// `ConfiguredFeature.place` for the implemented features.
+/// `ConfiguredFeature.place` for the implemented features. The boolean mirrors
+/// vanilla `Feature.place` — only `sequence` (fail-fast), `root_system` (tree
+/// success) and the selectors observe it; features whose vanilla `place` always
+/// reports success return `true`.
 fn place_feature(
     configured: &ConfiguredFeature,
     ctx: &mut PlacementCtx,
     random: &mut WorldgenRandom,
     origin: Pos,
-) {
+) -> bool {
     match configured {
         ConfiguredFeature::Ore(cfg) => place_ore(cfg, ctx, random, origin),
         ConfiguredFeature::ScatteredOre(cfg) => place_scattered_ore(cfg, ctx, random, origin),
         ConfiguredFeature::Spring(cfg) => place_spring(cfg, ctx, origin),
         ConfiguredFeature::Disk(cfg) => place_disk(cfg, ctx, random, origin),
-        ConfiguredFeature::Tree(cfg) => place_tree(cfg, ctx, random, origin),
+        ConfiguredFeature::Tree(cfg) => return place_tree(cfg, ctx, random, origin),
         ConfiguredFeature::RandomSelector(cfg) => place_random_selector(cfg, ctx, random, origin),
-        ConfiguredFeature::SimpleBlock(cfg) => place_simple_block(cfg, ctx, random, origin),
+        ConfiguredFeature::SimpleBlock(cfg) => return place_simple_block(cfg, ctx, random, origin),
         ConfiguredFeature::BlockColumn(cfg) => place_block_column(cfg, ctx, random, origin),
         ConfiguredFeature::Bamboo { probability } => place_bamboo(*probability, ctx, random, origin),
         ConfiguredFeature::Kelp => place_kelp(ctx, random, origin),
         ConfiguredFeature::Seagrass { probability } => place_seagrass(*probability, ctx, random, origin),
         ConfiguredFeature::SeaPickle { count } => place_sea_pickle(count, ctx, random, origin),
-        ConfiguredFeature::Lake(cfg) => place_lake(cfg, ctx, random, origin),
+        ConfiguredFeature::Lake(cfg) => return place_lake(cfg, ctx, random, origin),
         ConfiguredFeature::BlueIce => place_blue_ice(ctx, random, origin),
         ConfiguredFeature::Spike(cfg) => place_spike(cfg, ctx, random, origin),
         ConfiguredFeature::Iceberg(cfg) => place_iceberg(cfg, ctx, random, origin),
@@ -1694,8 +1830,23 @@ fn place_feature(
         ConfiguredFeature::CoralMushroom => place_coral(CoralKind::Mushroom, ctx, random, origin),
         ConfiguredFeature::VegetationPatch(cfg) => place_vegetation_patch(cfg, ctx, random, origin),
         ConfiguredFeature::FreezeTopLayer => place_freeze_top_layer(ctx, origin),
-        ConfiguredFeature::Deferred(_) => {}
+        ConfiguredFeature::RandomBooleanSelector { feature_true, feature_false } => {
+            // `RandomBooleanSelectorFeature.place` — one `nextBoolean` picks the branch.
+            let nf = if random.next_boolean() { feature_true } else { feature_false };
+            return place_nested(nf, ctx, random, origin);
+        }
+        ConfiguredFeature::Sequence(features) => return place_sequence(features, ctx, random, origin),
+        ConfiguredFeature::WeightedRandomSelector(entries) => {
+            return place_weighted_random_selector(entries, ctx, random, origin);
+        }
+        ConfiguredFeature::MultifaceGrowth(cfg) => return place_multiface_growth(cfg, ctx, random, origin),
+        ConfiguredFeature::RootSystem(cfg) => return place_root_system(cfg, ctx, random, origin),
+        ConfiguredFeature::FallenTree(cfg) => place_fallen_tree(cfg, ctx, random, origin),
+        ConfiguredFeature::HugeMushroom(cfg) => return place_huge_mushroom(cfg, ctx, random, origin),
+        ConfiguredFeature::Vines => return place_vines(ctx, origin),
+        ConfiguredFeature::Deferred(_) => return false,
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1717,16 +1868,17 @@ fn place_random_selector(cfg: &RandomSelectorConfig, ctx: &mut PlacementCtx, ran
 
 /// `PlacedFeature.place` for a nested feature — thread its own placement chain
 /// (no biome check) then place the resolved configured feature.
-fn place_nested(nf: &NestedFeature, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+fn place_nested(nf: &NestedFeature, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) -> bool {
     if let NestedFeature::Resolved { feature, placement } = nf {
         // A nested placement whose chain contains an unsupported modifier would
         // desync only this terminal feature (the RNG is reseeded per top
         // feature); still, skip rather than mis-draw.
         if placement.iter().any(|m| !m.is_supported()) {
-            return;
+            return false;
         }
-        place_stream(feature, placement, ctx, random, origin);
+        return place_stream(feature, placement, ctx, random, origin);
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2089,17 +2241,17 @@ fn simple_block_can_survive(b: ParityBlock, level: &dyn DecorationLevel, p: Pos)
 /// `SimpleBlockFeature.place`. Draws the state provider (may consume RNG), then
 /// the survival gate (no RNG); double plants place both halves, everything else a
 /// single block. `schedule_tick` is a sim concern (no block write) and omitted.
-fn place_simple_block(cfg: &SimpleBlockConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+fn place_simple_block(cfg: &SimpleBlockConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) -> bool {
     let state = match cfg.to_place.get_state(ctx.level, random, origin) {
         Some(s) => s,
-        None => return,
+        None => return false,
     };
     if !simple_block_can_survive(state, ctx.level, origin) {
-        return;
+        return false;
     }
     if is_double_plant(state) {
         if !ctx.level.get_block(origin.x, origin.y + 1, origin.z).is_air() {
-            return;
+            return false;
         }
         ctx.level.set_block(origin.x, origin.y, origin.z, state);
         ctx.level.set_block(origin.x, origin.y + 1, origin.z, state);
@@ -2109,6 +2261,7 @@ fn place_simple_block(cfg: &SimpleBlockConfig, ctx: &mut PlacementCtx, random: &
         // draws none — collapsed here to a plain carpet placement (documented).
         ctx.level.set_block(origin.x, origin.y, origin.z, state);
     }
+    true
 }
 
 /// `BlockColumnFeature.truncate`.
@@ -2293,9 +2446,9 @@ fn place_sea_pickle(count: &IntProvider, ctx: &mut PlacementCtx, random: &mut Wo
 /// the border-integrity scan (may abort), fills fluid/air, then the barrier shell.
 /// `scheduleTick` / `markAboveForPostProcessing` are post/sim flags (no block
 /// write) and omitted. The water-ice pass never runs for lava lakes.
-fn place_lake(cfg: &LakeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+fn place_lake(cfg: &LakeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) -> bool {
     if origin.y <= ctx.level.min_y() + 4 {
-        return;
+        return false;
     }
     let base = origin.offset(-8, -4, -8);
     let mut grid = [false; 2048];
@@ -2324,7 +2477,7 @@ fn place_lake(cfg: &LakeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRan
 
     let fluid = match cfg.fluid.get_state(ctx.level, random, base) {
         Some(f) => f,
-        None => return,
+        None => return false,
     };
 
     // Border-integrity scan.
@@ -2344,10 +2497,10 @@ fn place_lake(cfg: &LakeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRan
                     let op = base.offset(xx, yy, zz);
                     let bs = ctx.level.get_block(op.x, op.y, op.z);
                     if yy >= 4 && bs.is_fluid() {
-                        return;
+                        return false;
                     }
                     if yy < 4 && !bs.blocks_motion() && bs != fluid {
-                        return;
+                        return false;
                     }
                     // `can_place_feature` is `true` for the lava lakes.
                 }
@@ -2373,7 +2526,7 @@ fn place_lake(cfg: &LakeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRan
     // Barrier shell.
     let barrier = match cfg.barrier.get_state(ctx.level, random, base) {
         Some(b) => b,
-        None => return,
+        None => return true,
     };
     if !barrier.is_air() {
         for xx in 0..16 {
@@ -2391,6 +2544,7 @@ fn place_lake(cfg: &LakeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRan
         }
     }
     // Lava fluid → the water-ice pass is skipped.
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -4258,9 +4412,74 @@ fn parse_vegetation_patch(cfg: &Value, waterlogged: bool) -> VegetationPatchConf
 fn nested_supported(nf: &NestedFeature) -> bool {
     match nf {
         NestedFeature::Resolved { feature, placement } => {
-            feature.is_implemented() && placement.iter().all(|m| m.is_supported())
+            feature_fully_supported(feature) && placement.iter().all(|m| m.is_supported())
         }
         _ => false,
+    }
+}
+
+/// Deep support check: a feature is fully supported only if it (and every nested
+/// feature it delegates to) is implemented with a supported placement chain. Used
+/// to decide whether a whole `vegetation_patch` / `root_system` may run — a nested
+/// template-gated feature (e.g. `sulfur_spring`) makes the enclosing feature skip
+/// whole, which is parity-safe because the RNG is reseeded per top feature.
+fn feature_fully_supported(f: &ConfiguredFeature) -> bool {
+    match f {
+        ConfiguredFeature::Deferred(_) => false,
+        ConfiguredFeature::RandomSelector(cfg) => {
+            cfg.features.iter().all(|w| nested_supported(&w.feature)) && nested_supported(&cfg.default)
+        }
+        ConfiguredFeature::SimpleRandomSelector(cfg) => cfg.features.iter().all(nested_supported),
+        ConfiguredFeature::Sequence(fs) => fs.iter().all(nested_supported),
+        ConfiguredFeature::WeightedRandomSelector(fs) => fs.iter().all(|(nf, _)| nested_supported(nf)),
+        ConfiguredFeature::RandomBooleanSelector { feature_true, feature_false } => {
+            nested_supported(feature_true) && nested_supported(feature_false)
+        }
+        ConfiguredFeature::VegetationPatch(cfg) => nested_supported(&cfg.vegetation_feature),
+        ConfiguredFeature::RootSystem(cfg) => nested_supported(&cfg.feature),
+        _ => true,
+    }
+}
+
+fn parse_multiface_growth(cfg: &Value) -> MultifaceGrowthConfig {
+    MultifaceGrowthConfig {
+        block: cfg["block"].as_str().and_then(ParityBlock::from_name).unwrap_or(ParityBlock::GlowLichen),
+        search_range: cfg.get("search_range").and_then(Value::as_i64).unwrap_or(10) as i32,
+        can_place_on_floor: cfg.get("can_place_on_floor").and_then(Value::as_bool).unwrap_or(false),
+        can_place_on_ceiling: cfg.get("can_place_on_ceiling").and_then(Value::as_bool).unwrap_or(false),
+        can_place_on_wall: cfg.get("can_place_on_wall").and_then(Value::as_bool).unwrap_or(false),
+        chance_of_spreading: cfg.get("chance_of_spreading").and_then(Value::as_f64).unwrap_or(0.5) as f32,
+        can_be_placed_on: parse_block_holderset(&cfg["can_be_placed_on"]),
+    }
+}
+
+fn parse_root_system(cfg: &Value) -> RootSystemConfig {
+    RootSystemConfig {
+        feature: parse_nested(&cfg["feature"]),
+        required_vertical_space_for_tree: cfg["required_vertical_space_for_tree"].as_i64().unwrap_or(1) as i32,
+        level_test_distance: cfg["level_test_distance"].as_i64().unwrap_or(0) as i32,
+        max_level_deviation: cfg["max_level_deviation"].as_i64().unwrap_or(0) as i32,
+        root_radius: cfg["root_radius"].as_i64().unwrap_or(1) as i32,
+        root_replaceable: dripstone_tag(&cfg["root_replaceable"]),
+        root_state_provider: StateProvider::parse(&cfg["root_state_provider"]),
+        root_placement_attempts: cfg["root_placement_attempts"].as_i64().unwrap_or(0) as i32,
+        root_column_max_height: cfg["root_column_max_height"].as_i64().unwrap_or(1) as i32,
+        hanging_root_radius: cfg["hanging_root_radius"].as_i64().unwrap_or(1) as i32,
+        hanging_roots_vertical_span: cfg["hanging_roots_vertical_span"].as_i64().unwrap_or(1) as i32,
+        hanging_root_state_provider: StateProvider::parse(&cfg["hanging_root_state_provider"]),
+        hanging_root_placement_attempts: cfg["hanging_root_placement_attempts"].as_i64().unwrap_or(0) as i32,
+        allowed_vertical_water_for_tree: cfg["allowed_vertical_water_for_tree"].as_i64().unwrap_or(1) as i32,
+        allowed_tree_position: BlockPredicate::parse(&cfg["allowed_tree_position"]),
+    }
+}
+
+fn parse_huge_mushroom(cfg: &Value, brown: bool) -> HugeMushroomConfig {
+    HugeMushroomConfig {
+        cap_provider: StateProvider::parse(&cfg["cap_provider"]),
+        stem_provider: StateProvider::parse(&cfg["stem_provider"]),
+        foliage_radius: cfg.get("foliage_radius").and_then(Value::as_i64).unwrap_or(2) as i32,
+        can_place_on: BlockPredicate::parse(&cfg["can_place_on"]),
+        brown,
     }
 }
 
@@ -5780,6 +5999,9 @@ impl TreeDecorator {
             TreeDecorator::AlterGround { provider } => {
                 alter_ground_place(provider, level, decorations, random, trunks, roots);
             }
+            TreeDecorator::AttachedToLogs { probability, block_provider, directions } => {
+                attached_to_logs_place(*probability, block_provider, directions, level, decorations, random, trunks);
+            }
             TreeDecorator::AttachedToLeaves {
                 probability,
                 exclusion_radius_xz,
@@ -6112,7 +6334,7 @@ fn beehive_place(
 /// `updateLeaves` BFS. The RNG draw order matches the decompile exactly:
 /// getTreeHeight → foliageHeight → foliageRadius → (bounds/clip, no draws) →
 /// placeTrunk → per-attachment createFoliage → decorators.
-fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) -> bool {
     // Graceful skip for unported placers (fancy trunk, fancy/mega foliage, …):
     // bail before any RNG draw so this terminal feature simply produces nothing
     // rather than mis-drawing (safe — the RNG is reseeded per top feature).
@@ -6120,7 +6342,7 @@ fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut Worldgen
         || config.foliage_placer.is_unsupported()
         || config.root_placer_unsupported
     {
-        return;
+        return false;
     }
 
     let level: &mut dyn DecorationLevel = ctx.level;
@@ -6141,13 +6363,13 @@ fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut Worldgen
     // <= getMaxY()+1`. `getMaxY()` is the inclusive top, so `getMaxY()+1` ==
     // `getMaxBuildHeight()` == our exclusive `max_y()`.
     if min_y < level.min_y() + 1 || max_y > level.max_y() {
-        return;
+        return false;
     }
     let grow_through = config.trunk_placer.grow_through();
     let min_clipped = config.minimum_size.min_clipped_height();
     let clipped = get_max_free_tree_height(level, tree_height, trunk_origin, config, grow_through);
     if !(clipped >= tree_height || min_clipped.map(|m| clipped >= m).unwrap_or(false)) {
-        return;
+        return false;
     }
 
     let mut trunks: HashSet<Pos> = HashSet::new();
@@ -6158,7 +6380,7 @@ fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut Worldgen
     // Roots are placed first; a failed root system aborts the whole tree.
     if let Some(rp) = &config.root_placer {
         if !rp.place_roots(level, &mut roots, random, origin, trunk_origin, config) {
-            return;
+            return false;
         }
     }
 
@@ -6170,16 +6392,496 @@ fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut Worldgen
     }
 
     // `place`: decorators run only when the tree placed something.
-    if !trunks.is_empty() || !foliage.is_empty() {
+    let placed = !trunks.is_empty() || !foliage.is_empty();
+    if placed {
         for dec in &config.decorators {
             dec.place(level, &mut decorations, random, &trunks, &foliage, &roots);
         }
     }
     // `updateLeaves` + `updateShapeAtEdge` are the deferred block-state pass.
+    placed
 }
 
 fn lerp(t: f64, a: f64, b: f64) -> f64 {
     a + t * (b - a)
+}
+
+// ---------------------------------------------------------------------------
+// P8 close-out features (lush caves / mushrooms / vines / sculk / sulfur)
+// ---------------------------------------------------------------------------
+
+/// A full `Direction`. `VALUES` reproduces `Direction.values()` order
+/// (DOWN, UP, NORTH, SOUTH, WEST, EAST); the multiface config builds its own
+/// ordered list per the ceiling/floor/wall flags.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dir6 {
+    Down,
+    Up,
+    North,
+    South,
+    West,
+    East,
+}
+
+impl Dir6 {
+    const VALUES: [Dir6; 6] = [Dir6::Down, Dir6::Up, Dir6::North, Dir6::South, Dir6::West, Dir6::East];
+    fn step(self) -> (i32, i32, i32) {
+        match self {
+            Dir6::Down => (0, -1, 0),
+            Dir6::Up => (0, 1, 0),
+            Dir6::North => (0, 0, -1),
+            Dir6::South => (0, 0, 1),
+            Dir6::West => (-1, 0, 0),
+            Dir6::East => (1, 0, 0),
+        }
+    }
+    fn opposite(self) -> Dir6 {
+        match self {
+            Dir6::Down => Dir6::Up,
+            Dir6::Up => Dir6::Down,
+            Dir6::North => Dir6::South,
+            Dir6::South => Dir6::North,
+            Dir6::West => Dir6::East,
+            Dir6::East => Dir6::West,
+        }
+    }
+}
+
+/// `SequenceFeature.place` — place each nested placed feature in order, failing
+/// fast (returning false) at the first that fails.
+fn place_sequence(features: &[NestedFeature], ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) -> bool {
+    for f in features {
+        if !place_nested(f, ctx, random, origin) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `WeightedRandomSelectorFeature.place` — `nextInt(total_weight)` selects one
+/// entry (cumulative-weight scan). Reached only via `rooted_sulfur_spring`, which
+/// `root_system` skips whole (template-gated); kept for completeness.
+fn place_weighted_random_selector(
+    entries: &[(NestedFeature, i32)],
+    ctx: &mut PlacementCtx,
+    random: &mut WorldgenRandom,
+    origin: Pos,
+) -> bool {
+    let total: i32 = entries.iter().map(|(_, w)| *w).sum();
+    if total <= 0 {
+        return false;
+    }
+    let mut sel = random.next_int_bounded(total);
+    for (nf, w) in entries {
+        sel -= *w;
+        if sel < 0 {
+            return place_nested(nf, ctx, random, origin);
+        }
+    }
+    false
+}
+
+/// `MultifaceGrowthFeature.place` (glow_lichen / sculk_vein). The placed block
+/// collapses to its default state (face booleans dropped); the RNG draws — the
+/// direction shuffles and the spread `nextFloat` + `Direction.allShuffled` — are
+/// consumed 1:1. The spread's own block writes are elided (terminal, cannot
+/// desync anything downstream).
+fn place_multiface_growth(cfg: &MultifaceGrowthConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) -> bool {
+    // `isAirOrWater(origin)`.
+    let ob = ctx.level.get_block(origin.x, origin.y, origin.z);
+    if !ob.is_air() && ob != ParityBlock::Water {
+        return false;
+    }
+    // `validDirections`: ceiling (UP), floor (DOWN), then the 4 horizontals.
+    let mut valid: Vec<Dir6> = Vec::with_capacity(6);
+    if cfg.can_place_on_ceiling {
+        valid.push(Dir6::Up);
+    }
+    if cfg.can_place_on_floor {
+        valid.push(Dir6::Down);
+    }
+    if cfg.can_place_on_wall {
+        valid.extend([Dir6::North, Dir6::East, Dir6::South, Dir6::West]);
+    }
+    if valid.is_empty() {
+        return false;
+    }
+    // `getShuffledDirections` = `Util.shuffledCopy(validDirections)`.
+    let mut var14 = valid.clone();
+    util_shuffle(&mut var14, random);
+    if multiface_place_growth_if_possible(cfg, ctx, random, origin, &var14) {
+        return true;
+    }
+    for &search_dir in &var14 {
+        // `getShuffledDirectionsExcept(search_dir.opposite)`.
+        let exclude = search_dir.opposite();
+        let mut placement_dirs: Vec<Dir6> = valid.iter().copied().filter(|&d| d != exclude).collect();
+        util_shuffle(&mut placement_dirs, random);
+        let (sx, sy, sz) = search_dir.step();
+        // NB: vanilla 26.2 re-sets `pos = origin.relative(searchDirection)` each
+        // iteration (distance 1), so the whole range probes the same cell.
+        let pos = Pos::new(origin.x + sx, origin.y + sy, origin.z + sz);
+        for _ in 0..cfg.search_range {
+            let state = ctx.level.get_block(pos.x, pos.y, pos.z);
+            if !state.is_air() && state != ParityBlock::Water && state != cfg.block {
+                break;
+            }
+            if multiface_place_growth_if_possible(cfg, ctx, random, pos, &placement_dirs) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `MultifaceGrowthFeature.placeGrowthIfPossible`.
+fn multiface_place_growth_if_possible(
+    cfg: &MultifaceGrowthConfig,
+    ctx: &mut PlacementCtx,
+    random: &mut WorldgenRandom,
+    pos: Pos,
+    placement_dirs: &[Dir6],
+) -> bool {
+    for &dir in placement_dirs {
+        let (dx, dy, dz) = dir.step();
+        let neighbour = ctx.level.get_block(pos.x + dx, pos.y + dy, pos.z + dz);
+        if cfg.can_be_placed_on.contains(&neighbour) {
+            // `getStateForPlacement` never returns null for a supported face with a
+            // valid neighbour; the multiface state collapses to `cfg.block`.
+            ctx.level.set_block(pos.x, pos.y, pos.z, cfg.block);
+            if random.next_float() < cfg.chance_of_spreading {
+                // `getSpreader().spreadFromFaceTowardRandomDirection` →
+                // `Direction.allShuffled` = shuffledCopy of the 6 faces (5 draws);
+                // the spread placements are deterministic (no further RNG) and
+                // elided here (terminal, cannot desync anything).
+                let mut faces = Dir6::VALUES;
+                util_shuffle(&mut faces, random);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// `RootSystemFeature.place` (rooted_azalea_tree; rooted_sulfur_spring is
+/// template-gated → skipped whole).
+fn place_root_system(cfg: &RootSystemConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) -> bool {
+    // Skip whole when the nested tree feature is not fully supported (parity-safe:
+    // the RNG is reseeded per top feature). No RNG is drawn before this point.
+    if !nested_supported(&cfg.feature) {
+        return true;
+    }
+    if !ctx.level.get_block(origin.x, origin.y, origin.z).is_air() {
+        return false;
+    }
+    if root_place_dirt_and_tree(cfg, ctx, random, origin) {
+        root_place_hanging(cfg, ctx, random, origin);
+    }
+    true
+}
+
+/// `RootSystemFeature.isAllowedTreeSpace`.
+fn root_allowed_tree_space(state: ParityBlock, blocks_above: i32, allowed_water: i32) -> bool {
+    state.is_air() || (blocks_above + 1 <= allowed_water && state == ParityBlock::Water)
+}
+
+/// `RootSystemFeature.spaceForTree` (no RNG). `isSolid` corner check approximates
+/// vanilla's air / non-air tests directly.
+fn root_space_for_tree(cfg: &RootSystemConfig, ctx: &PlacementCtx, pos: Pos) -> bool {
+    for i in 1..=cfg.required_vertical_space_for_tree {
+        let s = ctx.level.get_block(pos.x, pos.y + i, pos.z);
+        if !root_allowed_tree_space(s, i, cfg.allowed_vertical_water_for_tree) {
+            return false;
+        }
+    }
+    if cfg.level_test_distance > 0 {
+        // `Direction.from2DDataValue`: 0=SOUTH, 1=WEST, 2=NORTH, 3=EAST.
+        const CORNERS: [(i32, i32); 4] = [(0, 1), (-1, 0), (0, -1), (1, 0)];
+        for (cx, cz) in CORNERS {
+            let corner = Pos::new(pos.x + cx * cfg.level_test_distance, pos.y, pos.z + cz * cfg.level_test_distance);
+            let below = ctx.level.get_block(corner.x, corner.y - cfg.max_level_deviation, corner.z);
+            let above = ctx.level.get_block(corner.x, corner.y + cfg.max_level_deviation, corner.z);
+            if below.is_air() || !above.is_air() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `RootSystemFeature.placeDirtAndTree`.
+fn root_place_dirt_and_tree(cfg: &RootSystemConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) -> bool {
+    for y in 0..cfg.root_column_max_height {
+        let working = Pos::new(origin.x, origin.y + y + 1, origin.z);
+        if ctx.level.get_height(Heightmap::WorldSurface, working.x, working.z) < working.y {
+            return false;
+        }
+        if cfg.allowed_tree_position.test(ctx.level, working) && root_space_for_tree(cfg, ctx, working) {
+            let below = ctx.level.get_block(working.x, working.y - 1, working.z);
+            if below == ParityBlock::Lava || !below.blocks_motion() {
+                return false;
+            }
+            if place_nested(&cfg.feature, ctx, random, working) {
+                root_place_dirt(cfg, ctx, random, origin, origin.y + y);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `RootSystemFeature.placeDirt` + `placeRootedDirt`.
+fn root_place_dirt(cfg: &RootSystemConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos, target_height: i32) {
+    for y in origin.y..target_height {
+        for _ in 0..cfg.root_placement_attempts {
+            let dx = random.next_int_bounded(cfg.root_radius) - random.next_int_bounded(cfg.root_radius);
+            let dz = random.next_int_bounded(cfg.root_radius) - random.next_int_bounded(cfg.root_radius);
+            let wp = Pos::new(origin.x + dx, y, origin.z + dz);
+            let at = ctx.level.get_block(wp.x, wp.y, wp.z);
+            if cfg.root_replaceable.map(|t| t.contains(at)).unwrap_or(false) {
+                if let Some(s) = cfg.root_state_provider.get_state(ctx.level, random, wp) {
+                    ctx.level.set_block(wp.x, wp.y, wp.z, s);
+                }
+            }
+        }
+    }
+}
+
+/// `RootSystemFeature.placeRoots` (hanging roots). `canSurvive` / `isFaceSturdy`
+/// collapse to a `blocks_motion` support test (draws no RNG).
+fn root_place_hanging(cfg: &RootSystemConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    for _ in 0..cfg.hanging_root_placement_attempts {
+        let dx = random.next_int_bounded(cfg.hanging_root_radius) - random.next_int_bounded(cfg.hanging_root_radius);
+        let dy = random.next_int_bounded(cfg.hanging_roots_vertical_span) - random.next_int_bounded(cfg.hanging_roots_vertical_span);
+        let dz = random.next_int_bounded(cfg.hanging_root_radius) - random.next_int_bounded(cfg.hanging_root_radius);
+        let wp = Pos::new(origin.x + dx, origin.y + dy, origin.z + dz);
+        if ctx.level.get_block(wp.x, wp.y, wp.z).is_air() {
+            if let Some(s) = cfg.hanging_root_state_provider.get_state(ctx.level, random, wp) {
+                if ctx.level.get_block(wp.x, wp.y + 1, wp.z).blocks_motion() {
+                    ctx.level.set_block(wp.x, wp.y, wp.z, s);
+                }
+            }
+        }
+    }
+}
+
+/// `FallenTreeFeature.placeFallenTree`.
+fn place_fallen_tree(cfg: &FallenTreeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    // Stump (log identity; axis collapses) + its decorators.
+    if let Some(s) = cfg.trunk_provider.get_state(ctx.level, random, origin) {
+        ctx.level.set_block(origin.x, origin.y, origin.z, s);
+    }
+    fallen_decorate_logs(&cfg.stump_decorators, &[origin], ctx.level, random);
+
+    let dir = horizontal_random_direction(random);
+    let (sx, sz) = (dir.step_x(), dir.step_z());
+    let log_length = cfg.log_length.sample(random) - 2;
+    let off = 2 + random.next_int_bounded(2);
+    let mut start = Pos::new(origin.x + sx * off, origin.y, origin.z + sz * off);
+    // `setGroundHeightForFallenLogStartPos`.
+    {
+        let mut p = Pos::new(start.x, start.y + 1, start.z);
+        for _ in 0..6 {
+            if valid_tree_pos(ctx.level, p) && fallen_over_solid(ctx.level, p) {
+                break;
+            }
+            p = Pos::new(p.x, p.y - 1, p.z);
+        }
+        start = p;
+    }
+    if !fallen_can_place_entire(ctx.level, log_length, start, sx, sz) {
+        return;
+    }
+    // `placeFallenLog`.
+    let mut logs: Vec<Pos> = Vec::with_capacity(log_length.max(0) as usize);
+    let mut p = start;
+    for _ in 0..log_length {
+        if let Some(s) = cfg.trunk_provider.get_state(ctx.level, random, p) {
+            ctx.level.set_block(p.x, p.y, p.z, s);
+        }
+        logs.push(p);
+        p = Pos::new(p.x + sx, p.y, p.z + sz);
+    }
+    fallen_decorate_logs(&cfg.log_decorators, &logs, ctx.level, random);
+}
+
+/// `FallenTreeFeature.isOverSolidGround` — `isFaceSturdy(below, UP)`, approx.
+fn fallen_over_solid(level: &dyn DecorationLevel, p: Pos) -> bool {
+    level.get_block(p.x, p.y - 1, p.z).blocks_motion()
+}
+
+/// `FallenTreeFeature.canPlaceEntireFallenLog`.
+fn fallen_can_place_entire(level: &dyn DecorationLevel, log_length: i32, start: Pos, sx: i32, sz: i32) -> bool {
+    let mut gap = 0;
+    let mut p = start;
+    for _ in 0..log_length {
+        if !valid_tree_pos(level, p) {
+            return false;
+        }
+        if !fallen_over_solid(level, p) {
+            gap += 1;
+            if gap > 2 {
+                return false;
+            }
+        } else {
+            gap = 0;
+        }
+        p = Pos::new(p.x + sx, p.y, p.z + sz);
+    }
+    true
+}
+
+/// `FallenTreeFeature.decorateLogs` — run each decorator over the log set.
+fn fallen_decorate_logs(decorators: &[TreeDecorator], logs: &[Pos], level: &mut dyn DecorationLevel, random: &mut WorldgenRandom) {
+    if decorators.is_empty() {
+        return;
+    }
+    let log_set: HashSet<Pos> = logs.iter().copied().collect();
+    let empty: HashSet<Pos> = HashSet::new();
+    let mut decorations: HashSet<Pos> = HashSet::new();
+    for dec in decorators {
+        dec.place(level, &mut decorations, random, &log_set, &empty, &empty);
+    }
+}
+
+/// `AttachedToLogsDecorator.place`. `Util.shuffledCopy(logs)` order can't match
+/// the JVM `HashSet`; the by-Y sort is the same tradeoff the other decorators
+/// document (RNG-draw-count faithful, block grid approximate).
+fn attached_to_logs_place(
+    probability: f32,
+    block_provider: &StateProvider,
+    directions: &[(i32, i32, i32)],
+    level: &mut dyn DecorationLevel,
+    decorations: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    logs: &HashSet<Pos>,
+) {
+    if directions.is_empty() {
+        return;
+    }
+    let mut list = sorted_by_y(logs);
+    util_shuffle(&mut list, random);
+    for log in list {
+        let (dx, dy, dz) = directions[random.next_int_bounded(directions.len() as i32) as usize];
+        let placement = Pos::new(log.x + dx, log.y + dy, log.z + dz);
+        if random.next_float() <= probability && level.get_block(placement.x, placement.y, placement.z).is_air() {
+            if let Some(state) = block_provider.get_state(&*level, random, placement) {
+                decorations.insert(placement);
+                level.set_block(placement.x, placement.y, placement.z, state);
+            }
+        }
+    }
+}
+
+/// `AbstractHugeMushroomFeature.place` + red/brown `makeCap`. Face booleans
+/// collapse to the default block state; the `getTreeHeight` draws (and any
+/// provider draws, none for the vanilla simple providers) are consumed 1:1.
+fn place_huge_mushroom(cfg: &HugeMushroomConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) -> bool {
+    // `getTreeHeight`.
+    let mut tree_height = random.next_int_bounded(3) + 4;
+    if random.next_int_bounded(12) == 0 {
+        tree_height *= 2;
+    }
+    if !huge_mushroom_valid(cfg, ctx, origin, tree_height) {
+        return false;
+    }
+    // `makeCap`.
+    if cfg.brown {
+        let r = cfg.foliage_radius;
+        for dx in -r..=r {
+            for dz in -r..=r {
+                let x_edge = dx == -r || dx == r;
+                let z_edge = dz == -r || dz == r;
+                if !x_edge || !z_edge {
+                    let state = cfg.cap_provider.get_state(ctx.level, random, origin);
+                    huge_place_block(ctx, Pos::new(origin.x + dx, origin.y + tree_height, origin.z + dz), state);
+                }
+            }
+        }
+    } else {
+        for dy in (tree_height - 3)..=tree_height {
+            let radius = if dy < tree_height { cfg.foliage_radius } else { cfg.foliage_radius - 1 };
+            for dx in -radius..=radius {
+                for dz in -radius..=radius {
+                    let x_edge = dx == -radius || dx == radius;
+                    let z_edge = dz == -radius || dz == radius;
+                    if dy >= tree_height || x_edge != z_edge {
+                        let state = cfg.cap_provider.get_state(ctx.level, random, origin);
+                        huge_place_block(ctx, Pos::new(origin.x + dx, origin.y + dy, origin.z + dz), state);
+                    }
+                }
+            }
+        }
+    }
+    // `placeTrunk`.
+    for dy in 0..tree_height {
+        let state = cfg.stem_provider.get_state(ctx.level, random, origin);
+        huge_place_block(ctx, Pos::new(origin.x, origin.y + dy, origin.z), state);
+    }
+    true
+}
+
+/// `AbstractHugeMushroomFeature.isValidPosition` (no RNG).
+fn huge_mushroom_valid(cfg: &HugeMushroomConfig, ctx: &PlacementCtx, origin: Pos, tree_height: i32) -> bool {
+    let y = origin.y;
+    if y < ctx.level.min_y() + 1 || y + tree_height + 1 > ctx.level.max_y() {
+        return false;
+    }
+    if !cfg.can_place_on.test(ctx.level, Pos::new(origin.x, origin.y - 1, origin.z)) {
+        return false;
+    }
+    for dy in 0..=tree_height {
+        let radius = huge_radius_for_height(cfg, tree_height, dy);
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                let b = ctx.level.get_block(origin.x + dx, origin.y + dy, origin.z + dz);
+                if !b.is_air() && !b.is_leaves() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `getTreeRadiusForHeight` for the red / brown subclasses.
+fn huge_radius_for_height(cfg: &HugeMushroomConfig, tree_height: i32, yo: i32) -> i32 {
+    if cfg.brown {
+        if yo <= 3 { 0 } else { cfg.foliage_radius }
+    } else if (yo < tree_height && yo >= tree_height - 3) || yo == tree_height {
+        cfg.foliage_radius
+    } else {
+        0
+    }
+}
+
+/// `AbstractHugeMushroomFeature.placeMushroomBlock` — place only into air / a
+/// `#replaceable_by_mushrooms` cell (draws no RNG).
+fn huge_place_block(ctx: &mut PlacementCtx, pos: Pos, state: Option<ParityBlock>) {
+    let Some(state) = state else { return };
+    let cur = ctx.level.get_block(pos.x, pos.y, pos.z);
+    if cur.is_air() || BlockTag::ReplaceableByMushrooms.contains(cur) {
+        ctx.level.set_block(pos.x, pos.y, pos.z, state);
+    }
+}
+
+/// `VinesFeature.place` — no RNG. `isAcceptableNeighbour` collapses to a
+/// full-face (`blocks_motion`) support test; the vine face property collapses.
+fn place_vines(ctx: &mut PlacementCtx, origin: Pos) -> bool {
+    if !ctx.level.get_block(origin.x, origin.y, origin.z).is_air() {
+        return false;
+    }
+    for dir in Dir6::VALUES {
+        if dir == Dir6::Down {
+            continue;
+        }
+        let (dx, dy, dz) = dir.step();
+        if ctx.level.get_block(origin.x + dx, origin.y + dy, origin.z + dz).blocks_motion() {
+            ctx.level.set_block(origin.x, origin.y, origin.z, ParityBlock::Vine);
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -7445,5 +8147,181 @@ mod tests {
         let mut ctx2 = PlacementCtx { level: &mut level2, biome_index: &idx2, top_feature: "t" };
         place_freeze_top_layer(&mut ctx2, Pos::new(0, 0, 0));
         assert_eq!(level.blocks.get(&(3, 69, 3)), level2.blocks.get(&(3, 69, 3)));
+    }
+
+    // --- P8 close-out features (lush caves / mushrooms / vines / sulfur) --------
+
+    /// The close-out feature types all parse as implemented and, where nested,
+    /// resolve fully; the previously-deferred lush-caves patches now run; the
+    /// template-gated rooted_sulfur_spring and face-collapse-gated sculk_patch stay
+    /// skipped.
+    #[test]
+    fn close_out_features_parse_and_resolve() {
+        let reg = registry_for(&["minecraft:lush_caves"]);
+        for n in [
+            "cave_vines", "cave_vines_plant", "small_dripleaf", "big_dripleaf", "big_dripleaf_stem",
+            "hanging_roots", "glow_lichen", "sculk_vein", "red_mushroom_block", "brown_mushroom_block", "mushroom_stem",
+        ] {
+            assert!(ParityBlock::from_name(n).is_some(), "block {n} resolves");
+        }
+        assert!(matches!(reg.configured.get("lush_caves_clay"), Some(ConfiguredFeature::RandomBooleanSelector { .. })));
+        assert!(matches!(reg.configured.get("mushroom_island_vegetation"), Some(ConfiguredFeature::RandomBooleanSelector { .. })));
+        assert!(matches!(reg.configured.get("glow_lichen"), Some(ConfiguredFeature::MultifaceGrowth(_))));
+        assert!(matches!(reg.configured.get("rooted_azalea_tree"), Some(ConfiguredFeature::RootSystem(_))));
+        assert!(matches!(reg.configured.get("fallen_oak_tree"), Some(ConfiguredFeature::FallenTree(_))));
+        assert!(matches!(reg.configured.get("huge_red_mushroom"), Some(ConfiguredFeature::HugeMushroom(_))));
+        assert!(matches!(reg.configured.get("huge_brown_mushroom"), Some(ConfiguredFeature::HugeMushroom(_))));
+        assert!(matches!(reg.configured.get("vines"), Some(ConfiguredFeature::Vines)));
+        assert!(matches!(reg.configured.get("sulfur_pool"), Some(ConfiguredFeature::Sequence(_))));
+        assert!(matches!(reg.configured.get("cave_vine"), Some(ConfiguredFeature::BlockColumn(_))));
+        assert!(matches!(reg.configured.get("dripleaf"), Some(ConfiguredFeature::SimpleRandomSelector(_))));
+        for id in ["moss_patch_ceiling", "clay_with_dripleaves", "clay_pool_with_dripleaves", "pale_moss_patch"] {
+            match reg.configured.get(id) {
+                Some(ConfiguredFeature::VegetationPatch(c)) => {
+                    assert!(nested_supported(&c.vegetation_feature), "{id} nested vegetation now supported")
+                }
+                other => panic!("{id} not a vegetation_patch: {other:?}"),
+            }
+        }
+        if let Some(ConfiguredFeature::RootSystem(c)) = reg.configured.get("rooted_azalea_tree") {
+            assert!(nested_supported(&c.feature), "azalea_tree nested feature supported");
+        } else {
+            panic!("rooted_azalea_tree missing");
+        }
+        if let Some(ConfiguredFeature::RootSystem(c)) = reg.configured.get("rooted_sulfur_spring") {
+            assert!(!nested_supported(&c.feature), "sulfur_spring is template-gated → not supported");
+        } else {
+            panic!("rooted_sulfur_spring missing");
+        }
+        // sculk_patch stays deferred (charge sim depends on collapsed face state).
+        assert!(!reg.configured.get("sculk_patch_deep_dark").map(|c| c.is_implemented()).unwrap_or(true));
+    }
+
+    /// glow_lichen (multiface_growth) attaches to a stone ceiling and is
+    /// deterministic; the block collapses to `glow_lichen`.
+    #[test]
+    fn glow_lichen_attaches_to_ceiling() {
+        let reg = registry_for(&["minecraft:lush_caves"]);
+        let cfg = match reg.configured.get("glow_lichen") {
+            Some(ConfiguredFeature::MultifaceGrowth(c)) => c.clone(),
+            o => panic!("glow_lichen not multiface: {o:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(50);
+            level.set_block(0, 61, 0, ParityBlock::Stone); // ceiling above the air cell
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            let placed = place_multiface_growth(&cfg, &mut ctx, &mut random, Pos::new(0, 60, 0));
+            (placed, level.get_block(0, 60, 0))
+        };
+        let a = run(11);
+        assert_eq!(a, run(11), "deterministic");
+        assert!(a.0, "growth placed");
+        assert_eq!(a.1, ParityBlock::GlowLichen, "glow_lichen collapsed at origin");
+    }
+
+    /// A fallen oak drops a stump plus a sideways log run, deterministically.
+    #[test]
+    fn fallen_tree_lays_sideways_logs() {
+        let reg = registry_for(&["minecraft:taiga"]);
+        let cfg = match reg.configured.get("fallen_oak_tree") {
+            Some(ConfiguredFeature::FallenTree(c)) => c.clone(),
+            o => panic!("fallen_oak_tree not fallen_tree: {o:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = tree_level(70);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_fallen_tree(&cfg, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut w: Vec<_> = level.blocks.into_iter().collect();
+            w.sort_by_key(|(k, _)| *k);
+            w
+        };
+        let a = run(5);
+        assert_eq!(a, run(5), "deterministic");
+        let logs = a.iter().filter(|(_, b)| *b == ParityBlock::OakLog).count();
+        assert!(logs >= 3, "stump + fallen logs placed, got {logs}");
+        assert_eq!(
+            a.iter().find(|((x, y, z), _)| (*x, *y, *z) == (8, 70, 8)).map(|(_, b)| *b),
+            Some(ParityBlock::OakLog),
+            "stump at origin"
+        );
+    }
+
+    /// A huge red mushroom builds a red cap and a mushroom stem on mycelium.
+    #[test]
+    fn huge_red_mushroom_builds_cap_and_stem() {
+        let reg = registry_for(&["minecraft:mushroom_fields"]);
+        let cfg = match reg.configured.get("huge_red_mushroom") {
+            Some(ConfiguredFeature::HugeMushroom(c)) => c.clone(),
+            o => panic!("huge_red_mushroom not huge_mushroom: {o:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(70);
+            level.set_block(8, 69, 8, ParityBlock::Mycelium);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            let placed = place_huge_mushroom(&cfg, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut w: Vec<_> = level.blocks.into_iter().collect();
+            w.sort_by_key(|(k, _)| *k);
+            (placed, w)
+        };
+        let (placed, a) = run(3);
+        assert!(placed, "mushroom placed");
+        assert_eq!(a, run(3).1, "deterministic");
+        assert!(a.iter().any(|(_, b)| *b == ParityBlock::RedMushroomBlock), "red cap placed");
+        assert!(a.iter().any(|(_, b)| *b == ParityBlock::MushroomStem), "stem placed");
+    }
+
+    /// Vines attach to a solid wall neighbour (no RNG); the face property collapses.
+    #[test]
+    fn vines_attach_to_wall() {
+        let mut level = TestLevel::new(50);
+        level.set_block(0, 60, -1, ParityBlock::Stone); // wall to the north
+        let idx = AllBiome;
+        let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+        assert!(place_vines(&mut ctx, Pos::new(0, 60, 0)), "vine placed");
+        assert_eq!(level.get_block(0, 60, 0), ParityBlock::Vine);
+    }
+
+    /// A rooted azalea grows its tree, lays rooted dirt in the surrounding stone,
+    /// and is deterministic. The nested `azalea_tree` is fully supported.
+    #[test]
+    fn root_system_grows_rooted_azalea() {
+        let reg = registry_for(&["minecraft:lush_caves"]);
+        let cfg = match reg.configured.get("rooted_azalea_tree") {
+            Some(ConfiguredFeature::RootSystem(c)) => c.clone(),
+            o => panic!("rooted_azalea_tree not root_system: {o:?}"),
+        };
+        let run = |seed: i64| {
+            // Stone everywhere below y=200 (WORLD_SURFACE=200 is above the cave).
+            let mut level = TestLevel::new(200);
+            // Origin shaft (air) + a grass tree floor + a carved canopy pocket.
+            level.set_block(0, 90, 0, ParityBlock::Air);
+            level.set_block(0, 91, 0, ParityBlock::Air);
+            level.set_block(0, 92, 0, ParityBlock::GrassBlock);
+            for x in -4..=4 {
+                for z in -4..=4 {
+                    for y in 93..=104 {
+                        level.set_block(x, y, z, ParityBlock::Air);
+                    }
+                }
+            }
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            let placed = place_root_system(&cfg, &mut ctx, &mut random, Pos::new(0, 90, 0));
+            let mut w: Vec<_> = level.blocks.into_iter().collect();
+            w.sort_by_key(|(k, _)| *k);
+            (placed, w)
+        };
+        let (placed, a) = run(9);
+        assert!(placed, "root_system returns true (origin was air)");
+        assert_eq!(a, run(9).1, "deterministic");
+        assert!(a.iter().any(|(_, b)| *b == ParityBlock::OakLog), "azalea trunk grew");
+        assert!(a.iter().any(|(_, b)| *b == ParityBlock::RootedDirt), "rooted dirt laid in the walls");
     }
 }

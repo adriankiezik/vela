@@ -1761,11 +1761,33 @@ pub enum ParityBlock {
     BubbleCoralWallFan = 168,
     FireCoralWallFan = 169,
     HornCoralWallFan = 170,
+    // Lush-caves vegetation + multiface growth (P8 close-out). Property-carrying
+    // blocks (berries/age/facing/half/tilt/waterlogged, multiface face booleans)
+    // collapse to their default block state; every RNG draw is still consumed.
+    CaveVines = 171,
+    CaveVinesPlant = 172,
+    SmallDripleaf = 173,
+    BigDripleaf = 174,
+    BigDripleafStem = 175,
+    HangingRoots = 176,
+    GlowLichen = 177,
+    SculkVein = 178,
+    // Huge mushrooms (mushroom_fields / dark forest). Face booleans collapse.
+    RedMushroomBlock = 179,
+    BrownMushroomBlock = 180,
+    MushroomStem = 181,
+    // Deep-dark sculk group.
+    Sculk = 182,
+    SculkSensor = 183,
+    SculkShrieker = 184,
+    SculkCatalyst = 185,
+    // Sulfur caves.
+    PotentSulfur = 186,
 }
 
 impl ParityBlock {
     /// Every parity block, in discriminant order (index `b as usize`).
-    pub const ALL: [ParityBlock; 171] = [
+    pub const ALL: [ParityBlock; 187] = [
         ParityBlock::Air,
         ParityBlock::Stone,
         ParityBlock::Water,
@@ -1937,6 +1959,22 @@ impl ParityBlock {
         ParityBlock::BubbleCoralWallFan,
         ParityBlock::FireCoralWallFan,
         ParityBlock::HornCoralWallFan,
+        ParityBlock::CaveVines,
+        ParityBlock::CaveVinesPlant,
+        ParityBlock::SmallDripleaf,
+        ParityBlock::BigDripleaf,
+        ParityBlock::BigDripleafStem,
+        ParityBlock::HangingRoots,
+        ParityBlock::GlowLichen,
+        ParityBlock::SculkVein,
+        ParityBlock::RedMushroomBlock,
+        ParityBlock::BrownMushroomBlock,
+        ParityBlock::MushroomStem,
+        ParityBlock::Sculk,
+        ParityBlock::SculkSensor,
+        ParityBlock::SculkShrieker,
+        ParityBlock::SculkCatalyst,
+        ParityBlock::PotentSulfur,
     ];
 
     /// The `minecraft:` block id this parity block resolves to in the real
@@ -2114,6 +2152,22 @@ impl ParityBlock {
             ParityBlock::BubbleCoralWallFan => "minecraft:bubble_coral_wall_fan",
             ParityBlock::FireCoralWallFan => "minecraft:fire_coral_wall_fan",
             ParityBlock::HornCoralWallFan => "minecraft:horn_coral_wall_fan",
+            ParityBlock::CaveVines => "minecraft:cave_vines",
+            ParityBlock::CaveVinesPlant => "minecraft:cave_vines_plant",
+            ParityBlock::SmallDripleaf => "minecraft:small_dripleaf",
+            ParityBlock::BigDripleaf => "minecraft:big_dripleaf",
+            ParityBlock::BigDripleafStem => "minecraft:big_dripleaf_stem",
+            ParityBlock::HangingRoots => "minecraft:hanging_roots",
+            ParityBlock::GlowLichen => "minecraft:glow_lichen",
+            ParityBlock::SculkVein => "minecraft:sculk_vein",
+            ParityBlock::RedMushroomBlock => "minecraft:red_mushroom_block",
+            ParityBlock::BrownMushroomBlock => "minecraft:brown_mushroom_block",
+            ParityBlock::MushroomStem => "minecraft:mushroom_stem",
+            ParityBlock::Sculk => "minecraft:sculk",
+            ParityBlock::SculkSensor => "minecraft:sculk_sensor",
+            ParityBlock::SculkShrieker => "minecraft:sculk_shrieker",
+            ParityBlock::SculkCatalyst => "minecraft:sculk_catalyst",
+            ParityBlock::PotentSulfur => "minecraft:potent_sulfur",
         }
     }
 
@@ -2288,6 +2342,22 @@ impl ParityBlock {
             "bubble_coral_wall_fan" => ParityBlock::BubbleCoralWallFan,
             "fire_coral_wall_fan" => ParityBlock::FireCoralWallFan,
             "horn_coral_wall_fan" => ParityBlock::HornCoralWallFan,
+            "cave_vines" => ParityBlock::CaveVines,
+            "cave_vines_plant" => ParityBlock::CaveVinesPlant,
+            "small_dripleaf" => ParityBlock::SmallDripleaf,
+            "big_dripleaf" => ParityBlock::BigDripleaf,
+            "big_dripleaf_stem" => ParityBlock::BigDripleafStem,
+            "hanging_roots" => ParityBlock::HangingRoots,
+            "glow_lichen" => ParityBlock::GlowLichen,
+            "sculk_vein" => ParityBlock::SculkVein,
+            "red_mushroom_block" => ParityBlock::RedMushroomBlock,
+            "brown_mushroom_block" => ParityBlock::BrownMushroomBlock,
+            "mushroom_stem" => ParityBlock::MushroomStem,
+            "sculk" => ParityBlock::Sculk,
+            "sculk_sensor" => ParityBlock::SculkSensor,
+            "sculk_shrieker" => ParityBlock::SculkShrieker,
+            "sculk_catalyst" => ParityBlock::SculkCatalyst,
+            "potent_sulfur" => ParityBlock::PotentSulfur,
             // `cave_air` behaves as air in worldgen (empty/`isAir`); collapse it.
             "cave_air" => ParityBlock::Air,
             _ => return None,
@@ -2313,6 +2383,9 @@ impl ParityBlock {
         // block motion); `cocoa` keeps a collision shape and does.
         // `mangrove_propagule` (a plant) and `moss_carpet` (a carpet) have empty
         // collision shapes for the worldgen heightmaps, like the snow layer/vine.
+        // cave_vines / hanging_roots / multiface growths / small_dripleaf all have
+        // empty collision shapes (like the snow layer / vine), so they do not block
+        // motion for the FEATURES-stage heightmaps.
         !matches!(
             self,
             ParityBlock::Air
@@ -2322,6 +2395,12 @@ impl ParityBlock {
                 | ParityBlock::Vine
                 | ParityBlock::MangrovePropagule
                 | ParityBlock::MossCarpet
+                | ParityBlock::CaveVines
+                | ParityBlock::CaveVinesPlant
+                | ParityBlock::HangingRoots
+                | ParityBlock::GlowLichen
+                | ParityBlock::SculkVein
+                | ParityBlock::SmallDripleaf
         )
     }
 
