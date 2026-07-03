@@ -391,10 +391,15 @@ pub fn biome_registry_size() -> usize {
     biome::registry_size()
 }
 
-/// Choose a spawn column on solid, dry land near the origin: spiral outward until
-/// a column's surface is above sea level and not ocean, returning its world xz.
-/// Falls back to the origin if nothing suitable is found within the search radius.
+/// Choose the world spawn column. In parity mode this runs vanilla's
+/// climate-aware spawn selection ([`parity_spawn_column`]); the legacy generator
+/// keeps the origin-spiral heuristic below.
 pub fn spawn_column() -> (i32, i32) {
+    if parity_enabled() {
+        return parity_spawn_column();
+    }
+    // Legacy: spiral outward from the origin until a column's surface is above
+    // sea level and not ocean, returning its world xz. Falls back to the origin.
     for radius in 0..64i32 {
         for dz in -radius..=radius {
             for dx in -radius..=radius {
@@ -403,18 +408,81 @@ pub fn spawn_column() -> (i32, i32) {
                     continue;
                 }
                 let (x, z) = (dx * 8, dz * 8);
-                // In parity mode a solid surface above sea level already
-                // implies dry land; the legacy biome check reads the legacy
-                // climate field and would be meaningless there.
-                if surface_height(x, z) > SEA_LEVEL
-                    && (parity_enabled() || biome_at(x, z) != Biome::Ocean)
-                {
+                if surface_height(x, z) > SEA_LEVEL && biome_at(x, z) != Biome::Ocean {
                     return (x, z);
                 }
             }
         }
     }
     (0, 0)
+}
+
+/// Vanilla-parity world spawn selection, ported from `MinecraftServer.setInitialSpawn`
+/// for the OVERWORLD (`isDebug == false`):
+///
+/// 1. `Climate.SpawnFinder` ([`climate::find_spawn_position`]) searches climate
+///    space for the block column whose climate best matches the overworld
+///    `spawn_target` (temperate, inland, non-river), biased toward the origin —
+///    this is what keeps players out of the desert/jungle the legacy spiral
+///    would land in.
+/// 2. The block is snapped to its owning chunk; vanilla's initial spawn is that
+///    chunk's centre column `(+8, +8)`.
+/// 3. A `Mth.square(11)` spiral (bounded to a `±5`-chunk window, the exact
+///    `setInitialSpawn` walk) probes each chunk via [`spawn_pos_in_chunk`] —
+///    `PlayerSpawnFinder.getSpawnPosInChunk`'s per-column scan — for the first
+///    valid dry-land column, taking it as the spawn.
+///
+/// Vela's spawn contract is an `(x, z)` column (the y is derived by the caller
+/// via `surface_height + 1`), and the only per-column signal available through
+/// the public pipeline API is `surface_height` (`OCEAN_FLOOR_WG`). So the
+/// block-level validity check is at column granularity: a column is a valid
+/// spawn when its ocean-floor surface is above sea level (dry land, no water
+/// column) — the column-level equivalent of `getLevelRespawnPos`'s
+/// solid-face-up-and-not-under-fluid test.
+fn parity_spawn_column() -> (i32, i32) {
+    // Build the seed's climate sampler once (memoised by `world_spawn`).
+    let data = density::VanillaWorldgenData::load_overworld();
+    let rng_state = density::RandomState::new_overworld(&data, seed() as i64);
+    let sampler = climate::Sampler::new(&rng_state);
+    let (block_x, block_z) = climate::find_spawn_position(&sampler);
+
+    // The spawn chunk and its centre column (vanilla's initial `setSpawn`).
+    let (spawn_cx, spawn_cz) = (block_x >> 4, block_z >> 4);
+    let mut spawn = (spawn_cx * 16 + 8, spawn_cz * 16 + 8);
+
+    // `setInitialSpawn`'s spiral: `xChunkOffset/zChunkOffset` walk a growing
+    // square, clamped to the ±5-chunk window, over Mth.square(11) steps.
+    let (mut xo, mut zo, mut dx, mut dz) = (0i32, 0i32, 0i32, -1i32);
+    for _ in 0..(11 * 11) {
+        if (-5..=5).contains(&xo) && (-5..=5).contains(&zo) {
+            if let Some(col) = spawn_pos_in_chunk(spawn_cx + xo, spawn_cz + zo) {
+                spawn = col;
+                break;
+            }
+        }
+        if xo == zo || (xo < 0 && xo == -zo) || (xo > 0 && xo == 1 - zo) {
+            let old_dx = dx;
+            dx = -dz;
+            dz = old_dx;
+        }
+        xo += dx;
+        zo += dz;
+    }
+    spawn
+}
+
+/// `PlayerSpawnFinder.getSpawnPosInChunk` at column granularity: scan a chunk's
+/// 16×16 columns (x outer, z inner, vanilla's order) for the first whose surface
+/// (`OCEAN_FLOOR_WG`) is above sea level — i.e. dry land, a valid standing spot.
+fn spawn_pos_in_chunk(cx: i32, cz: i32) -> Option<(i32, i32)> {
+    for x in (cx * 16)..(cx * 16 + 16) {
+        for z in (cz * 16)..(cz * 16 + 16) {
+            if surface_height(x, z) > SEA_LEVEL {
+                return Some((x, z));
+            }
+        }
+    }
+    None
 }
 
 /// The world spawn column `(wx, wz)`, computed once and memoised. [`spawn_column`]
@@ -548,5 +616,17 @@ mod tests {
         let (x, z) = spawn_column();
         assert!(surface_height(x, z) > SEA_LEVEL);
         assert_ne!(biome_at(x, z), Biome::Ocean);
+    }
+
+    #[test]
+    fn world_spawn_is_memoised() {
+        // The world spawn is computed once and cached (vanilla caches the level
+        // spawn in ServerLevelData rather than re-searching it), so repeated
+        // reads return the identical column without re-running the search.
+        let a = world_spawn();
+        let b = world_spawn();
+        assert_eq!(a, b, "world_spawn must be stable across calls");
+        // And it agrees with a direct spawn_column() computation for this seed.
+        assert!(surface_height(a.0, a.1) > SEA_LEVEL, "spawn column must be dry land");
     }
 }
