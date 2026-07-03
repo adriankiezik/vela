@@ -69,9 +69,13 @@ enum StateProvider {
     Simple(ParityBlock),
     RuleBased { fallback: Box<StateProvider>, rules: Vec<(BlockPredicate, StateProvider)> },
     /// `WeightedStateProvider` — `(block, weight)` entries; `getState` draws one
-    /// `nextInt(total_weight)`. None of the target trees use it, so it is only a
-    /// completeness port (cumulative-weight selection).
+    /// `nextInt(total_weight)`. Azalea uses it (azalea/flowering_azalea leaves).
     Weighted(Vec<(ParityBlock, i32)>),
+    /// `RandomizedIntStateProvider` — draws the `source` state, then draws
+    /// `values.sample` to set an integer property. The property collapses onto the
+    /// identity default state, but both RNG draws are consumed 1:1 (mangrove
+    /// propagule `age`).
+    RandomizedInt { source: Box<StateProvider>, values: IntProvider },
     Unsupported,
 }
 
@@ -116,6 +120,10 @@ impl StateProvider {
                     StateProvider::Weighted(entries)
                 }
             }
+            "randomized_int_state_provider" => StateProvider::RandomizedInt {
+                source: Box::new(StateProvider::parse(&v["source"])),
+                values: IntProvider::parse(&v["values"]),
+            },
             _ => StateProvider::Unsupported,
         }
     }
@@ -146,6 +154,13 @@ impl StateProvider {
                     }
                 }
                 entries.last().map(|(b, _)| *b)
+            }
+            StateProvider::RandomizedInt { source, values } => {
+                let base = source.get_state(level, random, pos);
+                // `unmodifiedState.setValue(property, values.sample(random))` — the
+                // property collapses onto the default state; the draw is consumed.
+                let _ = values.sample(random);
+                base
             }
             StateProvider::Unsupported => None,
         }
@@ -267,6 +282,30 @@ enum TrunkPlacer {
     /// `MegaJungleTrunkPlacer extends GiantTrunkPlacer` — 2×2 trunk plus radial
     /// side branches.
     MegaJungle { base: i32, a: i32, b: i32 },
+    /// `CherryTrunkPlacer` — a straight trunk with 1–3 curved side branches.
+    Cherry {
+        base: i32,
+        a: i32,
+        b: i32,
+        branch_count: IntProvider,
+        branch_horizontal_length: IntProvider,
+        branch_start_min: i32,
+        branch_start_max: i32,
+        branch_end_offset: IntProvider,
+    },
+    /// `BendingTrunkPlacer` — a trunk that bends over near the top (azalea).
+    Bending { base: i32, a: i32, b: i32, min_height_for_leaves: i32, bend_length: IntProvider },
+    /// `UpwardsBranchingTrunkPlacer` — a trunk with random upward branches that
+    /// can grow through a block set (mangrove).
+    UpwardsBranching {
+        base: i32,
+        a: i32,
+        b: i32,
+        extra_branch_steps: IntProvider,
+        place_branch_prob: f32,
+        extra_branch_length: IntProvider,
+        can_grow_through: Option<BlockTag>,
+    },
     Unsupported,
 }
 
@@ -283,12 +322,52 @@ impl TrunkPlacer {
             "fancy_trunk_placer" => TrunkPlacer::Fancy { base, a, b },
             "giant_trunk_placer" => TrunkPlacer::Giant { base, a, b },
             "mega_jungle_trunk_placer" => TrunkPlacer::MegaJungle { base, a, b },
+            "cherry_trunk_placer" => {
+                // `branch_start_offset_from_top` is a bare `UniformInt` (no `type`);
+                // `secondBranchStartOffsetFromTop = UniformInt.of(min, max-1)`.
+                let bs = &v["branch_start_offset_from_top"];
+                TrunkPlacer::Cherry {
+                    base,
+                    a,
+                    b,
+                    branch_count: IntProvider::parse(&v["branch_count"]),
+                    branch_horizontal_length: IntProvider::parse(&v["branch_horizontal_length"]),
+                    branch_start_min: bs["min_inclusive"].as_i64().unwrap_or(0) as i32,
+                    branch_start_max: bs["max_inclusive"].as_i64().unwrap_or(0) as i32,
+                    branch_end_offset: IntProvider::parse(&v["branch_end_offset_from_top"]),
+                }
+            }
+            "bending_trunk_placer" => TrunkPlacer::Bending {
+                base,
+                a,
+                b,
+                min_height_for_leaves: v.get("min_height_for_leaves").and_then(Value::as_i64).unwrap_or(1) as i32,
+                bend_length: IntProvider::parse(&v["bend_length"]),
+            },
+            "upwards_branching_trunk_placer" => TrunkPlacer::UpwardsBranching {
+                base,
+                a,
+                b,
+                extra_branch_steps: IntProvider::parse(&v["extra_branch_steps"]),
+                place_branch_prob: v.get("place_branch_per_log_probability").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                extra_branch_length: IntProvider::parse(&v["extra_branch_length"]),
+                can_grow_through: parse_grow_through(&v["can_grow_through"]),
+            },
             _ => TrunkPlacer::Unsupported,
         }
     }
 
     fn is_unsupported(&self) -> bool {
         matches!(self, TrunkPlacer::Unsupported)
+    }
+
+    /// The `validTreePos`-widening block set some placers grow through
+    /// (`UpwardsBranchingTrunkPlacer`); `None` for the plain placers.
+    fn grow_through(&self) -> Option<BlockTag> {
+        match self {
+            TrunkPlacer::UpwardsBranching { can_grow_through, .. } => *can_grow_through,
+            _ => None,
+        }
     }
 
     /// `TrunkPlacer.getTreeHeight` — `baseHeight + nextInt(a+1) + nextInt(b+1)`.
@@ -299,7 +378,10 @@ impl TrunkPlacer {
             | TrunkPlacer::DarkOak { base, a, b }
             | TrunkPlacer::Fancy { base, a, b }
             | TrunkPlacer::Giant { base, a, b }
-            | TrunkPlacer::MegaJungle { base, a, b } => {
+            | TrunkPlacer::MegaJungle { base, a, b }
+            | TrunkPlacer::Cherry { base, a, b, .. }
+            | TrunkPlacer::Bending { base, a, b, .. }
+            | TrunkPlacer::UpwardsBranching { base, a, b, .. } => {
                 *base + random.next_int_bounded(*a + 1) + random.next_int_bounded(*b + 1)
             }
             TrunkPlacer::Unsupported => 0,
@@ -326,6 +408,20 @@ enum FoliagePlacer {
     /// `MegaJungleFoliagePlacer` — the top blob of a mega jungle tree; draws one
     /// `nextInt(2)` per single-trunk attachment.
     MegaJungle { radius: IntProvider, offset: IntProvider, height: i32 },
+    /// `CherryFoliagePlacer` — a wide flat canopy with hanging-leaf fringes.
+    Cherry {
+        radius: IntProvider,
+        offset: IntProvider,
+        height: IntProvider,
+        wide_bottom_layer_hole_chance: f32,
+        corner_hole_chance: f32,
+        hanging_leaves_chance: f32,
+        hanging_leaves_extension_chance: f32,
+    },
+    /// `MegaPineFoliagePlacer` — the jagged conic crown of a mega spruce/pine.
+    MegaPine { radius: IntProvider, offset: IntProvider, crown_height: IntProvider },
+    /// `RandomSpreadFoliagePlacer` — scatters leaves in a box (azalea, mangrove).
+    RandomSpread { radius: IntProvider, offset: IntProvider, foliage_height: IntProvider, leaf_placement_attempts: i32 },
     Unsupported,
 }
 
@@ -368,6 +464,26 @@ impl FoliagePlacer {
                 offset,
                 height: v.get("height").and_then(Value::as_i64).unwrap_or(0) as i32,
             },
+            "cherry_foliage_placer" => FoliagePlacer::Cherry {
+                radius,
+                offset,
+                height: IntProvider::parse(&v["height"]),
+                wide_bottom_layer_hole_chance: v.get("wide_bottom_layer_hole_chance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                corner_hole_chance: v.get("corner_hole_chance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                hanging_leaves_chance: v.get("hanging_leaves_chance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                hanging_leaves_extension_chance: v.get("hanging_leaves_extension_chance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+            },
+            "mega_pine_foliage_placer" => FoliagePlacer::MegaPine {
+                radius,
+                offset,
+                crown_height: IntProvider::parse(&v["crown_height"]),
+            },
+            "random_spread_foliage_placer" => FoliagePlacer::RandomSpread {
+                radius,
+                offset,
+                foliage_height: IntProvider::parse(&v["foliage_height"]),
+                leaf_placement_attempts: v.get("leaf_placement_attempts").and_then(Value::as_i64).unwrap_or(0) as i32,
+            },
             _ => FoliagePlacer::Unsupported,
         }
     }
@@ -390,6 +506,18 @@ enum TreeDecorator {
     TrunkVine,
     /// `LeaveVineDecorator` — hanging vines off the leaf shell.
     LeaveVine { probability: f32 },
+    /// `AlterGroundDecorator` — replaces the ground under the trunk (podzol for
+    /// mega spruce/pine).
+    AlterGround { provider: StateProvider },
+    /// `AttachedToLeavesDecorator` — hangs a block (mangrove propagule) off leaves.
+    AttachedToLeaves {
+        probability: f32,
+        exclusion_radius_xz: i32,
+        exclusion_radius_y: i32,
+        block_provider: StateProvider,
+        required_empty_blocks: i32,
+        directions: Vec<(i32, i32, i32)>,
+    },
     Unsupported,
 }
 
@@ -402,9 +530,89 @@ impl TreeDecorator {
             "cocoa" => TreeDecorator::Cocoa { probability: prob },
             "trunk_vine" => TreeDecorator::TrunkVine,
             "leave_vine" => TreeDecorator::LeaveVine { probability: prob },
+            "alter_ground" => TreeDecorator::AlterGround { provider: StateProvider::parse(&v["provider"]) },
+            "attached_to_leaves" => TreeDecorator::AttachedToLeaves {
+                probability: prob,
+                exclusion_radius_xz: v.get("exclusion_radius_xz").and_then(Value::as_i64).unwrap_or(0) as i32,
+                exclusion_radius_y: v.get("exclusion_radius_y").and_then(Value::as_i64).unwrap_or(0) as i32,
+                block_provider: StateProvider::parse(&v["block_provider"]),
+                required_empty_blocks: v.get("required_empty_blocks").and_then(Value::as_i64).unwrap_or(1) as i32,
+                directions: v["directions"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|d| parse_direction(d.as_str().unwrap_or("")))
+                    .collect(),
+            },
             _ => TreeDecorator::Unsupported,
         }
     }
+}
+
+/// A `Direction` name → unit step vector (only the six cardinal directions).
+fn parse_direction(name: &str) -> Option<(i32, i32, i32)> {
+    Some(match name.strip_prefix("minecraft:").unwrap_or(name) {
+        "down" => (0, -1, 0),
+        "up" => (0, 1, 0),
+        "north" => (0, 0, -1),
+        "south" => (0, 0, 1),
+        "west" => (-1, 0, 0),
+        "east" => (1, 0, 0),
+        _ => return None,
+    })
+}
+
+/// `AboveRootPlacement` — a chance to place a block (moss carpet) on top of each
+/// placed root.
+#[derive(Clone, Debug)]
+struct AboveRootPlacement {
+    chance: f32,
+    provider: StateProvider,
+}
+
+/// `RootPlacer` — only `MangroveRootPlacer` exists in the overworld. Grows a
+/// spreading root system below the trunk origin before the trunk is placed; its
+/// RNG draws precede (and thus affect) the trunk/foliage draws, so it is ported
+/// 1:1.
+#[derive(Clone, Debug)]
+struct RootPlacer {
+    trunk_offset_y: IntProvider,
+    root_provider: StateProvider,
+    above_root: Option<AboveRootPlacement>,
+    can_grow_through: Option<BlockTag>,
+    muddy_roots_in: Vec<ParityBlock>,
+    muddy_roots_provider: StateProvider,
+    max_root_width: i32,
+    max_root_length: i32,
+    random_skew_chance: f32,
+}
+
+/// Parse a `root_placer` config. Returns `None` for an unsupported type (there is
+/// only `mangrove_root_placer` in vanilla); the caller then treats the tree as
+/// unsupported rather than mis-placing it.
+fn parse_root_placer(v: &Value) -> Option<RootPlacer> {
+    let t = v.get("type").and_then(Value::as_str).unwrap_or("");
+    if t.strip_prefix("minecraft:").unwrap_or(t) != "mangrove_root_placer" {
+        return None;
+    }
+    let mrp = &v["mangrove_root_placement"];
+    Some(RootPlacer {
+        trunk_offset_y: IntProvider::parse(&v["trunk_offset_y"]),
+        root_provider: StateProvider::parse(&v["root_provider"]),
+        above_root: v
+            .get("above_root_placement")
+            .filter(|a| a.is_object())
+            .map(|a| AboveRootPlacement {
+                chance: a.get("above_root_placement_chance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+                provider: StateProvider::parse(&a["above_root_provider"]),
+            }),
+        can_grow_through: parse_grow_through(&mrp["can_grow_through"]),
+        muddy_roots_in: parse_block_holderset(&mrp["muddy_roots_in"]),
+        muddy_roots_provider: StateProvider::parse(&mrp["muddy_roots_provider"]),
+        max_root_width: mrp.get("max_root_width").and_then(Value::as_i64).unwrap_or(8) as i32,
+        max_root_length: mrp.get("max_root_length").and_then(Value::as_i64).unwrap_or(15) as i32,
+        random_skew_chance: mrp.get("random_skew_chance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -417,9 +625,15 @@ struct TreeConfig {
     decorators: Vec<TreeDecorator>,
     ignore_vines: bool,
     below_trunk_provider: StateProvider,
+    root_placer: Option<RootPlacer>,
+    /// A `root_placer` field was present but of an unsupported type → skip the
+    /// whole tree (parity-safe).
+    root_placer_unsupported: bool,
 }
 
 fn parse_tree(cfg: &Value) -> TreeConfig {
+    let has_root_field = cfg.get("root_placer").map(|v| !v.is_null()).unwrap_or(false);
+    let root_placer = if has_root_field { parse_root_placer(&cfg["root_placer"]) } else { None };
     TreeConfig {
         trunk_provider: StateProvider::parse(&cfg["trunk_provider"]),
         trunk_placer: TrunkPlacer::parse(&cfg["trunk_placer"]),
@@ -434,6 +648,8 @@ fn parse_tree(cfg: &Value) -> TreeConfig {
             .collect(),
         ignore_vines: cfg.get("ignore_vines").and_then(Value::as_bool).unwrap_or(false),
         below_trunk_provider: StateProvider::parse(&cfg["below_trunk_provider"]),
+        root_placer_unsupported: has_root_field && root_placer.is_none(),
+        root_placer,
     }
 }
 
@@ -559,6 +775,12 @@ fn parse_ore(cfg: &Value) -> OreConfig {
         size: cfg["size"].as_i64().unwrap_or(0) as i32,
         discard_chance_on_air_exposure: cfg["discard_chance_on_air_exposure"].as_f64().unwrap_or(0.0) as f32,
     }
+}
+
+/// Resolve a `#tag`-string HolderSet reference (e.g. a `can_grow_through` field)
+/// to a modeled [`BlockTag`]. Non-tag / unknown references yield `None`.
+fn parse_grow_through(v: &Value) -> Option<BlockTag> {
+    v.as_str().and_then(|s| BlockTag::from_id(s.trim_start_matches('#')))
 }
 
 fn parse_block_holderset(v: &Value) -> Vec<ParityBlock> {
@@ -1330,6 +1552,28 @@ impl HDir {
             _ => 0,
         }
     }
+    /// `Direction.getClockWise()` in the horizontal plane: N→E→S→W→N.
+    fn clockwise(self) -> HDir {
+        match self {
+            HDir::North => HDir::East,
+            HDir::East => HDir::South,
+            HDir::South => HDir::West,
+            HDir::West => HDir::North,
+        }
+    }
+    /// `Direction.getAxisDirection() == POSITIVE` (east/south point +x/+z).
+    fn axis_positive(self) -> bool {
+        matches!(self, HDir::East | HDir::South)
+    }
+    /// `Direction.getOpposite()` in the horizontal plane.
+    fn opposite(self) -> HDir {
+        match self {
+            HDir::North => HDir::South,
+            HDir::South => HDir::North,
+            HDir::East => HDir::West,
+            HDir::West => HDir::East,
+        }
+    }
 }
 
 /// `Direction.Plane.HORIZONTAL.getRandomDirection(random)` = `faces[nextInt(4)]`.
@@ -1348,9 +1592,20 @@ fn valid_tree_pos(level: &dyn DecorationLevel, p: Pos) -> bool {
     b.is_air() || BlockTag::ReplaceableByTrees.contains(b)
 }
 
+/// `TrunkPlacer.validTreePos` with the optional `can_grow_through` override some
+/// placers add (`UpwardsBranchingTrunkPlacer`): `validTreePos || #can_grow_through`.
+fn valid_tree_pos_ext(level: &dyn DecorationLevel, p: Pos, grow_through: Option<BlockTag>) -> bool {
+    valid_tree_pos(level, p)
+        || grow_through.map(|t| t.contains(level.get_block(p.x, p.y, p.z))).unwrap_or(false)
+}
+
 /// `TrunkPlacer.isFree` — `validTreePos || #logs`.
 fn is_free(level: &dyn DecorationLevel, p: Pos) -> bool {
-    valid_tree_pos(level, p) || BlockTag::Logs.contains(level.get_block(p.x, p.y, p.z))
+    is_free_ext(level, p, None)
+}
+
+fn is_free_ext(level: &dyn DecorationLevel, p: Pos, grow_through: Option<BlockTag>) -> bool {
+    valid_tree_pos_ext(level, p, grow_through) || BlockTag::Logs.contains(level.get_block(p.x, p.y, p.z))
 }
 
 /// `TreeFeature.isVine` — a `vine` block (only ever present when an earlier tree
@@ -1374,7 +1629,19 @@ fn place_log(
     p: Pos,
     config: &TreeConfig,
 ) -> bool {
-    if valid_tree_pos(level, p) {
+    place_log_growable(level, trunks, random, p, config, None)
+}
+
+/// `TrunkPlacer.placeLog` honoring an optional `can_grow_through` override.
+fn place_log_growable(
+    level: &mut dyn DecorationLevel,
+    trunks: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    p: Pos,
+    config: &TreeConfig,
+    grow_through: Option<BlockTag>,
+) -> bool {
+    if valid_tree_pos_ext(level, p, grow_through) {
         if let Some(state) = config.trunk_provider.get_state(&*level, random, p) {
             trunks.insert(p);
             level.set_block(p.x, p.y, p.z, state);
@@ -1417,13 +1684,19 @@ fn place_below_trunk_block(
 /// `TreeFeature.getMaxFreeTreeHeight`. `isVine` is normally false during the
 /// first tree of a chunk, but an earlier jungle tree's vine decorators can leave
 /// `vine` blocks, so the `ignore_vines` gate is honored.
-fn get_max_free_tree_height(level: &dyn DecorationLevel, max_tree_height: i32, tree_pos: Pos, config: &TreeConfig) -> i32 {
+fn get_max_free_tree_height(
+    level: &dyn DecorationLevel,
+    max_tree_height: i32,
+    tree_pos: Pos,
+    config: &TreeConfig,
+    grow_through: Option<BlockTag>,
+) -> i32 {
     for y in 0..=max_tree_height + 1 {
         let r = config.minimum_size.get_size_at_height(max_tree_height, y);
         for x in -r..=r {
             for z in -r..=r {
                 let p = Pos::new(tree_pos.x + x, tree_pos.y + y, tree_pos.z + z);
-                if !is_free(level, p) || (!config.ignore_vines && is_vine(level, p)) {
+                if !is_free_ext(level, p, grow_through) || (!config.ignore_vines && is_vine(level, p)) {
                     return y - 2;
                 }
             }
@@ -1570,7 +1843,342 @@ impl TrunkPlacer {
                 }
                 attachments
             }
+            TrunkPlacer::Cherry {
+                branch_count,
+                branch_horizontal_length,
+                branch_start_min,
+                branch_start_max,
+                branch_end_offset,
+                ..
+            } => {
+                // `CherryTrunkPlacer.placeTrunk`.
+                place_below_trunk_block(level, trunks, random, origin.below(), config);
+                // `UniformInt.sample` = `nextInt(max - min + 1) + min`.
+                let first_off = random.next_int_bounded(*branch_start_max - *branch_start_min + 1) + *branch_start_min;
+                let first_branch = (tree_height - 1 + first_off).max(0);
+                // secondBranchStartOffsetFromTop = UniformInt.of(min, max-1).
+                let second_off = random.next_int_bounded(*branch_start_max - 1 - *branch_start_min + 1) + *branch_start_min;
+                let mut second_branch = (tree_height - 1 + second_off).max(0);
+                if second_branch >= first_branch {
+                    second_branch += 1;
+                }
+                let bc = branch_count.sample(random);
+                let has_middle_branch = bc == 3;
+                let has_both_side_branches = bc >= 2;
+                let trunk_height = if has_middle_branch {
+                    tree_height
+                } else if has_both_side_branches {
+                    first_branch.max(second_branch) + 1
+                } else {
+                    first_branch + 1
+                };
+                for y in 0..trunk_height {
+                    place_log(level, trunks, random, origin.above(y), config);
+                }
+                let mut attachments = Vec::new();
+                if has_middle_branch {
+                    attachments.push(FoliageAttachment { pos: origin.above(trunk_height), radius_offset: 0, double_trunk: false });
+                }
+                let tree_direction = horizontal_random_direction(random);
+                attachments.push(cherry_generate_branch(
+                    level, trunks, random, tree_height, origin, config, branch_horizontal_length, branch_end_offset,
+                    tree_direction, first_branch, first_branch < trunk_height - 1,
+                ));
+                if has_both_side_branches {
+                    attachments.push(cherry_generate_branch(
+                        level, trunks, random, tree_height, origin, config, branch_horizontal_length, branch_end_offset,
+                        tree_direction.opposite(), second_branch, second_branch < trunk_height - 1,
+                    ));
+                }
+                attachments
+            }
+            TrunkPlacer::Bending { min_height_for_leaves, bend_length, .. } => {
+                // `BendingTrunkPlacer.placeTrunk`.
+                let direction = horizontal_random_direction(random);
+                let log_height = tree_height - 1;
+                let (mut px, mut py, mut pz) = (origin.x, origin.y, origin.z);
+                place_below_trunk_block(level, trunks, random, origin.below(), config);
+                let mut foliage_points = Vec::new();
+                for i in 0..=log_height {
+                    if i + 1 >= log_height + random.next_int_bounded(2) {
+                        px += direction.step_x();
+                        pz += direction.step_z();
+                    }
+                    let p = Pos::new(px, py, pz);
+                    if valid_tree_pos(level, p) {
+                        place_log(level, trunks, random, p, config);
+                    }
+                    if i >= *min_height_for_leaves {
+                        foliage_points.push(FoliageAttachment { pos: p, radius_offset: 0, double_trunk: false });
+                    }
+                    py += 1;
+                }
+                let dir_length = bend_length.sample(random);
+                for _ in 0..=dir_length {
+                    let p = Pos::new(px, py, pz);
+                    if valid_tree_pos(level, p) {
+                        place_log(level, trunks, random, p, config);
+                    }
+                    foliage_points.push(FoliageAttachment { pos: p, radius_offset: 0, double_trunk: false });
+                    px += direction.step_x();
+                    pz += direction.step_z();
+                }
+                foliage_points
+            }
+            TrunkPlacer::UpwardsBranching { extra_branch_steps, place_branch_prob, extra_branch_length, .. } => {
+                // `UpwardsBranchingTrunkPlacer.placeTrunk`.
+                let grow_through = self.grow_through();
+                let mut attachments = Vec::new();
+                for height_pos in 0..tree_height {
+                    let current_height = origin.y + height_pos;
+                    let log_pos = Pos::new(origin.x, current_height, origin.z);
+                    if place_log_growable(level, trunks, random, log_pos, config, grow_through)
+                        && height_pos < tree_height - 1
+                        && random.next_float() < *place_branch_prob
+                    {
+                        let branch_dir = horizontal_random_direction(random);
+                        let branch_len = extra_branch_length.sample(random);
+                        let branch_pos = (branch_len - extra_branch_length.sample(random) - 1).max(0);
+                        let branch_steps = extra_branch_steps.sample(random);
+                        upwards_place_branch(
+                            level, trunks, random, tree_height, config, &mut attachments, origin, current_height,
+                            branch_dir, branch_pos, branch_steps, grow_through,
+                        );
+                    }
+                    if height_pos == tree_height - 1 {
+                        attachments.push(FoliageAttachment {
+                            pos: Pos::new(origin.x, current_height + 1, origin.z),
+                            radius_offset: 0,
+                            double_trunk: false,
+                        });
+                    }
+                }
+                attachments
+            }
             TrunkPlacer::Unsupported => Vec::new(),
+        }
+    }
+}
+
+/// `CherryTrunkPlacer.generateBranch` — a curved branch walking toward its end.
+#[allow(clippy::too_many_arguments)]
+fn cherry_generate_branch(
+    level: &mut dyn DecorationLevel,
+    trunks: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    tree_height: i32,
+    origin: Pos,
+    config: &TreeConfig,
+    branch_horizontal_length: &IntProvider,
+    branch_end_offset: &IntProvider,
+    branch_direction: HDir,
+    offset_from_origin: i32,
+    middle_continues_upwards: bool,
+) -> FoliageAttachment {
+    let mut log_pos = origin.above(offset_from_origin);
+    let branch_end_off = tree_height - 1 + branch_end_offset.sample(random);
+    let extend = middle_continues_upwards || branch_end_off < offset_from_origin;
+    let distance_to_trunk = branch_horizontal_length.sample(random) + if extend { 1 } else { 0 };
+    let branch_end_pos = Pos::new(
+        origin.x + branch_direction.step_x() * distance_to_trunk,
+        origin.y + branch_end_off,
+        origin.z + branch_direction.step_z() * distance_to_trunk,
+    );
+    let steps_horizontally = if extend { 2 } else { 1 };
+    for _ in 0..steps_horizontally {
+        log_pos = Pos::new(log_pos.x + branch_direction.step_x(), log_pos.y, log_pos.z + branch_direction.step_z());
+        place_log(level, trunks, random, log_pos, config);
+    }
+    let vertical_up = branch_end_pos.y > log_pos.y;
+    loop {
+        let distance =
+            (log_pos.x - branch_end_pos.x).abs() + (log_pos.y - branch_end_pos.y).abs() + (log_pos.z - branch_end_pos.z).abs();
+        if distance == 0 {
+            return FoliageAttachment { pos: branch_end_pos.above(1), radius_offset: 0, double_trunk: false };
+        }
+        let chance = (branch_end_pos.y - log_pos.y).abs() as f32 / distance as f32;
+        let grow_vertically = random.next_float() < chance;
+        log_pos = if grow_vertically {
+            Pos::new(log_pos.x, log_pos.y + if vertical_up { 1 } else { -1 }, log_pos.z)
+        } else {
+            Pos::new(log_pos.x + branch_direction.step_x(), log_pos.y, log_pos.z + branch_direction.step_z())
+        };
+        place_log(level, trunks, random, log_pos, config);
+    }
+}
+
+/// `UpwardsBranchingTrunkPlacer.placeBranch`.
+#[allow(clippy::too_many_arguments)]
+fn upwards_place_branch(
+    level: &mut dyn DecorationLevel,
+    trunks: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    tree_height: i32,
+    config: &TreeConfig,
+    attachments: &mut Vec<FoliageAttachment>,
+    origin: Pos,
+    current_height: i32,
+    branch_dir: HDir,
+    branch_pos: i32,
+    mut branch_steps: i32,
+    grow_through: Option<BlockTag>,
+) {
+    let mut height_along_branch = current_height + branch_pos;
+    let mut log_x = origin.x;
+    let mut log_z = origin.z;
+    let mut idx = branch_pos;
+    while idx < tree_height && branch_steps > 0 {
+        if idx >= 1 {
+            let placement_height = current_height + idx;
+            log_x += branch_dir.step_x();
+            log_z += branch_dir.step_z();
+            height_along_branch = placement_height;
+            if place_log_growable(level, trunks, random, Pos::new(log_x, placement_height, log_z), config, grow_through) {
+                height_along_branch += 1;
+            }
+            attachments.push(FoliageAttachment { pos: Pos::new(log_x, placement_height, log_z), radius_offset: 0, double_trunk: false });
+        }
+        idx += 1;
+        branch_steps -= 1;
+    }
+    if height_along_branch - current_height > 1 {
+        let foliage_pos = Pos::new(log_x, height_along_branch, log_z);
+        attachments.push(FoliageAttachment { pos: foliage_pos, radius_offset: 0, double_trunk: false });
+        attachments.push(FoliageAttachment { pos: foliage_pos.above(-2), radius_offset: 0, double_trunk: false });
+    }
+}
+
+impl RootPlacer {
+    /// `RootPlacer.getTrunkOrigin` — draws `trunkOffsetY` and shifts the trunk up.
+    fn get_trunk_origin(&self, origin: Pos, random: &mut WorldgenRandom) -> Pos {
+        origin.above(self.trunk_offset_y.sample(random))
+    }
+
+    /// `MangroveRootPlacer.canPlaceRoot` — `validTreePos || #can_grow_through`.
+    fn can_place_root(&self, level: &dyn DecorationLevel, p: Pos) -> bool {
+        valid_tree_pos(level, p)
+            || self.can_grow_through.map(|t| t.contains(level.get_block(p.x, p.y, p.z))).unwrap_or(false)
+    }
+
+    /// `MangroveRootPlacer.placeRoots` — returns false (aborting the whole tree)
+    /// when the root system cannot fit.
+    fn place_roots(
+        &self,
+        level: &mut dyn DecorationLevel,
+        roots: &mut HashSet<Pos>,
+        random: &mut WorldgenRandom,
+        origin: Pos,
+        trunk_origin: Pos,
+        config: &TreeConfig,
+    ) -> bool {
+        let mut root_positions: Vec<Pos> = Vec::new();
+        let mut cy = origin.y;
+        while cy < trunk_origin.y {
+            if !self.can_place_root(level, Pos::new(origin.x, cy, origin.z)) {
+                return false;
+            }
+            cy += 1;
+        }
+        root_positions.push(trunk_origin.below());
+        // `Direction.Plane.HORIZONTAL`: NORTH, EAST, SOUTH, WEST.
+        for dir in [HDir::North, HDir::East, HDir::South, HDir::West] {
+            let pos = Pos::new(trunk_origin.x + dir.step_x(), trunk_origin.y, trunk_origin.z + dir.step_z());
+            let mut positions_in_direction: Vec<Pos> = Vec::new();
+            if !self.simulate_roots(level, random, pos, dir, trunk_origin, &mut positions_in_direction, 0) {
+                return false;
+            }
+            root_positions.extend(positions_in_direction);
+            root_positions.push(pos);
+        }
+        for root_pos in &root_positions {
+            self.place_root(level, roots, random, *root_pos, config);
+        }
+        true
+    }
+
+    /// `MangroveRootPlacer.simulateRoots` (recursive).
+    #[allow(clippy::too_many_arguments)]
+    fn simulate_roots(
+        &self,
+        level: &dyn DecorationLevel,
+        random: &mut WorldgenRandom,
+        root_pos: Pos,
+        dir: HDir,
+        root_origin: Pos,
+        root_positions: &mut Vec<Pos>,
+        layer: i32,
+    ) -> bool {
+        if layer != self.max_root_length && (root_positions.len() as i32) <= self.max_root_length {
+            for pos in self.potential_root_positions(root_pos, dir, random, root_origin) {
+                if self.can_place_root(level, pos) {
+                    root_positions.push(pos);
+                    if !self.simulate_roots(level, random, pos, dir, root_origin, root_positions, layer + 1) {
+                        return false;
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `MangroveRootPlacer.potentialRootPositions`.
+    fn potential_root_positions(&self, pos: Pos, prev_dir: HDir, random: &mut WorldgenRandom, root_origin: Pos) -> Vec<Pos> {
+        let below = pos.below();
+        let next_to = Pos::new(pos.x + prev_dir.step_x(), pos.y, pos.z + prev_dir.step_z());
+        let width = (pos.x - root_origin.x).abs() + (pos.y - root_origin.y).abs() + (pos.z - root_origin.z).abs();
+        let skew = self.random_skew_chance;
+        if width > self.max_root_width - 3 && width <= self.max_root_width {
+            if random.next_float() < skew {
+                vec![below, next_to.below()]
+            } else {
+                vec![below]
+            }
+        } else if width > self.max_root_width {
+            vec![below]
+        } else if random.next_float() < skew {
+            vec![below]
+        } else if random.next_boolean() {
+            vec![next_to]
+        } else {
+            vec![below]
+        }
+    }
+
+    /// `MangroveRootPlacer.placeRoot` (with the muddy-roots override) + the base
+    /// `RootPlacer.placeRoot` above-root placement.
+    fn place_root(
+        &self,
+        level: &mut dyn DecorationLevel,
+        roots: &mut HashSet<Pos>,
+        random: &mut WorldgenRandom,
+        pos: Pos,
+        _config: &TreeConfig,
+    ) {
+        if self.muddy_roots_in.contains(&level.get_block(pos.x, pos.y, pos.z)) {
+            if let Some(state) = self.muddy_roots_provider.get_state(&*level, random, pos) {
+                roots.insert(pos);
+                level.set_block(pos.x, pos.y, pos.z, state);
+            }
+            return;
+        }
+        if self.can_place_root(level, pos) {
+            if let Some(state) = self.root_provider.get_state(&*level, random, pos) {
+                roots.insert(pos);
+                level.set_block(pos.x, pos.y, pos.z, state);
+            }
+            if let Some(ar) = &self.above_root {
+                let above = pos.above(1);
+                // `nextFloat() < chance && isAir(above)` — nextFloat always drawn.
+                let roll = random.next_float();
+                if roll < ar.chance && level.get_block(above.x, above.y, above.z).is_air() {
+                    if let Some(s2) = ar.provider.get_state(&*level, random, above) {
+                        roots.insert(above);
+                        level.set_block(above.x, above.y, above.z, s2);
+                    }
+                }
+            }
         }
     }
 }
@@ -1787,6 +2395,27 @@ fn try_place_leaf(
     false
 }
 
+/// `FoliagePlacer.tryPlaceExtension` — hang a leaf below a fringe if within reach
+/// of the trunk (`distManhattan < 7`) and a `nextFloat` gate passes.
+fn try_place_extension(
+    level: &mut dyn DecorationLevel,
+    foliage: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    config: &TreeConfig,
+    chance: f32,
+    log_pos: Pos,
+    pos: Pos,
+) -> bool {
+    let dist = (pos.x - log_pos.x).abs() + (pos.y - log_pos.y).abs() + (pos.z - log_pos.z).abs();
+    if dist >= 7 {
+        return false;
+    }
+    if random.next_float() > chance {
+        return false;
+    }
+    try_place_leaf(level, foliage, random, config, pos)
+}
+
 impl FoliagePlacer {
     fn offset_ip(&self) -> &IntProvider {
         match self {
@@ -1797,7 +2426,10 @@ impl FoliagePlacer {
             | FoliagePlacer::Fancy { offset, .. }
             | FoliagePlacer::Bush { offset, .. }
             | FoliagePlacer::Acacia { offset, .. }
-            | FoliagePlacer::MegaJungle { offset, .. } => offset,
+            | FoliagePlacer::MegaJungle { offset, .. }
+            | FoliagePlacer::Cherry { offset, .. }
+            | FoliagePlacer::MegaPine { offset, .. }
+            | FoliagePlacer::RandomSpread { offset, .. } => offset,
             FoliagePlacer::Unsupported => unreachable!("offset_ip on unsupported foliage placer"),
         }
     }
@@ -1814,6 +2446,9 @@ impl FoliagePlacer {
             FoliagePlacer::DarkOak { .. } => 4,
             // `AcaciaFoliagePlacer.foliageHeight` returns 0.
             FoliagePlacer::Acacia { .. } => 0,
+            FoliagePlacer::Cherry { height, .. } => height.sample(random),
+            FoliagePlacer::MegaPine { crown_height, .. } => crown_height.sample(random),
+            FoliagePlacer::RandomSpread { foliage_height, .. } => foliage_height.sample(random),
             FoliagePlacer::Unsupported => 0,
         }
     }
@@ -1830,7 +2465,10 @@ impl FoliagePlacer {
             | FoliagePlacer::Fancy { radius, .. }
             | FoliagePlacer::Bush { radius, .. }
             | FoliagePlacer::Acacia { radius, .. }
-            | FoliagePlacer::MegaJungle { radius, .. } => radius.sample(random),
+            | FoliagePlacer::MegaJungle { radius, .. }
+            | FoliagePlacer::Cherry { radius, .. }
+            | FoliagePlacer::MegaPine { radius, .. }
+            | FoliagePlacer::RandomSpread { radius, .. } => radius.sample(random),
             FoliagePlacer::Unsupported => 0,
         }
     }
@@ -1942,6 +2580,53 @@ impl FoliagePlacer {
                     yo -= 1;
                 }
             }
+            FoliagePlacer::Cherry { hanging_leaves_chance, hanging_leaves_extension_chance, .. } => {
+                // `CherryFoliagePlacer.createFoliage`. The wide-bottom / corner-hole
+                // RNG lives in `should_skip_location` (accessed via `self`).
+                let foliage_pos = att.pos.above(offset);
+                let current_radius = leaf_radius + att.radius_offset - 1;
+                let (hc, hec) = (*hanging_leaves_chance, *hanging_leaves_extension_chance);
+                self.place_leaves_row(level, foliage, random, config, foliage_pos, current_radius - 2, foliage_height - 3, dt);
+                self.place_leaves_row(level, foliage, random, config, foliage_pos, current_radius - 1, foliage_height - 4, dt);
+                let mut y = foliage_height - 5;
+                while y >= 0 {
+                    self.place_leaves_row(level, foliage, random, config, foliage_pos, current_radius, y, dt);
+                    y -= 1;
+                }
+                self.place_leaves_row_with_hanging_below(level, foliage, random, config, foliage_pos, current_radius, -1, dt, hc, hec);
+                self.place_leaves_row_with_hanging_below(level, foliage, random, config, foliage_pos, current_radius - 1, -2, dt, hc, hec);
+            }
+            FoliagePlacer::MegaPine { .. } => {
+                // `MegaPineFoliagePlacer.createFoliage`.
+                let fx = att.pos.x;
+                let fy = att.pos.y;
+                let fz = att.pos.z;
+                let mut prev_radius = 0;
+                let mut yy = fy - foliage_height + offset;
+                while yy <= fy + offset {
+                    let yo = fy - yy;
+                    let smooth_radius =
+                        leaf_radius + att.radius_offset + mth_floor_f32(yo as f32 / foliage_height as f32 * 3.5);
+                    let jagged_radius = if yo > 0 && smooth_radius == prev_radius && (yy & 1) == 0 {
+                        smooth_radius + 1
+                    } else {
+                        smooth_radius
+                    };
+                    self.place_leaves_row(level, foliage, random, config, Pos::new(fx, yy, fz), jagged_radius, 0, dt);
+                    prev_radius = smooth_radius;
+                    yy += 1;
+                }
+            }
+            FoliagePlacer::RandomSpread { leaf_placement_attempts, .. } => {
+                // `RandomSpreadFoliagePlacer.createFoliage`.
+                let origin = att.pos;
+                for _ in 0..*leaf_placement_attempts {
+                    let dx = random.next_int_bounded(leaf_radius) - random.next_int_bounded(leaf_radius);
+                    let dy = random.next_int_bounded(foliage_height) - random.next_int_bounded(foliage_height);
+                    let dz = random.next_int_bounded(leaf_radius) - random.next_int_bounded(leaf_radius);
+                    try_place_leaf(level, foliage, random, config, Pos::new(origin.x + dx, origin.y + dy, origin.z + dz));
+                }
+            }
             FoliagePlacer::Unsupported => {}
         }
     }
@@ -1965,6 +2650,52 @@ impl FoliagePlacer {
                 if !self.should_skip_location_signed(random, dx, y, dz, current_radius, double_trunk) {
                     try_place_leaf(level, foliage, random, config, Pos::new(origin.x + dx, origin.y + y, origin.z + dz));
                 }
+            }
+        }
+    }
+
+    /// `FoliagePlacer.placeLeavesRowWithHangingLeavesBelow` — place a normal leaf
+    /// row, then walk its four outer edges hanging 1–2 leaves below any leaf just
+    /// set (cherry's drooping fringe). `foliage.contains` models `FoliageSetter.isSet`.
+    #[allow(clippy::too_many_arguments)]
+    fn place_leaves_row_with_hanging_below(
+        &self,
+        level: &mut dyn DecorationLevel,
+        foliage: &mut HashSet<Pos>,
+        random: &mut WorldgenRandom,
+        config: &TreeConfig,
+        origin: Pos,
+        current_radius: i32,
+        y: i32,
+        double_trunk: bool,
+        hanging_chance: f32,
+        hanging_ext_chance: f32,
+    ) {
+        self.place_leaves_row(level, foliage, random, config, origin, current_radius, y, double_trunk);
+        let off = if double_trunk { 1 } else { 0 };
+        let log_pos = origin.below();
+        // `Direction.Plane.HORIZONTAL`: NORTH, EAST, SOUTH, WEST.
+        for along_edge in [HDir::North, HDir::East, HDir::South, HDir::West] {
+            let to_edge = along_edge.clockwise();
+            let offset_to_edge = if to_edge.axis_positive() { current_radius + off } else { current_radius };
+            // pos = origin + (0, y-1, 0), moved `offset_to_edge` along `to_edge`,
+            // then `-current_radius` along `along_edge`.
+            let mut px = origin.x + to_edge.step_x() * offset_to_edge + along_edge.step_x() * (-current_radius);
+            let py = origin.y + y - 1;
+            let mut pz = origin.z + to_edge.step_z() * offset_to_edge + along_edge.step_z() * (-current_radius);
+            let mut offset_along_edge = -current_radius;
+            while offset_along_edge < current_radius + off {
+                // `isSet(pos.move(UP))` then move back down.
+                let leaves_above = foliage.contains(&Pos::new(px, py + 1, pz));
+                if leaves_above
+                    && try_place_extension(level, foliage, random, config, hanging_chance, log_pos, Pos::new(px, py, pz))
+                {
+                    // one lower, then step back up.
+                    try_place_extension(level, foliage, random, config, hanging_ext_chance, log_pos, Pos::new(px, py - 1, pz));
+                }
+                offset_along_edge += 1;
+                px += along_edge.step_x();
+                pz += along_edge.step_z();
             }
         }
     }
@@ -2033,6 +2764,29 @@ impl FoliagePlacer {
                     dx * dx + dz * dz > cr * cr
                 }
             }
+            // `MegaPineFoliagePlacer.shouldSkipLocation` — same clipped circle. No RNG.
+            FoliagePlacer::MegaPine { .. } => {
+                if dx + dz >= 7 {
+                    true
+                } else {
+                    dx * dx + dz * dz > cr * cr
+                }
+            }
+            // `CherryFoliagePlacer.shouldSkipLocation`. Java `&&` short-circuits:
+            // each `nextFloat` is drawn only when its preceding condition holds.
+            FoliagePlacer::Cherry { wide_bottom_layer_hole_chance, corner_hole_chance, .. } => {
+                if y == -1 && (dx == cr || dz == cr) && random.next_float() < *wide_bottom_layer_hole_chance {
+                    return true;
+                }
+                let corner = dx == cr && dz == cr;
+                if cr > 2 {
+                    corner || (dx + dz > cr * 2 - 2 && random.next_float() < *corner_hole_chance)
+                } else {
+                    corner && random.next_float() < *corner_hole_chance
+                }
+            }
+            // `RandomSpreadFoliagePlacer.shouldSkipLocation` — always false (unused).
+            FoliagePlacer::RandomSpread { .. } => false,
             FoliagePlacer::Unsupported => false,
         }
     }
@@ -2051,6 +2805,7 @@ fn util_shuffle<T>(list: &mut [T], random: &mut WorldgenRandom) {
 
 impl TreeDecorator {
     /// `TreeDecorator.place`. Only `beehive` is modeled.
+    #[allow(clippy::too_many_arguments)]
     fn place(
         &self,
         level: &mut dyn DecorationLevel,
@@ -2058,6 +2813,7 @@ impl TreeDecorator {
         random: &mut WorldgenRandom,
         trunks: &HashSet<Pos>,
         foliage: &HashSet<Pos>,
+        roots: &HashSet<Pos>,
     ) {
         match self {
             TreeDecorator::Beehive { probability } => {
@@ -2072,7 +2828,170 @@ impl TreeDecorator {
             TreeDecorator::LeaveVine { probability } => {
                 leave_vine_place(*probability, level, decorations, random, foliage);
             }
+            TreeDecorator::AlterGround { provider } => {
+                alter_ground_place(provider, level, decorations, random, trunks, roots);
+            }
+            TreeDecorator::AttachedToLeaves {
+                probability,
+                exclusion_radius_xz,
+                exclusion_radius_y,
+                block_provider,
+                required_empty_blocks,
+                directions,
+            } => {
+                attached_to_leaves_place(
+                    *probability,
+                    *exclusion_radius_xz,
+                    *exclusion_radius_y,
+                    block_provider,
+                    *required_empty_blocks,
+                    directions,
+                    level,
+                    decorations,
+                    random,
+                    foliage,
+                );
+            }
             TreeDecorator::Unsupported => {}
+        }
+    }
+}
+
+/// `AlterGroundDecorator.place`. Uses the lowest trunk-or-root ring to seed a set
+/// of 5×5 podzol patches (4 fixed corners + 5 random offsets, each a `nextInt(64)`).
+fn alter_ground_place(
+    provider: &StateProvider,
+    level: &mut dyn DecorationLevel,
+    decorations: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    trunks: &HashSet<Pos>,
+    roots: &HashSet<Pos>,
+) {
+    // `TreeFeature.getLowestTrunkOrRootOfTree`.
+    let logs = sorted_by_y(trunks);
+    let root_list = sorted_by_y(roots);
+    let block_positions: Vec<Pos> = if root_list.is_empty() {
+        logs.clone()
+    } else if !logs.is_empty() && root_list[0].y == logs[0].y {
+        logs.iter().chain(root_list.iter()).copied().collect()
+    } else {
+        root_list.clone()
+    };
+    if block_positions.is_empty() {
+        return;
+    }
+    let min_y = block_positions[0].y;
+    for pos in block_positions.iter().filter(|p| p.y == min_y) {
+        alter_ground_circle(provider, level, decorations, random, pos.west().north());
+        alter_ground_circle(provider, level, decorations, random, pos.east().east().north());
+        alter_ground_circle(provider, level, decorations, random, pos.west().south().south());
+        alter_ground_circle(provider, level, decorations, random, pos.east().east().south().south());
+        for _ in 0..5 {
+            let placement = random.next_int_bounded(64);
+            let xx = placement % 8;
+            let zz = placement / 8;
+            if xx == 0 || xx == 7 || zz == 0 || zz == 7 {
+                alter_ground_circle(provider, level, decorations, random, pos.offset(-3 + xx, 0, -3 + zz));
+            }
+        }
+    }
+}
+
+/// `AlterGroundDecorator.placeCircle` — a 5×5 disc minus the four corners.
+fn alter_ground_circle(
+    provider: &StateProvider,
+    level: &mut dyn DecorationLevel,
+    decorations: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    center: Pos,
+) {
+    for xx in -2i32..=2 {
+        for zz in -2i32..=2 {
+            if xx.abs() != 2 || zz.abs() != 2 {
+                alter_ground_block(provider, level, decorations, random, center.offset(xx, 0, zz));
+            }
+        }
+    }
+}
+
+/// `AlterGroundDecorator.placeBlockAt` — scan a small vertical window for the
+/// first podzol-replaceable ground block and swap it.
+fn alter_ground_block(
+    provider: &StateProvider,
+    level: &mut dyn DecorationLevel,
+    decorations: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    pos: Pos,
+) {
+    let mut dy = 2;
+    while dy >= -3 {
+        let cursor = pos.above(dy);
+        if let Some(state) = provider.get_state(&*level, random, cursor) {
+            decorations.insert(cursor);
+            level.set_block(cursor.x, cursor.y, cursor.z, state);
+            break;
+        }
+        if !level.get_block(cursor.x, cursor.y, cursor.z).is_air() && dy < 0 {
+            break;
+        }
+        dy -= 1;
+    }
+}
+
+/// `AttachedToLeavesDecorator.place` — shuffle the leaves, then for each draw a
+/// direction, a `nextFloat` gate, and place a hanging block (mangrove propagule)
+/// with an exclusion zone.
+#[allow(clippy::too_many_arguments)]
+fn attached_to_leaves_place(
+    probability: f32,
+    exclusion_radius_xz: i32,
+    exclusion_radius_y: i32,
+    block_provider: &StateProvider,
+    required_empty_blocks: i32,
+    directions: &[(i32, i32, i32)],
+    level: &mut dyn DecorationLevel,
+    decorations: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    foliage: &HashSet<Pos>,
+) {
+    if directions.is_empty() {
+        return;
+    }
+    let mut leaves = sorted_by_y(foliage);
+    util_shuffle(&mut leaves, random);
+    let mut blacklist: HashSet<Pos> = HashSet::new();
+    for leaf in leaves {
+        // `Util.getRandom(directions, random)` = `directions[nextInt(size)]`.
+        let (dx, dy, dz) = directions[random.next_int_bounded(directions.len() as i32) as usize];
+        let placement = Pos::new(leaf.x + dx, leaf.y + dy, leaf.z + dz);
+        if blacklist.contains(&placement) {
+            continue;
+        }
+        if random.next_float() >= probability {
+            continue;
+        }
+        // `hasRequiredEmptyBlocks`.
+        let mut all_empty = true;
+        for i in 1..=required_empty_blocks {
+            let p = Pos::new(leaf.x + dx * i, leaf.y + dy * i, leaf.z + dz * i);
+            if !level.get_block(p.x, p.y, p.z).is_air() {
+                all_empty = false;
+                break;
+            }
+        }
+        if !all_empty {
+            continue;
+        }
+        for ex in -exclusion_radius_xz..=exclusion_radius_xz {
+            for ey in -exclusion_radius_y..=exclusion_radius_y {
+                for ez in -exclusion_radius_xz..=exclusion_radius_xz {
+                    blacklist.insert(Pos::new(placement.x + ex, placement.y + ey, placement.z + ez));
+                }
+            }
+        }
+        if let Some(state) = block_provider.get_state(&*level, random, placement) {
+            decorations.insert(placement);
+            level.set_block(placement.x, placement.y, placement.z, state);
         }
     }
 }
@@ -2248,7 +3167,10 @@ fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut Worldgen
     // Graceful skip for unported placers (fancy trunk, fancy/mega foliage, …):
     // bail before any RNG draw so this terminal feature simply produces nothing
     // rather than mis-drawing (safe — the RNG is reseeded per top feature).
-    if config.trunk_placer.is_unsupported() || config.foliage_placer.is_unsupported() {
+    if config.trunk_placer.is_unsupported()
+        || config.foliage_placer.is_unsupported()
+        || config.root_placer_unsupported
+    {
         return;
     }
 
@@ -2258,8 +3180,12 @@ fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut Worldgen
     let foliage_height = config.foliage_placer.foliage_height(random, tree_height);
     let trunk_height = tree_height - foliage_height;
     let leaf_radius = config.foliage_placer.foliage_radius(random, trunk_height);
-    // No root placer → trunkOrigin == origin.
-    let trunk_origin = origin;
+    // `config.rootPlacer.map(rp -> rp.getTrunkOrigin(origin, random)).orElse(origin)`
+    // — the root offset draw happens here, before the clip check and trunk.
+    let trunk_origin = match &config.root_placer {
+        Some(rp) => rp.get_trunk_origin(origin, random),
+        None => origin,
+    };
     let min_y = origin.y.min(trunk_origin.y);
     let max_y = origin.y.max(trunk_origin.y) + tree_height + 1;
     // Vanilla `TreeFeature.doPlace`: proceed when `minY >= getMinY()+1 && maxY
@@ -2268,15 +3194,24 @@ fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut Worldgen
     if min_y < level.min_y() + 1 || max_y > level.max_y() {
         return;
     }
+    let grow_through = config.trunk_placer.grow_through();
     let min_clipped = config.minimum_size.min_clipped_height();
-    let clipped = get_max_free_tree_height(level, tree_height, trunk_origin, config);
+    let clipped = get_max_free_tree_height(level, tree_height, trunk_origin, config, grow_through);
     if !(clipped >= tree_height || min_clipped.map(|m| clipped >= m).unwrap_or(false)) {
         return;
     }
 
     let mut trunks: HashSet<Pos> = HashSet::new();
     let mut foliage: HashSet<Pos> = HashSet::new();
+    let mut roots: HashSet<Pos> = HashSet::new();
     let mut decorations: HashSet<Pos> = HashSet::new();
+
+    // Roots are placed first; a failed root system aborts the whole tree.
+    if let Some(rp) = &config.root_placer {
+        if !rp.place_roots(level, &mut roots, random, origin, trunk_origin, config) {
+            return;
+        }
+    }
 
     let attachments = config.trunk_placer.place_trunk(level, &mut trunks, random, clipped, trunk_origin, config);
     for att in &attachments {
@@ -2288,7 +3223,7 @@ fn place_tree(config: &TreeConfig, ctx: &mut PlacementCtx, random: &mut Worldgen
     // `place`: decorators run only when the tree placed something.
     if !trunks.is_empty() || !foliage.is_empty() {
         for dec in &config.decorators {
-            dec.place(level, &mut decorations, random, &trunks, &foliage);
+            dec.place(level, &mut decorations, random, &trunks, &foliage, &roots);
         }
     }
     // `updateLeaves` + `updateShapeAtEdge` are the deferred block-state pass.
@@ -2733,6 +3668,103 @@ mod tests {
             assert_eq!(a, grow(config, seed), "{id} is deterministic for a fixed seed");
             assert!(a.iter().any(|(_, b)| *b == log), "{id} places {log:?}");
             assert!(a.iter().any(|(_, b)| *b == leaf), "{id} places {leaf:?}");
+        }
+    }
+
+    /// Cherry, azalea, mega spruce, and mangrove all parse to their new supported
+    /// placers (not `Unsupported`/`Deferred`) and grow their wood/leaf pair
+    /// deterministically on open ground. Covers the cherry trunk/foliage, azalea
+    /// bending trunk + random-spread foliage, mega-pine foliage + giant trunk +
+    /// alter-ground podzol, and the full mangrove stack (upwards-branching trunk,
+    /// random-spread foliage, mangrove root placer, attached-to-leaves propagules).
+    #[test]
+    fn remaining_overworld_trees_place_logs_and_leaves() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:plains"]);
+        let tree = |id: &str| match reg.configured.get(id) {
+            Some(ConfiguredFeature::Tree(c)) => c.clone(),
+            other => panic!("{id} is not a tree: {other:?}"),
+        };
+        let cherry = tree("cherry");
+        let azalea = tree("azalea_tree");
+        let mega_spruce = tree("mega_spruce");
+        let mangrove = tree("mangrove");
+
+        // The new placers parsed to their supported variants.
+        assert!(matches!(cherry.trunk_placer, TrunkPlacer::Cherry { .. }), "cherry trunk");
+        assert!(matches!(cherry.foliage_placer, FoliagePlacer::Cherry { .. }), "cherry foliage");
+        assert!(matches!(azalea.trunk_placer, TrunkPlacer::Bending { .. }), "bending trunk");
+        assert!(matches!(azalea.foliage_placer, FoliagePlacer::RandomSpread { .. }), "random-spread foliage");
+        assert!(matches!(mega_spruce.trunk_placer, TrunkPlacer::Giant { .. }), "giant trunk");
+        assert!(matches!(mega_spruce.foliage_placer, FoliagePlacer::MegaPine { .. }), "mega-pine foliage");
+        assert!(matches!(mega_spruce.decorators.as_slice(), [TreeDecorator::AlterGround { .. }]), "alter-ground decorator");
+        assert!(matches!(mangrove.trunk_placer, TrunkPlacer::UpwardsBranching { .. }), "upwards-branching trunk");
+        assert!(matches!(mangrove.foliage_placer, FoliagePlacer::RandomSpread { .. }), "mangrove foliage");
+        assert!(mangrove.root_placer.is_some() && !mangrove.root_placer_unsupported, "mangrove root placer supported");
+        assert!(
+            mangrove.decorators.iter().any(|d| matches!(d, TreeDecorator::AttachedToLeaves { .. })),
+            "attached-to-leaves decorator"
+        );
+
+        let grow = |config: &TreeConfig, seed: i64| {
+            let mut level = tree_level(70);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_tree(config, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut writes: Vec<_> = level.blocks.into_iter().collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+
+        // Azalea's canopy is either leaf variant; assert the log + at least one leaf.
+        for (id, config, log, leaf) in [
+            ("cherry", &cherry, CherryLog, CherryLeaves),
+            ("azalea_tree", &azalea, OakLog, AzaleaLeaves),
+            ("mega_spruce", &mega_spruce, SpruceLog, SpruceLeaves),
+            ("mangrove", &mangrove, MangroveLog, MangroveLeaves),
+        ] {
+            let seed = (0..256)
+                .find(|s| {
+                    let w = grow(config, *s);
+                    w.iter().any(|(_, b)| *b == log) && w.iter().any(|(_, b)| b.is_leaves())
+                })
+                .unwrap_or_else(|| panic!("{id} grows on open ground for some seed"));
+            let a = grow(config, seed);
+            assert_eq!(a, grow(config, seed), "{id} is deterministic for a fixed seed");
+            assert!(a.iter().any(|(_, b)| *b == log), "{id} places {log:?}");
+            assert!(a.iter().any(|(_, b)| b.is_leaves()), "{id} places canopy leaves");
+            let _ = leaf;
+        }
+
+        // The mega spruce's alter_ground decorator lays podzol under the trunk.
+        let podzol_seed = (0..256).find(|s| grow(&mega_spruce, *s).iter().any(|(_, b)| *b == Podzol));
+        assert!(podzol_seed.is_some(), "mega spruce alter_ground places podzol on some seed");
+
+        // The mangrove root placer grows roots, and its propagule decorator hangs
+        // mangrove propagules off the leaves, on some seed.
+        let root_seed = (0..256).find(|s| {
+            let w = grow(&mangrove, *s);
+            w.iter().any(|(_, b)| matches!(b, MangroveRoots | MuddyMangroveRoots))
+        });
+        assert!(root_seed.is_some(), "mangrove root placer grows roots on some seed");
+    }
+
+    /// Swamp oak and super birch reuse existing placers (straight trunk + blob
+    /// foliage), so they must already parse to supported trees — no new work, but
+    /// guard they did not regress to `Unsupported`/`Deferred`.
+    #[test]
+    fn swamp_oak_and_super_birch_are_supported() {
+        let reg = registry_for(&["minecraft:swamp"]);
+        for id in ["swamp_oak", "super_birch_bees_0002", "super_birch_bees"] {
+            match reg.configured.get(id) {
+                Some(ConfiguredFeature::Tree(c)) => {
+                    assert!(!c.trunk_placer.is_unsupported(), "{id} trunk supported");
+                    assert!(!c.foliage_placer.is_unsupported(), "{id} foliage supported");
+                    assert!(!c.root_placer_unsupported, "{id} has no unsupported root placer");
+                }
+                other => panic!("{id} is not a tree: {other:?}"),
+            }
         }
     }
 

@@ -479,8 +479,20 @@ pub enum BlockTag {
     ReplaceableByTrees,
     /// `#minecraft:cannot_replace_below_tree_trunk`.
     CannotReplaceBelowTreeTrunk,
-    /// `#minecraft:supports_vegetation` (sapling floor — used by `would_survive`).
+    /// `#minecraft:supports_vegetation` (= `#substrate_overworld ∪ farmland`) —
+    /// the sapling floor used by `would_survive`.
     SupportsVegetation,
+    /// `#minecraft:supports_mangrove_propagule` (= `#supports_vegetation ∪ clay`).
+    SupportsMangrovePropagule,
+    /// `#minecraft:beneath_tree_podzol_replaceable` (= `#substrate_overworld`) —
+    /// the alter_ground decorator's podzol-replaceable floor for mega spruce/pine.
+    BeneathTreePodzolReplaceable,
+    /// `#minecraft:mangrove_logs_can_grow_through` — the upwards-branching trunk
+    /// placer's `validTreePos` override.
+    MangroveLogsCanGrowThrough,
+    /// `#minecraft:mangrove_roots_can_grow_through` — the mangrove root placer's
+    /// `canPlaceRoot` override.
+    MangroveRootsCanGrowThrough,
     /// `#minecraft:air` — not a vanilla tag, but lets `matching_block_tag`/vegetation
     /// predicates resolve air instead of silently failing.
     Air,
@@ -498,6 +510,10 @@ impl BlockTag {
             "replaceable_by_trees" => BlockTag::ReplaceableByTrees,
             "cannot_replace_below_tree_trunk" => BlockTag::CannotReplaceBelowTreeTrunk,
             "supports_vegetation" => BlockTag::SupportsVegetation,
+            "supports_mangrove_propagule" => BlockTag::SupportsMangrovePropagule,
+            "beneath_tree_podzol_replaceable" => BlockTag::BeneathTreePodzolReplaceable,
+            "mangrove_logs_can_grow_through" => BlockTag::MangroveLogsCanGrowThrough,
+            "mangrove_roots_can_grow_through" => BlockTag::MangroveRootsCanGrowThrough,
             "air" => BlockTag::Air,
             _ => return None,
         })
@@ -511,12 +527,42 @@ impl BlockTag {
             BlockTag::BaseStoneOverworld => {
                 matches!(b, Stone | Granite | Diorite | Andesite | Tuff | Deepslate)
             }
-            BlockTag::Logs => matches!(b, OakLog | BirchLog | SpruceLog | DarkOakLog | JungleLog | AcaciaLog),
+            BlockTag::Logs => matches!(
+                b,
+                OakLog | BirchLog | SpruceLog | DarkOakLog | JungleLog | AcaciaLog | CherryLog | MangroveLog
+            ),
             BlockTag::Leaves => b.is_leaves(),
-            BlockTag::Dirt => matches!(b, Dirt | CoarseDirt),
+            BlockTag::Dirt => matches!(b, Dirt | CoarseDirt | RootedDirt),
             BlockTag::ReplaceableByTrees => b.is_leaves() || matches!(b, Water),
-            BlockTag::CannotReplaceBelowTreeTrunk => matches!(b, Dirt | CoarseDirt | Podzol),
-            BlockTag::SupportsVegetation => matches!(b, GrassBlock | Dirt | CoarseDirt | Podzol),
+            // `#dirt ∪ #mud ∪ #moss_blocks ∪ podzol` over the parity alphabet.
+            BlockTag::CannotReplaceBelowTreeTrunk => {
+                matches!(b, Dirt | CoarseDirt | RootedDirt | Mud | MuddyMangroveRoots | Podzol)
+            }
+            // `#supports_vegetation` = `#substrate_overworld ∪ farmland`
+            // (farmland is not in the alphabet).
+            BlockTag::SupportsVegetation => matches!(
+                b,
+                Dirt | CoarseDirt | RootedDirt | Mud | MuddyMangroveRoots | GrassBlock | Podzol | Mycelium
+            ),
+            // `#supports_mangrove_propagule` = `#supports_vegetation ∪ clay`.
+            BlockTag::SupportsMangrovePropagule => matches!(
+                b,
+                Dirt | CoarseDirt | RootedDirt | Mud | MuddyMangroveRoots | GrassBlock | Podzol | Mycelium | Clay
+            ),
+            // `#substrate_overworld` = `#dirt ∪ #mud ∪ #moss_blocks ∪ #grass_blocks`.
+            // (`#moss_blocks` = moss_block/pale_moss_block, not in the alphabet.)
+            BlockTag::BeneathTreePodzolReplaceable => matches!(
+                b,
+                Dirt | CoarseDirt | RootedDirt | Mud | MuddyMangroveRoots | GrassBlock | Podzol | Mycelium
+            ),
+            BlockTag::MangroveLogsCanGrowThrough => matches!(
+                b,
+                Mud | MuddyMangroveRoots | MangroveRoots | MangroveLeaves | MangroveLog | MangrovePropagule | MossCarpet | Vine
+            ),
+            BlockTag::MangroveRootsCanGrowThrough => matches!(
+                b,
+                Mud | MuddyMangroveRoots | MangroveRoots | MossCarpet | Vine | MangrovePropagule | Snow
+            ),
             BlockTag::Air => b.is_air(),
         }
     }
@@ -539,12 +585,13 @@ pub enum BlockPredicate {
     Replaceable { offset: (i32, i32, i32) },
     Solid { offset: (i32, i32, i32) },
     InsideWorldBounds { offset: (i32, i32, i32) },
-    /// `would_survive` — restricted to the sapling states the tree placed
-    /// features use: `state.canSurvive(pos)` for a sapling reduces to "the block
-    /// below is in `#supports_vegetation`" (`VegetationBlock.mayPlaceOn`). Any
-    /// non-sapling state is conservative (`false`), matching the deferred-only
+    /// `would_survive` — `state.canSurvive(pos)`. For the plant states the tree
+    /// placed features use this reduces to "the block below is in the plant's
+    /// `mayPlaceOn` tag": saplings → `#supports_vegetation`, mangrove propagule
+    /// (non-hanging) → `#supports_mangrove_propagule`. `support == None` is a
+    /// conservative `false` for any state not modeled, matching the deferred-only
     /// note on the other unsupported predicates.
-    WouldSurvive { sapling: bool, offset: (i32, i32, i32) },
+    WouldSurvive { support: Option<BlockTag>, offset: (i32, i32, i32) },
     Not(Box<BlockPredicate>),
     AllOf(Vec<BlockPredicate>),
     AnyOf(Vec<BlockPredicate>),
@@ -593,8 +640,17 @@ impl BlockPredicate {
             "inside_world_bounds" => BlockPredicate::InsideWorldBounds { offset: off },
             "would_survive" => {
                 let name = v["state"]["Name"].as_str().unwrap_or("");
-                let sapling = name.strip_prefix("minecraft:").unwrap_or(name).ends_with("_sapling");
-                BlockPredicate::WouldSurvive { sapling, offset: off }
+                let name = name.strip_prefix("minecraft:").unwrap_or(name);
+                let support = if name.ends_with("_sapling") {
+                    Some(BlockTag::SupportsVegetation)
+                } else if name == "mangrove_propagule" {
+                    // The placed state has `hanging=false` → `SaplingBlock.canSurvive`
+                    // → `mayPlaceOn(below) = #supports_mangrove_propagule`.
+                    Some(BlockTag::SupportsMangrovePropagule)
+                } else {
+                    None
+                };
+                BlockPredicate::WouldSurvive { support, offset: off }
             }
             "not" => BlockPredicate::Not(Box::new(BlockPredicate::parse(&v["predicate"]))),
             "all_of" => BlockPredicate::AllOf(
@@ -625,15 +681,15 @@ impl BlockPredicate {
             BlockPredicate::InsideWorldBounds { offset } => {
                 !level.is_outside_build_height(pos.y + offset.1)
             }
-            BlockPredicate::WouldSurvive { sapling, offset } => {
-                if !*sapling {
-                    return false;
+            BlockPredicate::WouldSurvive { support, offset } => match support {
+                None => false,
+                Some(tag) => {
+                    let bx = pos.x + offset.0;
+                    let by = pos.y + offset.1;
+                    let bz = pos.z + offset.2;
+                    tag.contains(level.get_block(bx, by - 1, bz))
                 }
-                let bx = pos.x + offset.0;
-                let by = pos.y + offset.1;
-                let bz = pos.z + offset.2;
-                BlockTag::SupportsVegetation.contains(level.get_block(bx, by - 1, bz))
-            }
+            },
             BlockPredicate::Not(p) => !p.test(level, pos),
             BlockPredicate::AllOf(ps) => ps.iter().all(|p| p.test(level, pos)),
             BlockPredicate::AnyOf(ps) => ps.iter().any(|p| p.test(level, pos)),

@@ -1631,11 +1631,30 @@ pub enum ParityBlock {
     AcaciaLeaves = 69,
     Cocoa = 70,
     Vine = 71,
+    // P8 remaining overworld tree alphabet. Appended (discriminants ≥ 72) so the
+    // existing fixture digest alphabet is untouched. Cherry (cherry_grove),
+    // azalea (lush caves; a weighted azalea/flowering pair), and the mangrove
+    // family (mangrove_swamp: logs, leaves, roots, muddy roots, propagule, and
+    // the `moss_carpet` above-root/decorator block), plus `rooted_dirt` used by
+    // azalea's below-trunk provider. Property-carrying blocks (propagule
+    // age/hanging, roots waterlogged) collapse to their default states while the
+    // vanilla RNG draws are consumed 1:1 (see `features.rs`).
+    CherryLog = 72,
+    CherryLeaves = 73,
+    AzaleaLeaves = 74,
+    FloweringAzaleaLeaves = 75,
+    MangroveLog = 76,
+    MangroveLeaves = 77,
+    MangroveRoots = 78,
+    MuddyMangroveRoots = 79,
+    MangrovePropagule = 80,
+    MossCarpet = 81,
+    RootedDirt = 82,
 }
 
 impl ParityBlock {
     /// Every parity block, in discriminant order (index `b as usize`).
-    pub const ALL: [ParityBlock; 72] = [
+    pub const ALL: [ParityBlock; 83] = [
         ParityBlock::Air,
         ParityBlock::Stone,
         ParityBlock::Water,
@@ -1708,6 +1727,17 @@ impl ParityBlock {
         ParityBlock::AcaciaLeaves,
         ParityBlock::Cocoa,
         ParityBlock::Vine,
+        ParityBlock::CherryLog,
+        ParityBlock::CherryLeaves,
+        ParityBlock::AzaleaLeaves,
+        ParityBlock::FloweringAzaleaLeaves,
+        ParityBlock::MangroveLog,
+        ParityBlock::MangroveLeaves,
+        ParityBlock::MangroveRoots,
+        ParityBlock::MuddyMangroveRoots,
+        ParityBlock::MangrovePropagule,
+        ParityBlock::MossCarpet,
+        ParityBlock::RootedDirt,
     ];
 
     /// The `minecraft:` block id this parity block resolves to in the real
@@ -1786,6 +1816,17 @@ impl ParityBlock {
             ParityBlock::AcaciaLeaves => "minecraft:acacia_leaves",
             ParityBlock::Cocoa => "minecraft:cocoa",
             ParityBlock::Vine => "minecraft:vine",
+            ParityBlock::CherryLog => "minecraft:cherry_log",
+            ParityBlock::CherryLeaves => "minecraft:cherry_leaves",
+            ParityBlock::AzaleaLeaves => "minecraft:azalea_leaves",
+            ParityBlock::FloweringAzaleaLeaves => "minecraft:flowering_azalea_leaves",
+            ParityBlock::MangroveLog => "minecraft:mangrove_log",
+            ParityBlock::MangroveLeaves => "minecraft:mangrove_leaves",
+            ParityBlock::MangroveRoots => "minecraft:mangrove_roots",
+            ParityBlock::MuddyMangroveRoots => "minecraft:muddy_mangrove_roots",
+            ParityBlock::MangrovePropagule => "minecraft:mangrove_propagule",
+            ParityBlock::MossCarpet => "minecraft:moss_carpet",
+            ParityBlock::RootedDirt => "minecraft:rooted_dirt",
         }
     }
 
@@ -1861,6 +1902,17 @@ impl ParityBlock {
             "acacia_leaves" => ParityBlock::AcaciaLeaves,
             "cocoa" => ParityBlock::Cocoa,
             "vine" => ParityBlock::Vine,
+            "cherry_log" => ParityBlock::CherryLog,
+            "cherry_leaves" => ParityBlock::CherryLeaves,
+            "azalea_leaves" => ParityBlock::AzaleaLeaves,
+            "flowering_azalea_leaves" => ParityBlock::FloweringAzaleaLeaves,
+            "mangrove_log" => ParityBlock::MangroveLog,
+            "mangrove_leaves" => ParityBlock::MangroveLeaves,
+            "mangrove_roots" => ParityBlock::MangroveRoots,
+            "muddy_mangrove_roots" => ParityBlock::MuddyMangroveRoots,
+            "mangrove_propagule" => ParityBlock::MangrovePropagule,
+            "moss_carpet" => ParityBlock::MossCarpet,
+            "rooted_dirt" => ParityBlock::RootedDirt,
             _ => return None,
         })
     }
@@ -1882,9 +1934,17 @@ impl ParityBlock {
     pub fn blocks_motion(self) -> bool {
         // `vine` has an empty collision shape (like the snow layer, it does not
         // block motion); `cocoa` keeps a collision shape and does.
+        // `mangrove_propagule` (a plant) and `moss_carpet` (a carpet) have empty
+        // collision shapes for the worldgen heightmaps, like the snow layer/vine.
         !matches!(
             self,
-            ParityBlock::Air | ParityBlock::Water | ParityBlock::Lava | ParityBlock::Snow | ParityBlock::Vine
+            ParityBlock::Air
+                | ParityBlock::Water
+                | ParityBlock::Lava
+                | ParityBlock::Snow
+                | ParityBlock::Vine
+                | ParityBlock::MangrovePropagule
+                | ParityBlock::MossCarpet
         )
     }
 
@@ -1900,6 +1960,10 @@ impl ParityBlock {
                 | ParityBlock::DarkOakLeaves
                 | ParityBlock::JungleLeaves
                 | ParityBlock::AcaciaLeaves
+                | ParityBlock::CherryLeaves
+                | ParityBlock::AzaleaLeaves
+                | ParityBlock::FloweringAzaleaLeaves
+                | ParityBlock::MangroveLeaves
         )
     }
 }

@@ -1147,6 +1147,79 @@ mod tests {
         assert!(jleaves > jlogs, "jungle leaves form a canopy over the logs");
     }
 
+    /// Cherry trees reach the live world: seed 18 is a `cherry_grove` around
+    /// chunk (-6, 13), so the live FEATURES path there grows cherry logs and
+    /// cherry leaves (the `cherry_trunk_placer` + `cherry_foliage_placer`). Guards
+    /// the cherry wiring against dropping back out of the pipeline; the pass is a
+    /// pure function of the seed.
+    #[test]
+    fn live_features_grow_cherry_trees() {
+        use ParityBlock::*;
+        let scan = || {
+            let mut p = ChunkPipeline::new_overworld(18);
+            let (mut logs, mut leaves) = (0u64, 0u64);
+            for cz in 11..16 {
+                for cx in -8..-3 {
+                    let fc = p.feature_extract(cx, cz).blocks.expect("featured blocks");
+                    logs += fc.blocks.iter().filter(|b| matches!(b, CherryLog)).count() as u64;
+                    leaves += fc.blocks.iter().filter(|b| matches!(b, CherryLeaves)).count() as u64;
+                }
+            }
+            (logs, leaves)
+        };
+        let (logs, leaves) = scan();
+        assert!(logs > 0, "the live FEATURES path placed cherry logs");
+        assert!(leaves > logs, "cherry leaves form a canopy over the logs");
+        assert_eq!(scan(), (logs, leaves), "the featured cherry output is deterministic across runs");
+    }
+
+    /// Mega spruce/pine reach the live world: seed 8 is old-growth taiga around
+    /// chunk (12, -15) / (23, -21). The `giant_trunk_placer` + `mega_pine_foliage_placer`
+    /// grow tall spruce trees, and the `alter_ground` decorator lays podzol under
+    /// them. Guards the mega-conifer + podzol-decorator wiring.
+    #[test]
+    fn live_features_grow_mega_spruce_with_podzol() {
+        use ParityBlock::*;
+        let mut p = ChunkPipeline::new_overworld(8);
+        let (mut spruce_leaves, mut podzol) = (0u64, 0u64);
+        for cz in -17..-12 {
+            for cx in 10..15 {
+                let fc = p.feature_extract(cx, cz).blocks.expect("featured blocks");
+                spruce_leaves += fc.blocks.iter().filter(|b| matches!(b, SpruceLeaves)).count() as u64;
+                podzol += fc.blocks.iter().filter(|b| matches!(b, Podzol)).count() as u64;
+            }
+        }
+        assert!(spruce_leaves > 0, "the live FEATURES path grew spruce canopy");
+        assert!(podzol > 0, "the alter_ground decorator laid podzol under the mega conifers");
+    }
+
+    /// Mangroves reach the live world: seed 0x5EEDC0DE (1592639710) is a
+    /// `mangrove_swamp` around chunk (7, -12). The full mangrove stack —
+    /// `upwards_branching_trunk_placer`, `random_spread_foliage_placer`,
+    /// `mangrove_root_placer` (roots + muddy roots + moss carpet), and the
+    /// `attached_to_leaves` propagule decorator — grows in the live pipeline.
+    /// Guards the whole mangrove wiring (trunk/foliage/roots/decorators + the
+    /// `would_survive(mangrove_propagule)` planting rule).
+    #[test]
+    fn live_features_grow_mangrove_trees() {
+        use ParityBlock::*;
+        let mut p = ChunkPipeline::new_overworld(1592639710);
+        let (mut logs, mut leaves, mut roots, mut props) = (0u64, 0u64, 0u64, 0u64);
+        for cz in -14..-9 {
+            for cx in 5..10 {
+                let fc = p.feature_extract(cx, cz).blocks.expect("featured blocks");
+                logs += fc.blocks.iter().filter(|b| matches!(b, MangroveLog)).count() as u64;
+                leaves += fc.blocks.iter().filter(|b| matches!(b, MangroveLeaves)).count() as u64;
+                roots += fc.blocks.iter().filter(|b| matches!(b, MangroveRoots | MuddyMangroveRoots)).count() as u64;
+                props += fc.blocks.iter().filter(|b| matches!(b, MangrovePropagule)).count() as u64;
+            }
+        }
+        assert!(logs > 0, "the live FEATURES path placed mangrove logs");
+        assert!(leaves > logs, "mangrove leaves form a canopy over the logs");
+        assert!(roots > 0, "the mangrove root placer grew roots");
+        assert!(props > 0, "the attached_to_leaves decorator hung propagules");
+    }
+
     /// The live FEATURES path (`feature_extract`) is a pure function of the seed:
     /// the featured center is byte-identical whether or not other chunks were
     /// served first. This is the invariant that keeps `generate_full` safe for
