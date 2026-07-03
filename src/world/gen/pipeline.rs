@@ -811,56 +811,127 @@ impl ChunkPipeline {
     /// (`structure_starts` radius 8), so per-serve regeneration is far too slow.
     ///
     /// Instead: bring the 5×5 to CARVERS in the shared cache (safe to amortize —
-    /// CARVERS is write-radius 0, a pure function of the seed), then **clone** it
-    /// and decorate the 3×3 on the copy in a fixed order — the center first, then
-    /// the distance-1 ring in `dz`-outer/`dx`-inner order. Every serve clones the
-    /// identical CARVERS base and applies the identical decoration order, so the
-    /// featured center is a pure function of the seed (the invariant
-    /// `from_grid` needs); the shared cache is never featured, so it stays pure
-    /// and keeps amortizing across serves. A cross-border feature is captured in
-    /// full for the chunk it overhangs into, because that neighbor is one of the
-    /// 3×3 decorated here.
+    /// CARVERS is write-radius 0, a pure function of the seed), then decorate each
+    /// origin chunk `D` in the center's 3×3 **in isolation** — on its own fresh
+    /// CARVERS-only clone of `D`'s 3×3 — and overlay the writes that land in the
+    /// center, in the fixed global `(cz, cx)` order. The shared cache is never
+    /// featured, so it stays pure and keeps amortizing across serves.
     ///
-    /// KNOWN GAP (not yet vanilla-exact, deferred to the serve-once lifecycle +
-    /// `.mca` diff): the decoration order here is per-serve-local, not the global
-    /// chunk-generation order. When serving C the center decorates first (reading
-    /// clean CARVERS); when serving a neighbor N the same center decorates
-    /// mid-sequence (reading N's partial writes). If a cross-border feature's
-    /// placement validity depends on those differing reads, the two serves can
-    /// disagree on that feature — a possible seam at chunk boundaries. Ores,
-    /// springs, disks, and any feature that stays within one chunk are unaffected
-    /// (no cross-border read/write); most trees place identically (trunk validity
-    /// keys off the CARVERS ground, which is shared). Border-exactness needs each
-    /// chunk decorated exactly once in global order — the full FULL-lifecycle
-    /// integration tracked in docs/WORLDGEN_PARITY.md.
+    /// ## Why isolation, and why it is seam-free (the fix for the old serve-local order)
+    ///
+    /// FEATURES reads are capped at radius 1 (the region's `Carvers` direct
+    /// dependency), but in vanilla a decorating chunk still sees a neighbor's
+    /// feature writes if that neighbor decorated first — placement is genuinely
+    /// order-dependent (a tree's `TrunkPlacer.isFree` / `FoliagePlacer`
+    /// `validTreePos` reads gate RNG-drawing block writes, so a cross-border read
+    /// of another chunk's logs/leaves changes what this chunk writes). The
+    /// previous live path decorated the whole 3×3 into ONE shared scratch in a
+    /// *center-first* order: serving `C` decorated `C` against clean CARVERS,
+    /// while serving a neighbor `N` decorated `C` mid-sequence against `N`'s
+    /// partial writes — the same chunk decorated two different ways, so a
+    /// border-straddling feature could disagree between the two serves = a seam.
+    /// Imposing a fixed *global* order on a shared scratch does NOT fix this: the
+    /// chunks two serves share always sit on the boundary of one serve's window,
+    /// where the set of in-window (already-decorated) neighbors differs, and the
+    /// read cascade that carries the difference is unbounded in the worst case —
+    /// so no bounded shared-scratch window is strictly seam-free.
+    ///
+    /// The fix removes cross-chunk feature visibility entirely: each origin `D`
+    /// decorates against its own 3×3 held at CARVERS (never another origin's
+    /// feature writes), so its write set `W_D` is a pure function of `(seed, D)` —
+    /// identical in every serve, whatever the center. A feature straddling the
+    /// `C`/`N` border is placed by a single origin `D` within radius 1 of both;
+    /// serving `C` overlays `W_D|C` and serving `N` overlays `W_D|N`, both slices
+    /// of the *same* `W_D`, so the two sides always agree: seam-free and a pure
+    /// function of the seed (the invariant `from_grid` needs). This also matches
+    /// the staged single-chunk FEATURES pass, whose radius-1 neighbors are only at
+    /// CARVERS when it runs. Within one chunk, features still see their own
+    /// chunk's earlier writes (same isolated clone), exactly as vanilla.
+    ///
+    /// Overlap resolution differs from vanilla only where two origins' writes hit
+    /// the *same* center block (e.g. two trees whose canopies cross a border): the
+    /// fixed global `(cz, cx)` order picks the winner deterministically, rather
+    /// than vanilla's load-order-dependent winner. There is no golden fixture for
+    /// FEATURES output, and vanilla's own winner is scheduling-dependent, so this
+    /// is an accepted, seam-free deviation (documented in docs/WORLDGEN_PARITY.md).
     fn feature_extract(&mut self, cx: i32, cz: i32) -> ProtoChunk {
-        // 1. Base terrain: the 5×5 at CARVERS. Features read/write radius 1 from
-        //    each of the 3×3, reaching distance 2. Amortized by the shared cache.
+        let center = (cx, cz);
+        // 1. Base terrain: the 5×5 at CARVERS. Each origin in the 3×3 reads/writes
+        //    radius 1, so its 3×3 reaches distance 2 — the 5×5. Amortized by the
+        //    shared cache.
         for dz in -2..=2 {
             for dx in -2..=2 {
                 self.advance(cx + dx, cz + dz, ChunkStatus::Carvers);
             }
         }
-        // 2. Clone the 5×5 CARVERS neighborhood into a scratch map.
-        let mut scratch: HashMap<(i32, i32), ProtoChunk> = HashMap::with_capacity(25);
-        for dz in -2..=2 {
-            for dx in -2..=2 {
-                let p = (cx + dx, cz + dz);
-                scratch.insert(p, self.chunks[&p].clone());
-            }
-        }
-        // 3. Decorate the 3×3 into the copy in canonical order: center, then the
-        //    distance-1 ring. Each chunk's radius-1 writes/reads stay inside the
-        //    5×5, and later chunks see earlier writes exactly as the staged pass.
-        self.decorate_into(&mut scratch, (cx, cz));
+        // 2. The result starts as the center's CARVERS blocks; each origin's
+        //    isolated writes into the center are overlaid onto it.
+        let mut result = self.chunks[&center].clone();
+        let carvers_center =
+            result.blocks.as_ref().expect("center at CARVERS has blocks").blocks.clone();
+        // 3. Decorate every origin D in the 3×3 in the fixed global (cz, cx) order,
+        //    each on its OWN fresh CARVERS clone of D's 3×3, then overlay the
+        //    blocks it changed inside the center. Later origins win ties.
         for dz in -1..=1 {
             for dx in -1..=1 {
-                if dx != 0 || dz != 0 {
-                    self.decorate_into(&mut scratch, (cx + dx, cz + dz));
+                let d = (cx + dx, cz + dz);
+                let mut work: HashMap<(i32, i32), ProtoChunk> = HashMap::with_capacity(9);
+                for ez in -1..=1 {
+                    for ex in -1..=1 {
+                        let p = (d.0 + ex, d.1 + ez);
+                        work.insert(p, self.chunks[&p].clone());
+                    }
+                }
+                self.decorate_into(&mut work, d);
+                let decorated =
+                    &work[&center].blocks.as_ref().expect("center resident in D's 3×3").blocks;
+                let out = &mut result.blocks.as_mut().expect("center blocks").blocks;
+                for (i, &block) in decorated.iter().enumerate() {
+                    if block != carvers_center[i] {
+                        out[i] = block;
+                    }
                 }
             }
         }
-        scratch.remove(&(cx, cz)).expect("center chunk resident in scratch")
+        result
+    }
+
+    /// The isolated feature-writes an origin chunk `D` makes: `D` decorated on a
+    /// fresh CARVERS clone of its 3×3, returned as `(target chunk, block index,
+    /// block)` diffs vs CARVERS over the whole 3×3. This is the atom the live path
+    /// overlays; exposed for the seam test, which relies on it being a pure
+    /// function of `(seed, D)` — independent of any serve center.
+    #[cfg(test)]
+    fn isolated_origin_writes(&mut self, d: (i32, i32)) -> Vec<((i32, i32), usize, ParityBlock)> {
+        for ez in -1..=1 {
+            for ex in -1..=1 {
+                self.advance(d.0 + ex, d.1 + ez, ChunkStatus::Carvers);
+            }
+        }
+        let mut work: HashMap<(i32, i32), ProtoChunk> = HashMap::with_capacity(9);
+        let mut carvers: HashMap<(i32, i32), Vec<ParityBlock>> = HashMap::with_capacity(9);
+        for ez in -1..=1 {
+            for ex in -1..=1 {
+                let p = (d.0 + ex, d.1 + ez);
+                let proto = self.chunks[&p].clone();
+                carvers.insert(p, proto.blocks.as_ref().expect("CARVERS blocks").blocks.clone());
+                work.insert(p, proto);
+            }
+        }
+        self.decorate_into(&mut work, d);
+        let mut writes = Vec::new();
+        for ez in -1..=1 {
+            for ex in -1..=1 {
+                let p = (d.0 + ex, d.1 + ez);
+                let after = &work[&p].blocks.as_ref().unwrap().blocks;
+                for (i, (&a, &b)) in after.iter().zip(carvers[&p].iter()).enumerate() {
+                    if a != b {
+                        writes.push((p, i, a));
+                    }
+                }
+            }
+        }
+        writes
     }
 }
 
@@ -1591,5 +1662,172 @@ mod tests {
         let min_section_y = pipeline.generator.inner.random_state.settings.noise.min_y >> 4;
         let section = &sections[((10 >> 2) - min_section_y) as usize];
         assert_eq!(via_region, section[(((10 & 3) * 4 + 2) * 4 + 1) as usize]);
+    }
+
+    /// Rough perf comparison of the new isolated live path vs the old
+    /// center-first shared-scratch path over 20 chunks. Ignored (a benchmark).
+    /// Run: `cargo test --release feature_extract_perf -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn feature_extract_perf() {
+        use std::time::Instant;
+        fn center_first(p: &mut ChunkPipeline, c: (i32, i32)) -> Vec<ParityBlock> {
+            for dz in -2..=2 {
+                for dx in -2..=2 {
+                    p.advance(c.0 + dx, c.1 + dz, Carvers);
+                }
+            }
+            let mut scratch: HashMap<(i32, i32), ProtoChunk> = HashMap::with_capacity(25);
+            for dz in -2..=2 {
+                for dx in -2..=2 {
+                    let pp = (c.0 + dx, c.1 + dz);
+                    scratch.insert(pp, p.chunks[&pp].clone());
+                }
+            }
+            p.decorate_into(&mut scratch, c);
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    if dx != 0 || dz != 0 {
+                        p.decorate_into(&mut scratch, (c.0 + dx, c.1 + dz));
+                    }
+                }
+            }
+            scratch.remove(&c).unwrap().blocks.unwrap().blocks
+        }
+        let coords: Vec<(i32, i32)> = (0..20).map(|i| (i % 5, i / 5)).collect();
+
+        // Warm the CARVERS cache first so we time decoration, not base terrain.
+        let mut p = ChunkPipeline::new_overworld(0);
+        for &(cx, cz) in &coords {
+            let _ = p.feature_extract(cx, cz);
+        }
+        let t = Instant::now();
+        for &(cx, cz) in &coords {
+            let _ = p.feature_extract(cx, cz);
+        }
+        let new = t.elapsed();
+
+        let mut q = ChunkPipeline::new_overworld(0);
+        for &(cx, cz) in &coords {
+            let _ = center_first(&mut q, (cx, cz));
+        }
+        let t = Instant::now();
+        for &(cx, cz) in &coords {
+            let _ = center_first(&mut q, (cx, cz));
+        }
+        let old = t.elapsed();
+        println!(
+            "feature_extract 20 chunks (warm CARVERS): new(isolated) {new:?}, old(center-first) {old:?} ({:.2}x)",
+            new.as_secs_f64() / old.as_secs_f64()
+        );
+    }
+
+    /// The live FEATURES path is seam-free at chunk borders: a feature placed by
+    /// an origin chunk `D` that overhangs the `D`/neighbor border lands
+    /// identically whether we serve `D`'s chunk or the neighbor, because `D`'s
+    /// isolated write set is a pure function of `(seed, D)`. The previous
+    /// serve-local (center-first, shared-scratch) order violated this — the same
+    /// chunk decorated differently depending on which side was the serve center,
+    /// cutting cross-border features. This test proves both: the fix produces zero
+    /// seams, and the old order produced at least one (so the test is not vacuous).
+    ///
+    /// A "seam" here is a cross-border write from `D` that a neighbor serve
+    /// *dropped* (its position is bare CARVERS terrain in the served neighbor),
+    /// as opposed to a legitimate overlap where a later-ordered origin overwrote
+    /// it with its own feature.
+    #[test]
+    fn live_features_are_seam_free_across_borders() {
+        // Seed 0's origin region is densely forested — plenty of trees whose
+        // canopies overhang chunk borders (the read-dependent, order-sensitive
+        // case).
+        let seed = 0;
+
+        // A faithful replica of the OLD live path: clone the 5×5 CARVERS
+        // neighborhood into one shared scratch and decorate the 3×3 center-first.
+        fn center_first(p: &mut ChunkPipeline, c: (i32, i32)) -> Vec<ParityBlock> {
+            for dz in -2..=2 {
+                for dx in -2..=2 {
+                    p.advance(c.0 + dx, c.1 + dz, Carvers);
+                }
+            }
+            let mut scratch: HashMap<(i32, i32), ProtoChunk> = HashMap::with_capacity(25);
+            for dz in -2..=2 {
+                for dx in -2..=2 {
+                    let pp = (c.0 + dx, c.1 + dz);
+                    scratch.insert(pp, p.chunks[&pp].clone());
+                }
+            }
+            p.decorate_into(&mut scratch, c);
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    if dx != 0 || dz != 0 {
+                        p.decorate_into(&mut scratch, (c.0 + dx, c.1 + dz));
+                    }
+                }
+            }
+            scratch.remove(&c).unwrap().blocks.unwrap().blocks
+        }
+
+        // Count writes `origin` makes into `target` (its neighbor) that `served`
+        // dropped back to bare CARVERS terrain — i.e. the feature was cut at the
+        // border rather than overlaid by another feature.
+        fn dropped_writes(
+            writes: &[((i32, i32), usize, ParityBlock)],
+            target: (i32, i32),
+            served: &[ParityBlock],
+            carvers_target: &[ParityBlock],
+        ) -> usize {
+            writes
+                .iter()
+                .filter(|(chunk, i, block)| {
+                    *chunk == target && served[*i] != *block && served[*i] == carvers_target[*i]
+                })
+                .count()
+        }
+
+        let mut p = ChunkPipeline::new_overworld(seed);
+        let mut new_seams = 0usize;
+        let mut old_seams = 0usize;
+        let mut cross_border_features = 0usize;
+
+        for cz in -3..=3 {
+            for cx in -3..=3 {
+                let origin = (cx, cz);
+                // Both orthogonal neighbors: east and south.
+                for target in [(cx + 1, cz), (cx, cz + 1)] {
+                    let writes = p.isolated_origin_writes(origin);
+                    let into_target = writes.iter().filter(|(c, _, _)| *c == target).count();
+                    if into_target == 0 {
+                        continue;
+                    }
+                    cross_border_features += 1;
+
+                    p.advance(target.0, target.1, Carvers);
+                    let carvers_target =
+                        p.chunks[&target].blocks.as_ref().unwrap().blocks.clone();
+
+                    let served_new =
+                        p.feature_extract(target.0, target.1).blocks.unwrap().blocks;
+                    let served_old = center_first(&mut p, target);
+
+                    new_seams += dropped_writes(&writes, target, &served_new, &carvers_target);
+                    old_seams += dropped_writes(&writes, target, &served_old, &carvers_target);
+                }
+            }
+        }
+
+        assert!(
+            cross_border_features > 0,
+            "the sampled region has cross-border features to test (forested seed)"
+        );
+        assert!(
+            old_seams > 0,
+            "the old serve-local order dropped at least one cross-border feature \
+             (proves the seam existed and the test is not vacuous)"
+        );
+        assert_eq!(
+            new_seams, 0,
+            "the isolated-decoration live path drops no cross-border feature writes"
+        );
     }
 }
