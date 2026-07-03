@@ -24,23 +24,52 @@
 //!
 //! ## Implemented features
 //! `ore`, `scattered_ore`, `spring_feature`, `disk`, the whole `tree` system,
-//! `random_selector`, `simple_block` (grass / ferns / flowers / mushrooms /
-//! gourds / bushes / lily pads / dead bush / dry grass / leaf litter / berries /
-//! double plants / lush-caves moss set), `block_column` (cactus, sugar cane),
-//! `bamboo`, `kelp`, `seagrass`, `sea_pickle`, and `lake` (lava lakes). Note MC
-//! 26.2 replaced the old `random_patch` feature with `simple_block` repeated by
-//! its placement chain, so grass/flower patches flow through `simple_block`.
+//! `random_selector`, `simple_random_selector`, `simple_block` (grass / ferns /
+//! flowers / mushrooms / gourds / bushes / lily pads / dead bush / dry grass /
+//! leaf litter / berries / double plants / lush-caves moss set), `block_column`
+//! (cactus, sugar cane), `bamboo`, `kelp`, `seagrass`, `sea_pickle`, `lake`
+//! (lava lakes); the **frozen/ice** group (`blue_ice`, `spike`/ice_spike,
+//! `iceberg`; `ice_patch` flows through `disk`); the **desert/rock** group
+//! (`block_blob`/forest_rock, `desert_well`); the **underground** group
+//! (`monster_room`, `underwater_magma`, `geode`); the **dripstone** group
+//! (`speleothem_cluster`/dripstone_cluster, `large_dripstone`, `speleothem` via
+//! the pointed_dripstone selector); the **coral** group (`coral_tree`/
+//! `coral_claw`/`coral_mushroom`); `vegetation_patch` /
+//! `waterlogged_vegetation_patch` (moss/clay patches — see the JavaHashSet note);
+//! and `freeze_top_layer`. Note MC 26.2 replaced the old `random_patch` feature
+//! with `simple_block` repeated by its placement chain, so grass/flower patches
+//! flow through `simple_block`.
 //!
 //! ## Deferred features (skipped, documented)
-//! `vegetation_patch` / `waterlogged_vegetation_patch` and the rest of the
-//! lush-caves set (`big_dripleaf`/`small_dripleaf`/`cave_vines`/`glow_lichen`/
-//! `spore_blossom`-ceiling via `multiface_growth`/`root_system`), coral, the pale
-//! garden `pale_moss_carpet` side-topper RNG, `freeze_top_layer`,
-//! `underwater_magma`, geodes, dripstone, monster rooms, fossils, icebergs,
-//! `desert_well`, `ice_spike`, `blue_ice`, `forest_rock`, and every nether/end
-//! feature. Each deferred feature is still recognized (so the sort/seed
-//! accounting is complete) but its placement is not run — parity-safe because the
-//! RNG is reseeded per feature.
+//! Only two categories remain, each for a policy reason:
+//! * **Requires Mojang NBT structure-template assets** (clean-room policy —
+//!   Vela ships no Mojang assets): `fossil` (fossils are processor-based template
+//!   placements in 26.2).
+//! * **Requires a still-deferred nested vegetation feature** — the lush-caves
+//!   vegetation placers `cave_vines` / `big_dripleaf` / `small_dripleaf`
+//!   (`dripleaf`) / `glow_lichen`+`spore_blossom` via `multiface_growth` /
+//!   `root_system`, plus `pale_moss_vegetation` (not vendored). Because a
+//!   `vegetation_patch`'s `distributeVegetation` loop threads the nested
+//!   feature's RNG between its per-surface draws, any patch whose vegetation
+//!   feature is one of these is skipped **whole** (parity-safe: the RNG is
+//!   reseeded per top feature). This affects `moss_patch_ceiling`,
+//!   `clay_with_dripleaves`, `clay_pool_with_dripleaves`, and `pale_moss_patch`;
+//!   `moss_patch` (vegetation = `simple_block`) runs fully.
+//! * Every nether/end feature (out of overworld scope).
+//!
+//! Each deferred feature is still recognized (so the sort/seed accounting is
+//! complete) but its placement is not run — parity-safe because the RNG is
+//! reseeded per feature.
+//!
+//! ## Java HashSet iteration order (vegetation_patch)
+//! `VegetationPatchFeature` uses a plain `java.util.HashSet<BlockPos>` (verified
+//! in the decompile — not a `LinkedHashSet`), whose iteration order
+//! `distributeVegetation` depends on. `JavaHashSet` reproduces it exactly from
+//! `BlockPos.hashCode` (`(y+z*31)*31+x`), the `h^(h>>>16)` spread, power-of-two
+//! `(cap-1)&hash` bucket indexing, per-bucket insertion chaining, and the ×0.75
+//! resize threshold (initial capacity 16). Bucket treeification is not modeled:
+//! it needs capacity ≥ 64 **and** an 8-deep bucket, which the small patch sets
+//! never reach.
 //!
 //! ## Documented parity deviations
 //! * Property-carrying plant blocks collapse to their default block state
@@ -55,6 +84,23 @@
 //!   scans (mushrooms, leaf litter, seagrass, sea pickle, spore blossom) are
 //!   approximated by `blocks_motion`; the check draws no RNG so it can only shift
 //!   a plant on/off marginal terrain, never desync a feature.
+//! * Property collapses in the new groups (all RNG-exact, block-identity only):
+//!   pointed-dripstone `thickness`/`vertical_direction`/`waterlogged`, amethyst
+//!   bud/cluster `facing`/`waterlogged`, coral-fan `facing`, sea-pickle `pickles`,
+//!   sandstone-slab `type`, and `snowy=true` on the block under a snow layer, all
+//!   collapse to default block states.
+//! * Block entities are not modeled in worldgen: `monster_room`'s spawner (its
+//!   `nextInt(4)` mob pick is consumed) and chests (each `nextLong` loot seed is
+//!   consumed), and `desert_well`'s suspicious sand (two `nextInt(5)` picks
+//!   consumed). The block state is placed; the NBT (spawn data / loot table) is
+//!   deferred.
+//! * Predicate approximations that draw no RNG: `isSolid` (monster_room),
+//!   `isFaceSturdy` (vegetation_patch), `isVisibleFromOutside` (underwater_magma)
+//!   collapse to `blocks_motion` / air-or-fluid tests; they can only nudge which
+//!   blocks a no-RNG feature writes, never desync.
+//! * Floating-point: `iceberg`/`geode`/`speleothem` use `Math.pow`/`Math.log`/
+//!   JOML `invsqrt` (= `1/sqrt`); Rust `powf`/`ln`/`sqrt` may differ by a ULP
+//!   from Java on boundary cells (documented, shape-only — no RNG dependence).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
@@ -1032,6 +1078,7 @@ enum ConfiguredFeature {
     CoralClaw,
     CoralMushroom,
     VegetationPatch(VegetationPatchConfig),
+    FreezeTopLayer,
     Deferred(String),
 }
 
@@ -1120,10 +1167,7 @@ impl ConfiguredFeature {
             "coral_mushroom" => ConfiguredFeature::CoralMushroom,
             "vegetation_patch" => ConfiguredFeature::VegetationPatch(parse_vegetation_patch(cfg, false)),
             "waterlogged_vegetation_patch" => ConfiguredFeature::VegetationPatch(parse_vegetation_patch(cfg, true)),
-            // `freeze_top_layer` (SnowAndFreezeFeature) is recognized but
-            // deferred: its exact `Biome.shouldFreeze`/`shouldSnow` gates need
-            // the biome-temperature/height-adjust plumbing (in surface_rules)
-            // wired through the region, out of scope for this milestone.
+            "freeze_top_layer" => ConfiguredFeature::FreezeTopLayer,
             other => ConfiguredFeature::Deferred(other.to_owned()),
         }
     }
@@ -1196,6 +1240,9 @@ pub struct FeatureRegistry {
     step_index: Vec<HashMap<String, i32>>,
     /// biome fill value → biome name (mirrors the parameter-list order).
     biome_names: Vec<String>,
+    /// biome fill value → `(base temperature, frozen modifier, has_precipitation)`
+    /// for `freeze_top_layer`.
+    biome_snow: Vec<(f32, bool, bool)>,
 }
 
 fn strip(id: &str) -> String {
@@ -1339,7 +1386,22 @@ impl FeatureRegistry {
 
         let (steps, step_index) = build_features_per_step(&biome_names, &biome_features);
 
-        Self { configured, placed, biome_features, biome_feature_set, steps, step_index, biome_names }
+        // Per-biome snow climate (temperature, frozen modifier, has_precipitation)
+        // for freeze_top_layer, indexed by fill (biome_names order).
+        let mut snow_by_name: HashMap<String, (f32, bool, bool)> = HashMap::new();
+        for (name, json) in vanilla_jsons::BIOMES {
+            let v: Value = serde_json::from_str(json).expect("biome json");
+            let temp = v["temperature"].as_f64().unwrap_or(0.5) as f32;
+            let frozen = v.get("temperature_modifier").and_then(Value::as_str).is_some_and(|m| m == "frozen");
+            let has_precip = v.get("has_precipitation").and_then(Value::as_bool).unwrap_or(false);
+            snow_by_name.insert(format!("minecraft:{name}"), (temp, frozen, has_precip));
+        }
+        let biome_snow = biome_names
+            .iter()
+            .map(|n| snow_by_name.get(n).copied().unwrap_or((0.5, false, false)))
+            .collect();
+
+        Self { configured, placed, biome_features, biome_feature_set, steps, step_index, biome_names, biome_snow }
     }
 
     fn biome_name(&self, fill: u16) -> &str {
@@ -1353,6 +1415,9 @@ impl BiomeFeatureIndex for FeatureRegistry {
             .get(self.biome_name(biome_fill))
             .map(|s| s.contains(placed_feature_id))
             .unwrap_or(false)
+    }
+    fn biome_snow(&self, biome_fill: u16) -> (f32, bool, bool) {
+        self.biome_snow.get(biome_fill as usize).copied().unwrap_or((0.5, false, false))
     }
 }
 
@@ -1622,6 +1687,7 @@ fn place_feature(
         ConfiguredFeature::CoralClaw => place_coral(CoralKind::Claw, ctx, random, origin),
         ConfiguredFeature::CoralMushroom => place_coral(CoralKind::Mushroom, ctx, random, origin),
         ConfiguredFeature::VegetationPatch(cfg) => place_vegetation_patch(cfg, ctx, random, origin),
+        ConfiguredFeature::FreezeTopLayer => place_freeze_top_layer(ctx, origin),
         ConfiguredFeature::Deferred(_) => {}
     }
 }
@@ -4325,6 +4391,53 @@ fn place_vegetation_patch(cfg: &VegetationPatchConfig, ctx: &mut PlacementCtx, r
     }
 }
 
+// ---------------------------------------------------------------------------
+// SnowAndFreezeFeature (freeze_top_layer)
+// ---------------------------------------------------------------------------
+
+/// `SnowAndFreezeFeature.place`. Draws no RNG, so it is parity-trivial (it can
+/// never desync anything); the exact temperature/frozen chain is reused from the
+/// surface rules, and `getBrightness(BLOCK) < 10` is always true at worldgen
+/// (no block light). `isFaceSturdy`/`SnowLayerBlock.canSurvive` and the
+/// `snowy=true` property update on the block below collapse to `blocksMotion`
+/// approximations (documented; no RNG involved).
+fn place_freeze_top_layer(ctx: &mut PlacementCtx, origin: Pos) {
+    let sea = ctx.level.sea_level();
+    for dx in 0..16 {
+        for dz in 0..16 {
+            let x = origin.x + dx;
+            let z = origin.z + dz;
+            let y = ctx.level.get_height(Heightmap::MotionBlocking, x, z);
+            let top = Pos::new(x, y, z);
+            let below = Pos::new(x, y - 1, z);
+            let (temp, frozen, has_precip) = ctx.biome_index.biome_snow(ctx.level.get_biome_fill(top.x, top.y, top.z));
+            // shouldFreeze(below, checkNeighbors = false): cold enough, in build
+            // height, and a water source at `below`.
+            if super::surface_rules::cold_enough_to_snow(temp, frozen, below.x, below.y, below.z, sea)
+                && !ctx.level.is_outside_build_height(below.y)
+                && ctx.level.get_block(below.x, below.y, below.z) == ParityBlock::Water
+            {
+                ctx.level.set_block(below.x, below.y, below.z, ParityBlock::Ice);
+            }
+            // shouldSnow(top): precipitation is SNOW (has_precipitation && cold
+            // enough), the top is air/snow, and snow can survive on the block
+            // below (approximated by a motion-blocking, non-icy support).
+            let below_of_top = ctx.level.get_block(top.x, top.y - 1, top.z);
+            let snow_can_survive = below_of_top.blocks_motion()
+                && !matches!(below_of_top, ParityBlock::Ice | ParityBlock::PackedIce | ParityBlock::BlueIce);
+            if has_precip
+                && super::surface_rules::cold_enough_to_snow(temp, frozen, top.x, top.y, top.z, sea)
+                && !ctx.level.is_outside_build_height(top.y)
+                && (ctx.level.get_block(top.x, top.y, top.z).is_air()
+                    || ctx.level.get_block(top.x, top.y, top.z) == ParityBlock::Snow)
+                && snow_can_survive
+            {
+                ctx.level.set_block(top.x, top.y, top.z, ParityBlock::Snow);
+            }
+        }
+    }
+}
+
 /// `CoralMushroomFeature.placeFeature`.
 fn coral_mushroom(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos, state: ParityBlock) {
     let height = random.next_int_bounded(3) + 3;
@@ -6135,6 +6248,17 @@ mod tests {
         }
     }
 
+    /// A cold, precipitating biome (snowy-plains-like) for `freeze_top_layer`.
+    struct ColdBiome;
+    impl BiomeFeatureIndex for ColdBiome {
+        fn biome_has_feature(&self, _fill: u16, _id: &str) -> bool {
+            true
+        }
+        fn biome_snow(&self, _fill: u16) -> (f32, bool, bool) {
+            (0.0, false, true)
+        }
+    }
+
     fn coal_config() -> OreConfig {
         OreConfig {
             targets: vec![OreTarget {
@@ -7284,5 +7408,36 @@ mod tests {
             a.iter().any(|(_, b)| matches!(b, ShortGrass | TallGrass | MossCarpet | Azalea | FloweringAzalea)),
             "moss vegetation is distributed over the patch"
         );
+    }
+
+    /// `freeze_top_layer` freezes exposed water to ice and lays a snow layer on
+    /// cold, solid ground; it draws no RNG (parity-trivial).
+    #[test]
+    fn freeze_top_layer_ices_and_snows() {
+        use ParityBlock::*;
+        let mut level = TestLevel::new(70); // air at y>=70, stone below
+        // A water pool one below the surface in the left half of the chunk.
+        for x in 0..8 {
+            for z in 0..16 {
+                level.set_block(x, 69, z, Water);
+            }
+        }
+        let idx = ColdBiome;
+        let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+        place_freeze_top_layer(&mut ctx, Pos::new(0, 0, 0));
+        // Water columns freeze to ice at y=69; solid columns get a snow layer at y=70.
+        assert_eq!(level.get_block(3, 69, 3), Ice, "exposed water froze to ice");
+        assert_eq!(level.get_block(12, 70, 5), Snow, "cold solid ground got a snow layer");
+        // A second run is identical (no RNG).
+        let mut level2 = TestLevel::new(70);
+        for x in 0..8 {
+            for z in 0..16 {
+                level2.set_block(x, 69, z, Water);
+            }
+        }
+        let idx2 = ColdBiome;
+        let mut ctx2 = PlacementCtx { level: &mut level2, biome_index: &idx2, top_feature: "t" };
+        place_freeze_top_layer(&mut ctx2, Pos::new(0, 0, 0));
+        assert_eq!(level.blocks.get(&(3, 69, 3)), level2.blocks.get(&(3, 69, 3)));
     }
 }

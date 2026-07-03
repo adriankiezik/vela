@@ -93,6 +93,11 @@ pub trait DecorationLevel {
 /// `features::FeatureRegistry`.
 pub trait BiomeFeatureIndex {
     fn biome_has_feature(&self, biome_fill: u16, placed_feature_id: &str) -> bool;
+    /// `(base temperature, frozen temperature modifier, has_precipitation)` for a
+    /// biome fill — `freeze_top_layer`'s `shouldFreeze`/`shouldSnow` gates.
+    fn biome_snow(&self, _biome_fill: u16) -> (f32, bool, bool) {
+        (0.5, false, false)
+    }
 }
 
 /// Everything a [`PlacementModifier`] / feature needs beyond the shared RNG.

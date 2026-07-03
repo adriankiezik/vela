@@ -1174,6 +1174,44 @@ mod tests {
         assert!(leaves > logs, "leaves form a canopy over the logs");
     }
 
+    /// The new underground/dripstone feature groups reach the live world:
+    /// seed 0x5EEDC0DE (1592639710) grows a dripstone-caves / lush region around
+    /// the origin, so the live FEATURES path there produces dripstone
+    /// (SpeleothemCluster/LargeDripstone/pointed), geode amethyst + budding
+    /// amethyst (GeodeFeature), monster-room dungeon shells (MonsterRoomFeature),
+    /// and underwater magma (UnderwaterMagmaFeature). Guards the whole
+    /// underground/dripstone wiring against dropping back out of the pipeline, and
+    /// asserts the pass is a pure function of the seed.
+    #[test]
+    fn live_features_grow_caves_and_dripstone() {
+        use ParityBlock::*;
+        let scan = || {
+            let mut p = ChunkPipeline::new_overworld(1592639710);
+            let (mut drip, mut amethyst, mut dungeon, mut magma) = (0u64, 0u64, 0u64, 0u64);
+            for cz in -3..3 {
+                for cx in -3..3 {
+                    let fc = p.feature_extract(cx, cz).blocks.expect("featured blocks");
+                    for b in &fc.blocks {
+                        match b {
+                            DripstoneBlock | PointedDripstone => drip += 1,
+                            AmethystBlock | BuddingAmethyst | SmoothBasalt => amethyst += 1,
+                            MossyCobblestone | Spawner => dungeon += 1,
+                            MagmaBlock => magma += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (drip, amethyst, dungeon, magma)
+        };
+        let (drip, amethyst, dungeon, magma) = scan();
+        assert!(drip > 0, "the live FEATURES path grew dripstone");
+        assert!(amethyst > 0, "the live FEATURES path grew amethyst geodes");
+        assert!(dungeon > 0, "the live FEATURES path carved monster-room dungeons");
+        assert!(magma > 0, "the live FEATURES path sowed underwater magma");
+        assert_eq!(scan(), (drip, amethyst, dungeon, magma), "the featured output is deterministic across runs");
+    }
+
     /// Fancy oak reaches the live pipeline: `fancy_oak` is ~10% of oak spawns in
     /// forest/plains, so a forested region of the live FEATURES path grows oaks
     /// (logs + leaves), and the whole pass is a pure function of the seed

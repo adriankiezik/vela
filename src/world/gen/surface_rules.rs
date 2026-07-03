@@ -65,6 +65,12 @@ fn temperature_noises() -> &'static TemperatureNoises {
     })
 }
 
+/// `Biome.coldEnoughToSnow` for the FEATURES-stage `freeze_top_layer` — exposes
+/// the exact temperature/frozen-modifier/height-adjust chain to `features.rs`.
+pub fn cold_enough_to_snow(temperature: f32, frozen: bool, x: i32, y: i32, z: i32, sea_level: i32) -> bool {
+    BiomeClimate { temperature, frozen }.cold_enough_to_snow(x, y, z, sea_level)
+}
+
 impl BiomeClimate {
     /// `Biome.TemperatureModifier.modifyTemperature`.
     fn modify_temperature(&self, x: i32, z: i32) -> f32 {
