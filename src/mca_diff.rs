@@ -301,6 +301,8 @@ struct ChunkStats {
     name_mismatch: HashMap<String, u64>,
     /// biome-mismatch tally keyed by `"vanilla -> vela"`.
     biome_mismatch: HashMap<String, u64>,
+    /// TEMP: tree/veg mismatch count keyed by "biome | vanilla -> vela".
+    tree_by_biome: HashMap<String, u64>,
     /// first few concrete mismatches: `(x, y, z, vanilla, vela)`.
     samples: Vec<(i32, i32, i32, String, String)>,
 }
@@ -325,6 +327,9 @@ impl ChunkStats {
         }
         for (k, v) in &o.biome_mismatch {
             *self.biome_mismatch.entry(k.clone()).or_default() += v;
+        }
+        for (k, v) in &o.tree_by_biome {
+            *self.tree_by_biome.entry(k.clone()).or_default() += v;
         }
     }
 }
@@ -368,6 +373,18 @@ fn diff_chunk(cx: i32, cz: i32, vc: &VanillaChunk, proto: &ProtoChunk, max_sampl
                     }
                 } else {
                     *st.name_mismatch.entry(format!("{v_name} -> {a_name}")).or_default() += 1;
+                    // TEMP biome attribution for tree/veg mismatches.
+                    let is_tree = |n: &str| {
+                        n.contains("log") || n.contains("leaves") || n.ends_with("vine")
+                            || n.contains("grass") || n.contains("fern")
+                    };
+                    if is_tree(&v_name) || is_tree(&a_name) {
+                        if let Some(s) = sec {
+                            let q = (((ly >> 2) * 4 + (lz as usize >> 2)) * 4 + (lx as usize >> 2)) & 63;
+                            let bn = s.biome_name(q);
+                            *st.tree_by_biome.entry(format!("{bn} | {v_name} -> {a_name}")).or_default() += 1;
+                        }
+                    }
                     if st.samples.len() < max_samples {
                         st.samples.push((
                             cx * 16 + lx,
@@ -567,6 +584,10 @@ fn report() {
 
     eprintln!("\n--- top block name mismatches (structure-free), 'vanilla -> vela' ---");
     for (k, c) in top(&clean.name_mismatch, 30) {
+        eprintln!("  {c:>10}  {k}");
+    }
+    eprintln!("\n--- TEMP tree/veg mismatches by biome (structure-free) ---");
+    for (k, c) in top(&clean.tree_by_biome, 40) {
         eprintln!("  {c:>10}  {k}");
     }
     eprintln!("\n--- top biome mismatches (structure-free), 'vanilla -> vela' ---");

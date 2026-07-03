@@ -3645,9 +3645,14 @@ impl ParityGenerator {
     /// slices, then per Z column, cells top-down, `yInCell` descending, then
     /// `xInCell`, `zInCell`.
     pub fn fill_chunk(&self, chunk_x: i32, chunk_z: i32) -> FilledChunk {
+        let __t_total = std::time::Instant::now();
+        let mut __t_slices = std::time::Duration::ZERO;
+        let mut __t_setup = std::time::Duration::ZERO;
         let min_block_x = chunk_x * 16;
         let min_block_z = chunk_z * 16;
+        let __t0 = std::time::Instant::now();
         let mut nc = NoiseChunk::for_chunk(&self.random_state, min_block_x, min_block_z);
+        __t_setup += __t0.elapsed();
         let (cell_width, cell_height) = (nc.st.cell_width, nc.st.cell_height);
         let (cell_count_y, cell_min_y) = (nc.st.cell_count_y, nc.st.cell_noise_min_y);
         let (min_y, height) = (nc.min_y, nc.height);
@@ -3658,11 +3663,15 @@ impl ParityGenerator {
             ocean_floor_wg: [min_y; 256],
             world_surface_wg: [min_y; 256],
         };
+        let __t0 = std::time::Instant::now();
         nc.initialize_for_first_cell_x();
+        __t_slices += __t0.elapsed();
         let cell_count_x = 16 / cell_width;
         let cell_count_z = 16 / cell_width;
         for cell_x_index in 0..cell_count_x {
+            let __t0 = std::time::Instant::now();
             nc.advance_cell_x(cell_x_index);
+            __t_slices += __t0.elapsed();
             for cell_z_index in 0..cell_count_z {
                 for cell_y_index in (0..cell_count_y).rev() {
                     nc.select_cell_yz(cell_y_index as usize, cell_z_index as usize);
@@ -3701,8 +3710,27 @@ impl ParityGenerator {
             nc.swap_slices();
         }
         nc.stop_interpolation();
+        NOISE_FILL_PROFILE.with(|p| {
+            let mut m = p.borrow_mut();
+            m.0 += __t_setup;
+            m.1 += __t_slices;
+            m.2 += __t_total.elapsed() - __t_setup - __t_slices;
+            m.3 += 1;
+        });
         out
     }
+}
+
+// TEMP profiling accumulator for `fill_chunk`: (setup, slice fills, block loop,
+// chunks). Same pattern as the pipeline serve-phase profile.
+thread_local! {
+    static NOISE_FILL_PROFILE: std::cell::RefCell<(std::time::Duration, std::time::Duration, std::time::Duration, u64)> =
+        const { std::cell::RefCell::new((std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO, 0)) };
+}
+
+/// Drain the `fill_chunk` phase profile: (setup, slice fills, block loop, chunks).
+pub fn take_noise_fill_profile() -> (std::time::Duration, std::time::Duration, std::time::Duration, u64) {
+    NOISE_FILL_PROFILE.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
 #[cfg(test)]

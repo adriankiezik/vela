@@ -1682,6 +1682,20 @@ fn dfs(
 /// vanilla collects from `LevelChunkSection.getBiomes`). `seed` is the world
 /// seed. `min_block_x`/`min_block_z` are the section origin (`chunkX*16`,
 /// `chunkZ*16`).
+// Profiling hook: per-placed-feature cumulative wall time on this thread,
+// drained by examples/profile_features.rs. One Instant pair per top-level
+// feature placement (dozens per chunk) — negligible against the placement
+// work itself.
+thread_local! {
+    static FEATURE_PROFILE: std::cell::RefCell<HashMap<String, (std::time::Duration, u64)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Drain this thread's per-feature timing tallies (see `FEATURE_PROFILE`).
+pub fn take_feature_profile() -> Vec<(String, std::time::Duration, u64)> {
+    FEATURE_PROFILE.with(|p| p.borrow_mut().drain().map(|(k, (d, n))| (k, d, n)).collect())
+}
+
 pub fn apply_biome_decoration(
     registry: &FeatureRegistry,
     level: &mut dyn DecorationLevel,
@@ -1748,7 +1762,15 @@ pub fn apply_biome_decoration(
                 continue;
             }
             let mut ctx = PlacementCtx { level, biome_index: registry, top_feature: id };
+            let __t0 = std::time::Instant::now();
             place_with_biome_check(configured, placed, &mut ctx, &mut random, min_block_x, origin_y, min_block_z);
+            let __dt = __t0.elapsed();
+            FEATURE_PROFILE.with(|p| {
+                let mut m = p.borrow_mut();
+                let e = m.entry(id.clone()).or_insert((std::time::Duration::ZERO, 0));
+                e.0 += __dt;
+                e.1 += 1;
+            });
         }
     }
 }

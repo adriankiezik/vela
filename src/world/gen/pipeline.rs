@@ -35,8 +35,8 @@
 // Drop this once the live generator drives the pipeline.
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::warn;
 
@@ -616,7 +616,14 @@ impl ChunkPipeline {
                     }
                 }
             }
+            let __t0 = std::time::Instant::now();
             self.run_step(pos, step);
+            STEP_PHASES.with(|p| {
+                let mut m = p.borrow_mut();
+                let e = &mut m[next.index()];
+                e.0 += __t0.elapsed();
+                e.1 += 1;
+            });
             let chunk = self.chunks.get_mut(&pos).expect("proto chunk resident");
             chunk.status = next;
             current = next;
@@ -868,14 +875,12 @@ impl ChunkPipeline {
     /// is an accepted, seam-free deviation (documented in docs/WORLDGEN_PARITY.md).
     fn feature_extract(&mut self, cx: i32, cz: i32) -> ProtoChunk {
         let center = (cx, cz);
-        // 1. Base terrain: the 5×5 at CARVERS. Each origin in the 3×3 reads/writes
-        //    radius 1, so its 3×3 reaches distance 2 — the 5×5. Amortized by the
-        //    shared cache.
-        for dz in -2..=2 {
-            for dx in -2..=2 {
-                self.advance(cx + dx, cz + dz, ChunkStatus::Carvers);
-            }
-        }
+        // 1. Base terrain: only the center is needed eagerly. Each origin's
+        //    write-set pull (`ensure_origin_writes`) brings that origin's own
+        //    3×3 to CARVERS on a miss — and on a shared-cache hit needs no
+        //    terrain at all — so eagerly advancing the whole 5×5 here would
+        //    regenerate neighborhoods that the write-set cache already paid for.
+        self.ensure_carvers(center);
         // 2. The result starts as the center's CARVERS blocks; each origin's
         //    isolated writes into the center are overlaid onto it.
         let mut result = self.chunks[&center].clone();
@@ -909,10 +914,22 @@ impl ChunkPipeline {
     /// so a hit is indistinguishable from a fresh compute, which is what keeps the
     /// cached serve byte-identical to the uncached one.
     fn ensure_origin_writes(&mut self, d: (i32, i32)) {
-        if !self.feature_writes.contains_key(&d) {
-            let writes = self.isolated_origin_writes(d);
-            self.feature_writes.insert(d, writes);
+        if self.feature_writes.contains_key(&d) {
+            return;
         }
+        // Cross-worker shared cache first: `W_D` is a pure function of
+        // `(seed, D)`, so another worker's compute is byte-identical to ours.
+        if let Some(writes) = shared_writes().lock().expect("shared writes cache poisoned").get(self.seed, d)
+        {
+            self.feature_writes.insert(d, (*writes).clone());
+            return;
+        }
+        let writes = self.isolated_origin_writes(d);
+        shared_writes()
+            .lock()
+            .expect("shared writes cache poisoned")
+            .put(self.seed, d, Arc::new(writes.clone()));
+        self.feature_writes.insert(d, writes);
     }
 
     /// The isolated feature-writes an origin chunk `D` makes: `D` decorated on a
@@ -923,11 +940,14 @@ impl ChunkPipeline {
     /// relying on it being a pure function of `(seed, D)` — independent of any
     /// serve center — which is exactly what makes the cache sound.
     fn isolated_origin_writes(&mut self, d: (i32, i32)) -> Vec<((i32, i32), usize, ParityBlock)> {
+        let __t = std::time::Instant::now();
         for ez in -1..=1 {
             for ex in -1..=1 {
-                self.advance(d.0 + ex, d.1 + ez, ChunkStatus::Carvers);
+                self.ensure_carvers((d.0 + ex, d.1 + ez));
             }
         }
+        serve_phase_add(0, __t.elapsed());
+        let __t = std::time::Instant::now();
         let mut work: HashMap<(i32, i32), ProtoChunk> = HashMap::with_capacity(9);
         for ez in -1..=1 {
             for ex in -1..=1 {
@@ -935,7 +955,11 @@ impl ChunkPipeline {
                 work.insert(p, self.chunks[&p].clone());
             }
         }
+        serve_phase_add(1, __t.elapsed());
+        let __t = std::time::Instant::now();
         self.decorate_into(&mut work, d);
+        serve_phase_add(2, __t.elapsed());
+        let __t = std::time::Instant::now();
         // Diff the decorated copy against the CARVERS pre-image. The shared-cache
         // protos in `self.chunks` are never featured (FEATURES only ever writes
         // `work`) and stay at CARVERS, so they *are* the pre-image — no separate
@@ -953,8 +977,129 @@ impl ChunkPipeline {
                 }
             }
         }
+        serve_phase_add(3, __t.elapsed());
         writes
     }
+
+    /// Bring `pos` to CARVERS, preferring the process-global shared cache over
+    /// local generation. A CARVERS proto is a pure function of `(seed, pos)`
+    /// (see the shared-cache note on [`PROTO_CACHE_LIMIT`]), and independent
+    /// pipeline instances produce byte-identical protos (the
+    /// `parallel_pipelines_are_deterministic` invariant) — so a proto generated
+    /// by *any* worker can seed *every* worker's local cache. Before this,
+    /// each prefetch worker regenerated its shard's whole CARVERS halo
+    /// privately: with 4×4-block sharding a worker serving a 4×4 shard needs
+    /// its 8×8 window at CARVERS, ~4× the stage work actually required.
+    fn ensure_carvers(&mut self, pos: (i32, i32)) {
+        if self.chunks.get(&pos).is_some_and(|c| c.status >= ChunkStatus::Carvers) {
+            return;
+        }
+        if let Some(shared) = shared_carvers_get(self.seed, pos) {
+            self.chunks.insert(pos, (*shared).clone());
+            return;
+        }
+        self.advance(pos.0, pos.1, ChunkStatus::Carvers);
+        shared_carvers_put(self.seed, pos, Arc::new(self.chunks[&pos].clone()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-worker shared caches (CARVERS protos + origin feature write-sets)
+// ---------------------------------------------------------------------------
+
+/// A bounded, FIFO-evicting `(seed, key) → Arc<V>` map shared by every worker.
+/// Both cached values are pure functions of their key, so a hit is
+/// byte-identical to a fresh compute and eviction only ever costs recompute
+/// time. Keyed by seed so unit tests running many seeds in one process never
+/// cross-pollute. FIFO (not LRU) keeps the lock hold time O(1); the access
+/// pattern is a moving frontier, where FIFO ≈ LRU anyway.
+struct SharedCache<V> {
+    map: HashMap<(i64, i32, i32), Arc<V>>,
+    fifo: VecDeque<(i64, i32, i32)>,
+    limit: usize,
+}
+
+impl<V> SharedCache<V> {
+    fn get(&self, seed: i64, pos: (i32, i32)) -> Option<Arc<V>> {
+        self.map.get(&(seed, pos.0, pos.1)).cloned()
+    }
+
+    fn put(&mut self, seed: i64, pos: (i32, i32), value: Arc<V>) {
+        let key = (seed, pos.0, pos.1);
+        if self.map.insert(key, value).is_none() {
+            self.fifo.push_back(key);
+            while self.fifo.len() > self.limit {
+                let old = self.fifo.pop_front().expect("fifo non-empty");
+                self.map.remove(&old);
+            }
+        }
+    }
+}
+
+/// CARVERS-state protos, ~100 KiB each. 2048 ≈ 200 MiB — sized to hold a view
+/// distance 32 window (69×69 ≈ 4761 would be full coverage, but the moving
+/// frontier only needs the leading edge; trailing entries are dead weight).
+const SHARED_CARVERS_LIMIT: usize = 2048;
+
+/// Origin write-sets are a few KiB of diffs; keep far more of them (they save
+/// a whole decorate+diff pass, ~5 ms, per hit).
+const SHARED_WRITES_LIMIT: usize = 8192;
+
+fn shared_carvers() -> &'static Mutex<SharedCache<ProtoChunk>> {
+    static CACHE: OnceLock<Mutex<SharedCache<ProtoChunk>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(SharedCache { map: HashMap::new(), fifo: VecDeque::new(), limit: SHARED_CARVERS_LIMIT })
+    })
+}
+
+fn shared_carvers_get(seed: i64, pos: (i32, i32)) -> Option<Arc<ProtoChunk>> {
+    shared_carvers().lock().expect("shared carvers cache poisoned").get(seed, pos)
+}
+
+fn shared_carvers_put(seed: i64, pos: (i32, i32), proto: Arc<ProtoChunk>) {
+    shared_carvers().lock().expect("shared carvers cache poisoned").put(seed, pos, proto);
+}
+
+type OriginWrites = Vec<((i32, i32), usize, ParityBlock)>;
+
+fn shared_writes() -> &'static Mutex<SharedCache<OriginWrites>> {
+    static CACHE: OnceLock<Mutex<SharedCache<OriginWrites>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(SharedCache { map: HashMap::new(), fifo: VecDeque::new(), limit: SHARED_WRITES_LIMIT })
+    })
+}
+
+// Profiling hook: phase timing for the serve-path FEATURES machinery
+// (isolated_origin_writes). 0 = advance-to-CARVERS, 1 = 3×3 clone,
+// 2 = decorate, 3 = diff. Drained by examples/profile_features.rs. Four
+// Instant pairs per origin write-set compute — negligible.
+thread_local! {
+    static SERVE_PHASES: std::cell::RefCell<[(std::time::Duration, u64); 4]> =
+        std::cell::RefCell::new([(std::time::Duration::ZERO, 0); 4]);
+}
+
+fn serve_phase_add(i: usize, d: std::time::Duration) {
+    SERVE_PHASES.with(|p| {
+        let mut a = p.borrow_mut();
+        a[i].0 += d;
+        a[i].1 += 1;
+    });
+}
+
+/// Drain this thread's serve-phase tallies (see `SERVE_PHASES`).
+pub fn take_serve_phase_profile() -> [(std::time::Duration, u64); 4] {
+    SERVE_PHASES.with(|p| std::mem::replace(&mut *p.borrow_mut(), [(std::time::Duration::ZERO, 0); 4]))
+}
+
+// TEMP: per-status `run_step` tallies, indexed by `ChunkStatus::index()`.
+thread_local! {
+    static STEP_PHASES: std::cell::RefCell<[(std::time::Duration, u64); 12]> =
+        const { std::cell::RefCell::new([(std::time::Duration::ZERO, 0); 12]) };
+}
+
+/// Drain this thread's per-status step tallies (see `STEP_PHASES`).
+pub fn take_step_phase_profile() -> [(std::time::Duration, u64); 12] {
+    STEP_PHASES.with(|p| std::mem::replace(&mut *p.borrow_mut(), [(std::time::Duration::ZERO, 0); 12]))
 }
 
 // ---------------------------------------------------------------------------
