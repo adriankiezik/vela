@@ -496,6 +496,12 @@ pub enum BlockTag {
     /// `#minecraft:air` — not a vanilla tag, but lets `matching_block_tag`/vegetation
     /// predicates resolve air instead of silently failing.
     Air,
+    /// `#minecraft:features_cannot_replace` — protected blocks the lake feature
+    /// must not overwrite (only `bedrock` is in the parity alphabet).
+    FeaturesCannotReplace,
+    /// `#minecraft:lava_pool_stone_cannot_replace` (= `#features_cannot_replace ∪
+    /// #leaves ∪ #logs`) — the lava-lake barrier cannot replace these.
+    LavaPoolStoneCannotReplace,
 }
 
 impl BlockTag {
@@ -515,6 +521,8 @@ impl BlockTag {
             "mangrove_logs_can_grow_through" => BlockTag::MangroveLogsCanGrowThrough,
             "mangrove_roots_can_grow_through" => BlockTag::MangroveRootsCanGrowThrough,
             "air" => BlockTag::Air,
+            "features_cannot_replace" => BlockTag::FeaturesCannotReplace,
+            "lava_pool_stone_cannot_replace" => BlockTag::LavaPoolStoneCannotReplace,
             _ => return None,
         })
     }
@@ -543,11 +551,13 @@ impl BlockTag {
             BlockTag::SupportsVegetation => matches!(
                 b,
                 Dirt | CoarseDirt | RootedDirt | Mud | MuddyMangroveRoots | GrassBlock | Podzol | Mycelium
+                    | MossBlock | PaleMossBlock
             ),
             // `#supports_mangrove_propagule` = `#supports_vegetation ∪ clay`.
             BlockTag::SupportsMangrovePropagule => matches!(
                 b,
-                Dirt | CoarseDirt | RootedDirt | Mud | MuddyMangroveRoots | GrassBlock | Podzol | Mycelium | Clay
+                Dirt | CoarseDirt | RootedDirt | Mud | MuddyMangroveRoots | GrassBlock | Podzol | Mycelium
+                    | MossBlock | PaleMossBlock | Clay
             ),
             // `#substrate_overworld` = `#dirt ∪ #mud ∪ #moss_blocks ∪ #grass_blocks`.
             // (`#moss_blocks` = moss_block/pale_moss_block, not in the alphabet.)
@@ -564,6 +574,10 @@ impl BlockTag {
                 Mud | MuddyMangroveRoots | MangroveRoots | MossCarpet | Vine | MangrovePropagule | Snow
             ),
             BlockTag::Air => b.is_air(),
+            BlockTag::FeaturesCannotReplace => matches!(b, Bedrock),
+            BlockTag::LavaPoolStoneCannotReplace => {
+                matches!(b, Bedrock) || b.is_leaves() || BlockTag::Logs.contains(b)
+            }
         }
     }
 }
