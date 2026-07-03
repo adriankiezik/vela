@@ -9,6 +9,8 @@
 mod config;
 mod ids;
 mod inventory;
+#[cfg(test)]
+mod mca_diff;
 mod net;
 mod platform;
 mod protocol;
