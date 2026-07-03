@@ -2208,6 +2208,8 @@ impl ParityBlock {
             "light_gray_terracotta" => ParityBlock::LightGrayTerracotta,
             "diorite" => ParityBlock::Diorite,
             "andesite" => ParityBlock::Andesite,
+            "granite" => ParityBlock::Granite,
+            "tuff" => ParityBlock::Tuff,
             "clay" => ParityBlock::Clay,
             "coal_ore" => ParityBlock::CoalOre,
             "deepslate_coal_ore" => ParityBlock::DeepslateCoalOre,
