@@ -566,6 +566,13 @@ pub struct ChunkPipeline {
     /// and `setDecorationSeed` (P8) needs it.
     seed: i64,
     chunks: HashMap<(i32, i32), ProtoChunk>,
+    /// Cache of each origin's isolated FEATURES write-set, keyed by origin pos:
+    /// the diffs [`Self::isolated_origin_writes`] computes for that origin. `W_D`
+    /// is a pure function of `(seed, D)` — independent of the serve center — so it
+    /// is computed once and reused by every serve whose 3×3 contains `D` (adjacent
+    /// serves share 6 of 9 origins). Each entry is a few KiB of diffs; evicted
+    /// alongside the proto cache in `generate_full`.
+    feature_writes: HashMap<(i32, i32), Vec<((i32, i32), usize, ParityBlock)>>,
 }
 
 impl ChunkPipeline {
@@ -574,6 +581,7 @@ impl ChunkPipeline {
             generator: SurfacedGenerator::new_overworld(seed),
             seed,
             chunks: HashMap::new(),
+            feature_writes: HashMap::new(),
         }
     }
 
@@ -871,27 +879,22 @@ impl ChunkPipeline {
         // 2. The result starts as the center's CARVERS blocks; each origin's
         //    isolated writes into the center are overlaid onto it.
         let mut result = self.chunks[&center].clone();
-        let carvers_center =
-            result.blocks.as_ref().expect("center at CARVERS has blocks").blocks.clone();
-        // 3. Decorate every origin D in the 3×3 in the fixed global (cz, cx) order,
-        //    each on its OWN fresh CARVERS clone of D's 3×3, then overlay the
-        //    blocks it changed inside the center. Later origins win ties.
+        // 3. Overlay every origin D in the 3×3 in the fixed global (cz, cx) order,
+        //    reusing D's cached write-set `W_D` — computed once (a pure function of
+        //    `(seed, D)`) and shared across every serve whose window contains D.
+        //    Only the entries that target the center are applied; later origins win
+        //    ties (their overwrite runs later). This diff-based overlay reproduces
+        //    the old `decorated != carvers_center` compare exactly: `W_D` holds
+        //    precisely the center blocks D changed from CARVERS, so blocks D left
+        //    at their CARVERS value are simply absent and keep `result`'s CARVERS
+        //    value — no separate `carvers_center` snapshot needed.
         for dz in -1..=1 {
             for dx in -1..=1 {
                 let d = (cx + dx, cz + dz);
-                let mut work: HashMap<(i32, i32), ProtoChunk> = HashMap::with_capacity(9);
-                for ez in -1..=1 {
-                    for ex in -1..=1 {
-                        let p = (d.0 + ex, d.1 + ez);
-                        work.insert(p, self.chunks[&p].clone());
-                    }
-                }
-                self.decorate_into(&mut work, d);
-                let decorated =
-                    &work[&center].blocks.as_ref().expect("center resident in D's 3×3").blocks;
+                self.ensure_origin_writes(d);
                 let out = &mut result.blocks.as_mut().expect("center blocks").blocks;
-                for (i, &block) in decorated.iter().enumerate() {
-                    if block != carvers_center[i] {
+                for &(target, i, block) in &self.feature_writes[&d] {
+                    if target == center {
                         out[i] = block;
                     }
                 }
@@ -900,12 +903,25 @@ impl ChunkPipeline {
         result
     }
 
+    /// Ensure origin `d`'s isolated write-set is resident in `feature_writes`,
+    /// computing and caching it on a miss. The cached value is exactly what
+    /// [`Self::isolated_origin_writes`] returns — a pure function of `(seed, d)` —
+    /// so a hit is indistinguishable from a fresh compute, which is what keeps the
+    /// cached serve byte-identical to the uncached one.
+    fn ensure_origin_writes(&mut self, d: (i32, i32)) {
+        if !self.feature_writes.contains_key(&d) {
+            let writes = self.isolated_origin_writes(d);
+            self.feature_writes.insert(d, writes);
+        }
+    }
+
     /// The isolated feature-writes an origin chunk `D` makes: `D` decorated on a
     /// fresh CARVERS clone of its 3×3, returned as `(target chunk, block index,
     /// block)` diffs vs CARVERS over the whole 3×3. This is the atom the live path
-    /// overlays; exposed for the seam test, which relies on it being a pure
-    /// function of `(seed, D)` — independent of any serve center.
-    #[cfg(test)]
+    /// overlays (cached per origin in `feature_writes`, see
+    /// [`Self::ensure_origin_writes`]); the seam test also calls it directly,
+    /// relying on it being a pure function of `(seed, D)` — independent of any
+    /// serve center — which is exactly what makes the cache sound.
     fn isolated_origin_writes(&mut self, d: (i32, i32)) -> Vec<((i32, i32), usize, ParityBlock)> {
         for ez in -1..=1 {
             for ex in -1..=1 {
@@ -913,22 +929,24 @@ impl ChunkPipeline {
             }
         }
         let mut work: HashMap<(i32, i32), ProtoChunk> = HashMap::with_capacity(9);
-        let mut carvers: HashMap<(i32, i32), Vec<ParityBlock>> = HashMap::with_capacity(9);
         for ez in -1..=1 {
             for ex in -1..=1 {
                 let p = (d.0 + ex, d.1 + ez);
-                let proto = self.chunks[&p].clone();
-                carvers.insert(p, proto.blocks.as_ref().expect("CARVERS blocks").blocks.clone());
-                work.insert(p, proto);
+                work.insert(p, self.chunks[&p].clone());
             }
         }
         self.decorate_into(&mut work, d);
+        // Diff the decorated copy against the CARVERS pre-image. The shared-cache
+        // protos in `self.chunks` are never featured (FEATURES only ever writes
+        // `work`) and stay at CARVERS, so they *are* the pre-image — no separate
+        // snapshot clone of each block grid is needed.
         let mut writes = Vec::new();
         for ez in -1..=1 {
             for ex in -1..=1 {
                 let p = (d.0 + ex, d.1 + ez);
                 let after = &work[&p].blocks.as_ref().unwrap().blocks;
-                for (i, (&a, &b)) in after.iter().zip(carvers[&p].iter()).enumerate() {
+                let carvers = &self.chunks[&p].blocks.as_ref().expect("CARVERS blocks").blocks;
+                for (i, (&a, &b)) in after.iter().zip(carvers.iter()).enumerate() {
                     if a != b {
                         writes.push((p, i, a));
                     }
@@ -1046,6 +1064,15 @@ pub fn generate_full(cx: i32, cz: i32) -> ParityChunk {
             pipeline
                 .chunks
                 .retain(|pos, _| chessboard_distance(*pos, (cx, cz)) <= PROTO_KEEP_RADIUS);
+            // Trim the origin write-set cache on the same trail-trim: an origin's
+            // write-set is only reused while its 3×3 stays in the served window,
+            // so keep the same working set as the protos (one ring wider, since a
+            // kept chunk's origins reach `PROTO_KEEP_RADIUS + 1`). Dropped entries
+            // recompute deterministically if revisited; this only bounds memory
+            // (a write-set is a few KiB — far cheaper than the ~100 KiB protos).
+            pipeline.feature_writes.retain(|pos, _| {
+                chessboard_distance(*pos, (cx, cz)) <= PROTO_KEEP_RADIUS + 1
+            });
         }
         ParityChunk { blocks, surface_biomes }
     })
@@ -1424,6 +1451,37 @@ mod tests {
         carv.advance(0, 0, Carvers);
         let base = carv.chunk(0, 0).unwrap().blocks.as_ref().unwrap().blocks.clone();
         assert_ne!(a.blocks, base, "decoration wrote blocks into the center");
+    }
+
+    /// The per-origin write-set cache is transparent: a serve whose origins are
+    /// cache *hits* — warmed by serving overlapping neighbors first (each shares
+    /// 6 of the target's 9 origins) — is byte-identical to the same serve on a
+    /// cold pipeline that computes every origin fresh. A stale, mis-keyed, or
+    /// mis-overlaid cache entry would diverge here, so this guards the
+    /// optimization directly, independent of `feature_extract` still decorating.
+    #[test]
+    fn cached_origin_writes_match_uncached_serve() {
+        let seed = 1592639710;
+        for target in [(0, 0), (3, -2), (-4, 5)] {
+            // Cold: fresh pipeline, empty write-set cache — every origin computed
+            // fresh on this serve.
+            let mut cold = ChunkPipeline::new_overworld(seed);
+            let uncached = cold.feature_extract(target.0, target.1).blocks.expect("blocks");
+
+            // Warm: serve a spread of overlapping neighbors first (populating the
+            // cache with origins the target shares), so the target serve is an
+            // all-hit path, then serve the target.
+            let mut warm = ChunkPipeline::new_overworld(seed);
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (2, 0), (0, 2)] {
+                let _ = warm.feature_extract(target.0 + dx, target.1 + dz);
+            }
+            let cached = warm.feature_extract(target.0, target.1).blocks.expect("blocks");
+
+            assert_eq!(
+                uncached.blocks, cached.blocks,
+                "cached serve of {target:?} must equal the cold uncached serve"
+            );
+        }
     }
 
     /// The vanilla GENERATION_PYRAMID dependency tables, derived by hand from
