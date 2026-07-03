@@ -59,12 +59,12 @@ fn sin_table() -> &'static [f32; 65536] {
 }
 
 /// `Mth.sin(double)`.
-fn mth_sin(d: f64) -> f32 {
+pub(super) fn mth_sin(d: f64) -> f32 {
     sin_table()[((d * SIN_SCALE) as i64 & 65535) as usize]
 }
 
 /// `Mth.cos(double)`.
-fn mth_cos(d: f64) -> f32 {
+pub(super) fn mth_cos(d: f64) -> f32 {
     sin_table()[((d * SIN_SCALE + 16384.0) as i64 & 65535) as usize]
 }
 

@@ -1127,6 +1127,26 @@ mod tests {
         assert_eq!(scan(), (logs, leaves), "the featured oak output is deterministic across runs");
     }
 
+    /// Jungle trees reach the live world: seed `0x5EED_C0DE` (1592639710) is
+    /// jungle around the origin, so the live FEATURES path there grows jungle
+    /// logs and jungle leaves. Guards the new jungle trunk/foliage/decorator
+    /// wiring against silently dropping back out of the pipeline.
+    #[test]
+    fn live_features_grow_jungle_trees() {
+        use ParityBlock::*;
+        let mut p = ChunkPipeline::new_overworld(1592639710);
+        let (mut jlogs, mut jleaves) = (0u64, 0u64);
+        for cz in -2..2 {
+            for cx in -2..2 {
+                let fc = p.feature_extract(cx, cz).blocks.expect("featured blocks");
+                jlogs += fc.blocks.iter().filter(|b| matches!(b, JungleLog)).count() as u64;
+                jleaves += fc.blocks.iter().filter(|b| matches!(b, JungleLeaves)).count() as u64;
+            }
+        }
+        assert!(jlogs > 0, "the live FEATURES path placed jungle logs");
+        assert!(jleaves > jlogs, "jungle leaves form a canopy over the logs");
+    }
+
     /// The live FEATURES path (`feature_extract`) is a pure function of the seed:
     /// the featured center is byte-identical whether or not other chunks were
     /// served first. This is the invariant that keeps `generate_full` safe for

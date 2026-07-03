@@ -1618,11 +1618,24 @@ pub enum ParityBlock {
     SpruceLeaves = 63,
     DarkOakLeaves = 64,
     BeeNest = 65,
+    // P8 jungle + acacia tree alphabet. Appended (discriminants ≥ 66) so the
+    // existing fixture digest alphabet is untouched. Jungle/acacia logs+leaves
+    // plus the two directional decorator blocks (`cocoa`, `vine`). The identity
+    // alphabet carries no properties, so cocoa (age/facing) and vine (direction)
+    // resolve to their default block states — the RNG draws the decorators make
+    // are consumed 1:1 with vanilla, but the placed states are the closest
+    // representable ones (see `features.rs` decorator notes).
+    JungleLog = 66,
+    AcaciaLog = 67,
+    JungleLeaves = 68,
+    AcaciaLeaves = 69,
+    Cocoa = 70,
+    Vine = 71,
 }
 
 impl ParityBlock {
     /// Every parity block, in discriminant order (index `b as usize`).
-    pub const ALL: [ParityBlock; 66] = [
+    pub const ALL: [ParityBlock; 72] = [
         ParityBlock::Air,
         ParityBlock::Stone,
         ParityBlock::Water,
@@ -1689,6 +1702,12 @@ impl ParityBlock {
         ParityBlock::SpruceLeaves,
         ParityBlock::DarkOakLeaves,
         ParityBlock::BeeNest,
+        ParityBlock::JungleLog,
+        ParityBlock::AcaciaLog,
+        ParityBlock::JungleLeaves,
+        ParityBlock::AcaciaLeaves,
+        ParityBlock::Cocoa,
+        ParityBlock::Vine,
     ];
 
     /// The `minecraft:` block id this parity block resolves to in the real
@@ -1761,6 +1780,12 @@ impl ParityBlock {
             ParityBlock::SpruceLeaves => "minecraft:spruce_leaves",
             ParityBlock::DarkOakLeaves => "minecraft:dark_oak_leaves",
             ParityBlock::BeeNest => "minecraft:bee_nest",
+            ParityBlock::JungleLog => "minecraft:jungle_log",
+            ParityBlock::AcaciaLog => "minecraft:acacia_log",
+            ParityBlock::JungleLeaves => "minecraft:jungle_leaves",
+            ParityBlock::AcaciaLeaves => "minecraft:acacia_leaves",
+            ParityBlock::Cocoa => "minecraft:cocoa",
+            ParityBlock::Vine => "minecraft:vine",
         }
     }
 
@@ -1830,6 +1855,12 @@ impl ParityBlock {
             "spruce_leaves" => ParityBlock::SpruceLeaves,
             "dark_oak_leaves" => ParityBlock::DarkOakLeaves,
             "bee_nest" => ParityBlock::BeeNest,
+            "jungle_log" => ParityBlock::JungleLog,
+            "acacia_log" => ParityBlock::AcaciaLog,
+            "jungle_leaves" => ParityBlock::JungleLeaves,
+            "acacia_leaves" => ParityBlock::AcaciaLeaves,
+            "cocoa" => ParityBlock::Cocoa,
+            "vine" => ParityBlock::Vine,
             _ => return None,
         })
     }
@@ -1849,7 +1880,12 @@ impl ParityBlock {
     /// motion). Used to prime/maintain the FEATURES-stage heightmaps
     /// (`OCEAN_FLOOR`, `MOTION_BLOCKING`).
     pub fn blocks_motion(self) -> bool {
-        !matches!(self, ParityBlock::Air | ParityBlock::Water | ParityBlock::Lava | ParityBlock::Snow)
+        // `vine` has an empty collision shape (like the snow layer, it does not
+        // block motion); `cocoa` keeps a collision shape and does.
+        !matches!(
+            self,
+            ParityBlock::Air | ParityBlock::Water | ParityBlock::Lava | ParityBlock::Snow | ParityBlock::Vine
+        )
     }
 
     /// Membership in `#minecraft:leaves` over the parity alphabet. The
@@ -1862,6 +1898,8 @@ impl ParityBlock {
                 | ParityBlock::BirchLeaves
                 | ParityBlock::SpruceLeaves
                 | ParityBlock::DarkOakLeaves
+                | ParityBlock::JungleLeaves
+                | ParityBlock::AcaciaLeaves
         )
     }
 }

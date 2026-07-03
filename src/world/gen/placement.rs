@@ -43,8 +43,14 @@ impl Pos {
     pub fn east(self) -> Self {
         Self { x: self.x + 1, ..self }
     }
+    pub fn west(self) -> Self {
+        Self { x: self.x - 1, ..self }
+    }
     pub fn south(self) -> Self {
         Self { z: self.z + 1, ..self }
+    }
+    pub fn north(self) -> Self {
+        Self { z: self.z - 1, ..self }
     }
     pub fn offset(self, dx: i32, dy: i32, dz: i32) -> Self {
         Self { x: self.x + dx, y: self.y + dy, z: self.z + dz }
@@ -505,7 +511,7 @@ impl BlockTag {
             BlockTag::BaseStoneOverworld => {
                 matches!(b, Stone | Granite | Diorite | Andesite | Tuff | Deepslate)
             }
-            BlockTag::Logs => matches!(b, OakLog | BirchLog | SpruceLog | DarkOakLog),
+            BlockTag::Logs => matches!(b, OakLog | BirchLog | SpruceLog | DarkOakLog | JungleLog | AcaciaLog),
             BlockTag::Leaves => b.is_leaves(),
             BlockTag::Dirt => matches!(b, Dirt | CoarseDirt),
             BlockTag::ReplaceableByTrees => b.is_leaves() || matches!(b, Water),

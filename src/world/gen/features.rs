@@ -262,6 +262,11 @@ enum TrunkPlacer {
     Forking { base: i32, a: i32, b: i32 },
     DarkOak { base: i32, a: i32, b: i32 },
     Fancy { base: i32, a: i32, b: i32 },
+    /// `GiantTrunkPlacer` — a 2×2 straight trunk (mega spruce/jungle base).
+    Giant { base: i32, a: i32, b: i32 },
+    /// `MegaJungleTrunkPlacer extends GiantTrunkPlacer` — 2×2 trunk plus radial
+    /// side branches.
+    MegaJungle { base: i32, a: i32, b: i32 },
     Unsupported,
 }
 
@@ -276,6 +281,8 @@ impl TrunkPlacer {
             "forking_trunk_placer" => TrunkPlacer::Forking { base, a, b },
             "dark_oak_trunk_placer" => TrunkPlacer::DarkOak { base, a, b },
             "fancy_trunk_placer" => TrunkPlacer::Fancy { base, a, b },
+            "giant_trunk_placer" => TrunkPlacer::Giant { base, a, b },
+            "mega_jungle_trunk_placer" => TrunkPlacer::MegaJungle { base, a, b },
             _ => TrunkPlacer::Unsupported,
         }
     }
@@ -290,7 +297,9 @@ impl TrunkPlacer {
             TrunkPlacer::Straight { base, a, b }
             | TrunkPlacer::Forking { base, a, b }
             | TrunkPlacer::DarkOak { base, a, b }
-            | TrunkPlacer::Fancy { base, a, b } => {
+            | TrunkPlacer::Fancy { base, a, b }
+            | TrunkPlacer::Giant { base, a, b }
+            | TrunkPlacer::MegaJungle { base, a, b } => {
                 *base + random.next_int_bounded(*a + 1) + random.next_int_bounded(*b + 1)
             }
             TrunkPlacer::Unsupported => 0,
@@ -308,6 +317,15 @@ enum FoliagePlacer {
     /// `FancyFoliagePlacer extends BlobFoliagePlacer` — same `height` field, but
     /// its `createFoliage`/`shouldSkipLocation` are overridden (no RNG draws).
     Fancy { radius: IntProvider, offset: IntProvider, height: i32 },
+    /// `BushFoliagePlacer extends BlobFoliagePlacer` — same `height` field; only
+    /// `createFoliage`/`shouldSkipLocation` differ (jungle bush).
+    Bush { radius: IntProvider, offset: IntProvider, height: i32 },
+    /// `AcaciaFoliagePlacer` — a flat 3-row canopy; `foliageHeight` is always 0
+    /// and `createFoliage` draws no RNG.
+    Acacia { radius: IntProvider, offset: IntProvider },
+    /// `MegaJungleFoliagePlacer` — the top blob of a mega jungle tree; draws one
+    /// `nextInt(2)` per single-trunk attachment.
+    MegaJungle { radius: IntProvider, offset: IntProvider, height: i32 },
     Unsupported,
 }
 
@@ -338,6 +356,18 @@ impl FoliagePlacer {
                 offset,
                 height: v.get("height").and_then(Value::as_i64).unwrap_or(0) as i32,
             },
+            "bush_foliage_placer" => FoliagePlacer::Bush {
+                radius,
+                offset,
+                height: v.get("height").and_then(Value::as_i64).unwrap_or(0) as i32,
+            },
+            "acacia_foliage_placer" => FoliagePlacer::Acacia { radius, offset },
+            // `MegaJungleFoliagePlacer` registers under the id `jungle_foliage_placer`.
+            "jungle_foliage_placer" => FoliagePlacer::MegaJungle {
+                radius,
+                offset,
+                height: v.get("height").and_then(Value::as_i64).unwrap_or(0) as i32,
+            },
             _ => FoliagePlacer::Unsupported,
         }
     }
@@ -347,23 +377,31 @@ impl FoliagePlacer {
     }
 }
 
-/// `TreeDecorator` — only `beehive` is modeled; everything else is a graceful
-/// no-op (the decorators run after the tree body, so an unknown one can only
-/// affect its own output, never another feature — the RNG is reseeded per top
-/// feature).
+/// `TreeDecorator` — `beehive`, `cocoa`, `trunk_vine`, and `leave_vine` are
+/// modeled; everything else is a graceful no-op (the decorators run after the
+/// tree body, so an unknown one can only affect its own output, never another
+/// feature — the RNG is reseeded per top feature).
 #[derive(Clone, Debug)]
 enum TreeDecorator {
     Beehive { probability: f32 },
+    /// `CocoaDecorator` — hangs cocoa pods on the lowest trunk logs.
+    Cocoa { probability: f32 },
+    /// `TrunkVineDecorator` — vines on the sides of trunk logs.
+    TrunkVine,
+    /// `LeaveVineDecorator` — hanging vines off the leaf shell.
+    LeaveVine { probability: f32 },
     Unsupported,
 }
 
 impl TreeDecorator {
     fn parse(v: &Value) -> TreeDecorator {
         let t = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let prob = v.get("probability").and_then(Value::as_f64).unwrap_or(0.0) as f32;
         match t.strip_prefix("minecraft:").unwrap_or(t) {
-            "beehive" => TreeDecorator::Beehive {
-                probability: v.get("probability").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-            },
+            "beehive" => TreeDecorator::Beehive { probability: prob },
+            "cocoa" => TreeDecorator::Cocoa { probability: prob },
+            "trunk_vine" => TreeDecorator::TrunkVine,
+            "leave_vine" => TreeDecorator::LeaveVine { probability: prob },
             _ => TreeDecorator::Unsupported,
         }
     }
@@ -1315,6 +1353,12 @@ fn is_free(level: &dyn DecorationLevel, p: Pos) -> bool {
     valid_tree_pos(level, p) || BlockTag::Logs.contains(level.get_block(p.x, p.y, p.z))
 }
 
+/// `TreeFeature.isVine` — a `vine` block (only ever present when an earlier tree
+/// in the same chunk placed one via the vine decorators).
+fn is_vine(level: &dyn DecorationLevel, p: Pos) -> bool {
+    level.get_block(p.x, p.y, p.z) == ParityBlock::Vine
+}
+
 /// `TreeFeature.isAirOrLeaves`.
 fn is_air_or_leaves(level: &dyn DecorationLevel, p: Pos) -> bool {
     let b = level.get_block(p.x, p.y, p.z);
@@ -1341,6 +1385,20 @@ fn place_log(
     }
 }
 
+/// `TrunkPlacer.placeLogIfFree` — place a log only when the position `isFree`
+/// (valid tree pos or already a log); `placeLog` re-checks `validTreePos`.
+fn place_log_if_free(
+    level: &mut dyn DecorationLevel,
+    trunks: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    p: Pos,
+    config: &TreeConfig,
+) {
+    if is_free(level, p) {
+        place_log(level, trunks, random, p, config);
+    }
+}
+
 /// `TrunkPlacer.placeBelowTrunkBlock` — `belowTrunkProvider.getOptionalState`;
 /// `None` (no matching rule / no fallback) places nothing.
 fn place_below_trunk_block(
@@ -1356,15 +1414,16 @@ fn place_below_trunk_block(
     }
 }
 
-/// `TreeFeature.getMaxFreeTreeHeight`. `isVine` is always false over the parity
-/// alphabet (no vine block), and the target trees set `ignore_vines` anyway.
+/// `TreeFeature.getMaxFreeTreeHeight`. `isVine` is normally false during the
+/// first tree of a chunk, but an earlier jungle tree's vine decorators can leave
+/// `vine` blocks, so the `ignore_vines` gate is honored.
 fn get_max_free_tree_height(level: &dyn DecorationLevel, max_tree_height: i32, tree_pos: Pos, config: &TreeConfig) -> i32 {
     for y in 0..=max_tree_height + 1 {
         let r = config.minimum_size.get_size_at_height(max_tree_height, y);
         for x in -r..=r {
             for z in -r..=r {
                 let p = Pos::new(tree_pos.x + x, tree_pos.y + y, tree_pos.z + z);
-                if !is_free(level, p) {
+                if !is_free(level, p) || (!config.ignore_vines && is_vine(level, p)) {
                     return y - 2;
                 }
             }
@@ -1485,9 +1544,61 @@ impl TrunkPlacer {
                 attachments
             }
             TrunkPlacer::Fancy { .. } => place_fancy_trunk(level, trunks, random, tree_height, origin, config),
+            TrunkPlacer::Giant { .. } => place_giant_trunk(level, trunks, random, tree_height, origin, config),
+            TrunkPlacer::MegaJungle { .. } => {
+                // `MegaJungleTrunkPlacer.placeTrunk` — the giant 2×2 trunk plus
+                // radial side branches, each drawing `nextFloat` (angle) and
+                // `nextInt(4)` (height step).
+                let mut attachments = place_giant_trunk(level, trunks, random, tree_height, origin, config);
+                let mut branch_height = tree_height - 2 - random.next_int_bounded(4);
+                while branch_height > tree_height / 2 {
+                    let angle = random.next_float() * std::f32::consts::TAU;
+                    let mut bx = 0;
+                    let mut bz = 0;
+                    for b in 0..5 {
+                        bx = (1.5 + super::carvers::mth_cos(angle as f64) * b as f32) as i32;
+                        bz = (1.5 + super::carvers::mth_sin(angle as f64) * b as f32) as i32;
+                        let pos = origin.offset(bx, branch_height - 3 + b / 2, bz);
+                        place_log(level, trunks, random, pos, config);
+                    }
+                    attachments.push(FoliageAttachment {
+                        pos: origin.offset(bx, branch_height, bz),
+                        radius_offset: -2,
+                        double_trunk: false,
+                    });
+                    branch_height -= 2 + random.next_int_bounded(4);
+                }
+                attachments
+            }
             TrunkPlacer::Unsupported => Vec::new(),
         }
     }
+}
+
+/// `GiantTrunkPlacer.placeTrunk` — a 2×2 straight trunk. Shared by `Giant` and
+/// the `MegaJungle` placer (which calls it then adds side branches).
+fn place_giant_trunk(
+    level: &mut dyn DecorationLevel,
+    trunks: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    tree_height: i32,
+    origin: Pos,
+    config: &TreeConfig,
+) -> Vec<FoliageAttachment> {
+    let below = origin.below();
+    place_below_trunk_block(level, trunks, random, below, config);
+    place_below_trunk_block(level, trunks, random, below.east(), config);
+    place_below_trunk_block(level, trunks, random, below.south(), config);
+    place_below_trunk_block(level, trunks, random, below.south().east(), config);
+    for hh in 0..tree_height {
+        place_log_if_free(level, trunks, random, origin.offset(0, hh, 0), config);
+        if hh < tree_height - 1 {
+            place_log_if_free(level, trunks, random, origin.offset(1, hh, 0), config);
+            place_log_if_free(level, trunks, random, origin.offset(1, hh, 1), config);
+            place_log_if_free(level, trunks, random, origin.offset(0, hh, 1), config);
+        }
+    }
+    vec![FoliageAttachment { pos: origin.above(tree_height), radius_offset: 0, double_trunk: true }]
 }
 
 /// `Mth.floor(float)` — `(int)value` then step down when `value < i`.
@@ -1683,7 +1794,10 @@ impl FoliagePlacer {
             | FoliagePlacer::Spruce { offset, .. }
             | FoliagePlacer::Pine { offset, .. }
             | FoliagePlacer::DarkOak { offset, .. }
-            | FoliagePlacer::Fancy { offset, .. } => offset,
+            | FoliagePlacer::Fancy { offset, .. }
+            | FoliagePlacer::Bush { offset, .. }
+            | FoliagePlacer::Acacia { offset, .. }
+            | FoliagePlacer::MegaJungle { offset, .. } => offset,
             FoliagePlacer::Unsupported => unreachable!("offset_ip on unsupported foliage placer"),
         }
     }
@@ -1691,10 +1805,15 @@ impl FoliagePlacer {
     /// `FoliagePlacer.foliageHeight`.
     fn foliage_height(&self, random: &mut WorldgenRandom, tree_height: i32) -> i32 {
         match self {
-            FoliagePlacer::Blob { height, .. } | FoliagePlacer::Fancy { height, .. } => *height,
+            FoliagePlacer::Blob { height, .. }
+            | FoliagePlacer::Fancy { height, .. }
+            | FoliagePlacer::Bush { height, .. }
+            | FoliagePlacer::MegaJungle { height, .. } => *height,
             FoliagePlacer::Spruce { trunk_height, .. } => (tree_height - trunk_height.sample(random)).max(4),
             FoliagePlacer::Pine { height, .. } => height.sample(random),
             FoliagePlacer::DarkOak { .. } => 4,
+            // `AcaciaFoliagePlacer.foliageHeight` returns 0.
+            FoliagePlacer::Acacia { .. } => 0,
             FoliagePlacer::Unsupported => 0,
         }
     }
@@ -1708,7 +1827,10 @@ impl FoliagePlacer {
             FoliagePlacer::Blob { radius, .. }
             | FoliagePlacer::Spruce { radius, .. }
             | FoliagePlacer::DarkOak { radius, .. }
-            | FoliagePlacer::Fancy { radius, .. } => radius.sample(random),
+            | FoliagePlacer::Fancy { radius, .. }
+            | FoliagePlacer::Bush { radius, .. }
+            | FoliagePlacer::Acacia { radius, .. }
+            | FoliagePlacer::MegaJungle { radius, .. } => radius.sample(random),
             FoliagePlacer::Unsupported => 0,
         }
     }
@@ -1793,6 +1915,33 @@ impl FoliagePlacer {
                     yo -= 1;
                 }
             }
+            FoliagePlacer::Bush { .. } => {
+                // `BushFoliagePlacer.createFoliage` — a small blob widening downward.
+                let mut yo = offset;
+                while yo >= offset - foliage_height {
+                    let current_radius = leaf_radius + att.radius_offset - 1 - yo;
+                    self.place_leaves_row(level, foliage, random, config, att.pos, current_radius, yo, dt);
+                    yo -= 1;
+                }
+            }
+            FoliagePlacer::Acacia { .. } => {
+                // `AcaciaFoliagePlacer.createFoliage` — a flat 3-row canopy. No RNG.
+                let foliage_pos = att.pos.above(offset);
+                self.place_leaves_row(level, foliage, random, config, foliage_pos, leaf_radius + att.radius_offset, -1 - foliage_height, dt);
+                self.place_leaves_row(level, foliage, random, config, foliage_pos, leaf_radius - 1, -foliage_height, dt);
+                self.place_leaves_row(level, foliage, random, config, foliage_pos, leaf_radius + att.radius_offset - 1, 0, dt);
+            }
+            FoliagePlacer::MegaJungle { .. } => {
+                // `MegaJungleFoliagePlacer.createFoliage` — single-trunk branch tips
+                // draw one `nextInt(2)`; the double-trunk crown uses `foliageHeight`.
+                let leaf_height = if dt { foliage_height } else { 1 + random.next_int_bounded(2) };
+                let mut yo = offset;
+                while yo >= offset - leaf_height {
+                    let current_radius = leaf_radius + att.radius_offset + 1 - yo;
+                    self.place_leaves_row(level, foliage, random, config, att.pos, current_radius, yo, dt);
+                    yo -= 1;
+                }
+            }
             FoliagePlacer::Unsupported => {}
         }
     }
@@ -1865,6 +2014,25 @@ impl FoliagePlacer {
                 let fz = dz as f32 + 0.5;
                 fx * fx + fz * fz > (cr * cr) as f32
             }
+            // `BushFoliagePlacer.shouldSkipLocation` — Blob's corner test minus the
+            // `y == 0` exemption (draws `nextInt(2)` only at the corner).
+            FoliagePlacer::Bush { .. } => dx == cr && dz == cr && random.next_int_bounded(2) == 0,
+            // `AcaciaFoliagePlacer.shouldSkipLocation` — no RNG draw.
+            FoliagePlacer::Acacia { .. } => {
+                if y == 0 {
+                    (dx > 1 || dz > 1) && dx != 0 && dz != 0
+                } else {
+                    dx == cr && dz == cr && cr > 0
+                }
+            }
+            // `MegaJungleFoliagePlacer.shouldSkipLocation` — a clipped circle. No RNG.
+            FoliagePlacer::MegaJungle { .. } => {
+                if dx + dz >= 7 {
+                    true
+                } else {
+                    dx * dx + dz * dz > cr * cr
+                }
+            }
             FoliagePlacer::Unsupported => false,
         }
     }
@@ -1895,8 +2063,120 @@ impl TreeDecorator {
             TreeDecorator::Beehive { probability } => {
                 beehive_place(*probability, level, decorations, random, trunks, foliage);
             }
+            TreeDecorator::Cocoa { probability } => {
+                cocoa_place(*probability, level, decorations, random, trunks);
+            }
+            TreeDecorator::TrunkVine => {
+                trunk_vine_place(level, decorations, random, trunks);
+            }
+            TreeDecorator::LeaveVine { probability } => {
+                leave_vine_place(*probability, level, decorations, random, foliage);
+            }
             TreeDecorator::Unsupported => {}
         }
+    }
+}
+
+/// Sort a decorator position set into `Comparator.comparingInt(Vec3i::getY)`
+/// order. Vanilla builds the list from a JVM `HashSet` (whose iteration order we
+/// cannot reproduce) and stable-sorts by Y only; we sort by `(y, x, z)` so the
+/// output is deterministic. The number of RNG draws each decorator makes is a
+/// function of this ordering (see the module notes), so cocoa/vine placement is
+/// internally reproducible but may differ from vanilla at the block grid — the
+/// same tradeoff the beehive decorator already documents.
+fn sorted_by_y(set: &HashSet<Pos>) -> Vec<Pos> {
+    let mut v: Vec<Pos> = set.iter().copied().collect();
+    v.sort_by_key(|p| (p.y, p.x, p.z));
+    v
+}
+
+/// `CocoaDecorator.place`. Draws one `nextFloat` gate, then for each of the
+/// lowest logs (`y - treeY <= 2`) draws `nextFloat` per horizontal direction,
+/// and `nextInt(3)` (cocoa age) when a pod is placed. Cocoa's directional
+/// `facing`/`age` properties collapse to the default `cocoa` state (identity
+/// alphabet); the RNG draws are consumed 1:1.
+fn cocoa_place(
+    probability: f32,
+    level: &mut dyn DecorationLevel,
+    decorations: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    trunks: &HashSet<Pos>,
+) {
+    if random.next_float() >= probability {
+        return;
+    }
+    let logs = sorted_by_y(trunks);
+    if logs.is_empty() {
+        return;
+    }
+    let tree_y = logs[0].y;
+    // `Direction.Plane.HORIZONTAL`: NORTH, EAST, SOUTH, WEST.
+    const HORIZ: [HDir; 4] = [HDir::North, HDir::East, HDir::South, HDir::West];
+    for log in logs.iter().filter(|p| p.y - tree_y <= 2) {
+        for dir in HORIZ {
+            if random.next_float() <= 0.25 {
+                // `cocoaPos = pos.offset(opposite.getStepX(), 0, opposite.getStepZ())`.
+                let cocoa_pos = Pos::new(log.x - dir.step_x(), log.y, log.z - dir.step_z());
+                if level.get_block(cocoa_pos.x, cocoa_pos.y, cocoa_pos.z).is_air() {
+                    let _age = random.next_int_bounded(3);
+                    decorations.insert(cocoa_pos);
+                    level.set_block(cocoa_pos.x, cocoa_pos.y, cocoa_pos.z, ParityBlock::Cocoa);
+                }
+            }
+        }
+    }
+}
+
+/// `TrunkVineDecorator.place`. For each log, draws `nextInt(3)` per horizontal
+/// direction and places a vine on air sides. Vine `direction` property collapses
+/// to the default `vine` state; RNG draws are consumed 1:1.
+fn trunk_vine_place(
+    level: &mut dyn DecorationLevel,
+    decorations: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    trunks: &HashSet<Pos>,
+) {
+    for log in sorted_by_y(trunks) {
+        // west, east, north, south — each `nextInt(3) > 0` gates a vine.
+        for side in [log.west(), log.east(), log.north(), log.south()] {
+            if random.next_int_bounded(3) > 0 && level.get_block(side.x, side.y, side.z).is_air() {
+                decorations.insert(side);
+                level.set_block(side.x, side.y, side.z, ParityBlock::Vine);
+            }
+        }
+    }
+}
+
+/// `LeaveVineDecorator.place`. For each leaf, draws `nextFloat` per horizontal
+/// direction; a passing side grows a hanging vine column (no further RNG).
+fn leave_vine_place(
+    probability: f32,
+    level: &mut dyn DecorationLevel,
+    decorations: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    foliage: &HashSet<Pos>,
+) {
+    for leaf in sorted_by_y(foliage) {
+        for side in [leaf.west(), leaf.east(), leaf.north(), leaf.south()] {
+            if random.next_float() < probability && level.get_block(side.x, side.y, side.z).is_air() {
+                add_hanging_vine(level, decorations, side);
+            }
+        }
+    }
+}
+
+/// `LeaveVineDecorator.addHangingVine` — place a vine then extend down through
+/// air up to 4 blocks. No RNG.
+fn add_hanging_vine(level: &mut dyn DecorationLevel, decorations: &mut HashSet<Pos>, pos: Pos) {
+    decorations.insert(pos);
+    level.set_block(pos.x, pos.y, pos.z, ParityBlock::Vine);
+    let mut p = pos.below();
+    let mut max_dir = 4;
+    while max_dir > 0 && level.get_block(p.x, p.y, p.z).is_air() {
+        decorations.insert(p);
+        level.set_block(p.x, p.y, p.z, ParityBlock::Vine);
+        p = p.below();
+        max_dir -= 1;
     }
 }
 
@@ -2398,6 +2678,61 @@ mod tests {
                 ),
                 "unexpected block {block:?} at {x},{y},{z}"
             );
+        }
+    }
+
+    /// Jungle + acacia trees parse to the new giant/mega-jungle trunk and
+    /// acacia/bush/mega-jungle foliage placers (not `Unsupported`), and each
+    /// grows its wood/leaf pair deterministically on open ground. `jungle_bush`
+    /// intentionally uses a jungle trunk with an oak-leaf canopy.
+    #[test]
+    fn jungle_and_acacia_trees_place_logs_and_leaves() {
+        use ParityBlock::*;
+        let registry = registry_for(&["minecraft:jungle"]);
+        let tree = |id: &str| match registry.configured.get(id) {
+            Some(ConfiguredFeature::Tree(c)) => c.clone(),
+            other => panic!("{id} is not a tree: {other:?}"),
+        };
+        let jungle = tree("jungle_tree");
+        let mega = tree("mega_jungle_tree");
+        let bush = tree("jungle_bush");
+        let acacia = tree("acacia");
+
+        // The new placers parsed to their supported variants.
+        assert!(matches!(mega.trunk_placer, TrunkPlacer::MegaJungle { .. }), "mega jungle trunk");
+        assert!(matches!(mega.foliage_placer, FoliagePlacer::MegaJungle { .. }), "mega jungle foliage");
+        assert!(matches!(bush.foliage_placer, FoliagePlacer::Bush { .. }), "bush foliage");
+        assert!(matches!(acacia.trunk_placer, TrunkPlacer::Forking { .. }), "acacia forking trunk");
+        assert!(matches!(acacia.foliage_placer, FoliagePlacer::Acacia { .. }), "acacia foliage");
+        assert!(!jungle.trunk_placer.is_unsupported() && !jungle.foliage_placer.is_unsupported());
+
+        let grow = |config: &TreeConfig, seed: i64| {
+            let mut level = tree_level(70);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_tree(config, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut writes: Vec<_> = level.blocks.into_iter().collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+
+        for (id, config, log, leaf) in [
+            ("jungle_tree", &jungle, JungleLog, JungleLeaves),
+            ("mega_jungle_tree", &mega, JungleLog, JungleLeaves),
+            ("jungle_bush", &bush, JungleLog, OakLeaves),
+            ("acacia", &acacia, AcaciaLog, AcaciaLeaves),
+        ] {
+            let seed = (0..128)
+                .find(|s| {
+                    let w = grow(config, *s);
+                    w.iter().any(|(_, b)| *b == log) && w.iter().any(|(_, b)| *b == leaf)
+                })
+                .unwrap_or_else(|| panic!("{id} grows on open ground for some seed"));
+            let a = grow(config, seed);
+            assert_eq!(a, grow(config, seed), "{id} is deterministic for a fixed seed");
+            assert!(a.iter().any(|(_, b)| *b == log), "{id} places {log:?}");
+            assert!(a.iter().any(|(_, b)| *b == leaf), "{id} places {leaf:?}");
         }
     }
 
