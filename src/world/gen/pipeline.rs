@@ -1078,6 +1078,27 @@ mod tests {
         assert_ne!(before, after, "decoration changed the center chunk");
     }
 
+    /// Trees reach the live world: scanning a forested region of the live
+    /// FEATURES path turns up log and leaf blocks (and leaves outnumber logs, as
+    /// a real canopy does). Guards against a regression that silently drops the
+    /// tree feature back out of the live pipeline.
+    #[test]
+    fn live_features_grow_trees() {
+        use ParityBlock::*;
+        // Seed 0's origin region is densely forested (verified: 135/144 chunks).
+        let mut p = ChunkPipeline::new_overworld(0);
+        let (mut logs, mut leaves) = (0u64, 0u64);
+        for cz in -2..2 {
+            for cx in -2..2 {
+                let fc = p.feature_extract(cx, cz).blocks.expect("featured blocks");
+                logs += fc.blocks.iter().filter(|b| matches!(b, OakLog | BirchLog | SpruceLog | DarkOakLog)).count() as u64;
+                leaves += fc.blocks.iter().filter(|b| b.is_leaves()).count() as u64;
+            }
+        }
+        assert!(logs > 0, "the live FEATURES path placed tree logs");
+        assert!(leaves > logs, "leaves form a canopy over the logs");
+    }
+
     /// The live FEATURES path (`feature_extract`) is a pure function of the seed:
     /// the featured center is byte-identical whether or not other chunks were
     /// served first. This is the invariant that keeps `generate_full` safe for
