@@ -196,7 +196,18 @@ pub fn zoomed_quart(biome_zoom_seed: i64, x: i32, y: i32, z: i32) -> (i32, i32, 
 /// visit order as `fillBiomesFromNoise`, chunk by chunk, so the stateful
 /// RTree search evolves identically to the reference dump.
 pub struct BakedBiomes {
-    map: HashMap<(i32, i32, i32), u16>,
+    /// Row-major flat quart grid over the baked neighborhood, indexed
+    /// `lx + size_x * (lz + size_z * ly)`. Replaces the former
+    /// `HashMap<(i32,i32,i32), u16>` — the neighborhood is a dense contiguous
+    /// quart box, so a flat `Vec` bakes with direct stores (no hashing) and
+    /// answers `get_noise_biome` with a bounds-checked index.
+    data: Vec<u16>,
+    /// Quart origin (inclusive minimum) of the baked box in each axis.
+    qx0: i32,
+    qz0: i32,
+    qy0: i32,
+    size_x: i32,
+    size_z: i32,
     quart_min_y: i32,
     quart_max_y: i32,
 }
@@ -212,30 +223,15 @@ impl BakedBiomes {
         min_y: i32,
         height: i32,
     ) -> Self {
-        let mut map = HashMap::new();
+        let mut baked = Self::empty(chunk_x - 1, chunk_z - 1, 3, 3, min_y, height);
         for dz in -1..=1 {
             for dx in -1..=1 {
                 let (cx, cz) = (chunk_x + dx, chunk_z + dz);
                 let sections = source.fill_chunk_biomes(sampler, cx, cz, min_y, height);
-                let quart_min_x = (cx * 16) >> 2;
-                let quart_min_z = (cz * 16) >> 2;
-                let min_section_y = min_y >> 4;
-                for (section_index, section) in sections.iter().enumerate() {
-                    let quart_min_y = (min_section_y + section_index as i32) << 2;
-                    for y in 0..4 {
-                        for z in 0..4 {
-                            for x in 0..4 {
-                                map.insert(
-                                    (quart_min_x + x, quart_min_y + y, quart_min_z + z),
-                                    section[((y * 4 + z) * 4 + x) as usize],
-                                );
-                            }
-                        }
-                    }
-                }
+                baked.fill_chunk(cx, cz, &sections, min_y);
             }
         }
-        Self { map, quart_min_y: min_y >> 2, quart_max_y: (min_y + height - 1) >> 2 }
+        baked
     }
 
     /// Assemble the baked view from *stored* per-section quart biomes (the
@@ -247,35 +243,69 @@ impl BakedBiomes {
         min_y: i32,
         height: i32,
     ) -> Self {
-        let mut map = HashMap::new();
+        let chunks: Vec<((i32, i32), &[[u16; 64]])> = chunks.into_iter().collect();
+        let min_cx = chunks.iter().map(|((cx, _), _)| *cx).min().expect("≥1 chunk");
+        let max_cx = chunks.iter().map(|((cx, _), _)| *cx).max().expect("≥1 chunk");
+        let min_cz = chunks.iter().map(|((_, cz), _)| *cz).min().expect("≥1 chunk");
+        let max_cz = chunks.iter().map(|((_, cz), _)| *cz).max().expect("≥1 chunk");
+        let mut baked =
+            Self::empty(min_cx, min_cz, max_cx - min_cx + 1, max_cz - min_cz + 1, min_y, height);
         for ((cx, cz), sections) in chunks {
-            let quart_min_x = (cx * 16) >> 2;
-            let quart_min_z = (cz * 16) >> 2;
-            let min_section_y = min_y >> 4;
-            for (section_index, section) in sections.iter().enumerate() {
-                let quart_min_y = (min_section_y + section_index as i32) << 2;
-                for y in 0..4 {
-                    for z in 0..4 {
-                        for x in 0..4 {
-                            map.insert(
-                                (quart_min_x + x, quart_min_y + y, quart_min_z + z),
-                                section[((y * 4 + z) * 4 + x) as usize],
-                            );
-                        }
+            baked.fill_chunk(cx, cz, sections, min_y);
+        }
+        baked
+    }
+
+    /// Allocate the zeroed quart box for a neighborhood of `chunks_x × chunks_z`
+    /// chunks whose lower-left chunk is `(min_cx, min_cz)`.
+    fn empty(min_cx: i32, min_cz: i32, chunks_x: i32, chunks_z: i32, min_y: i32, height: i32) -> Self {
+        let size_x = chunks_x * 4;
+        let size_z = chunks_z * 4;
+        let size_y = (height >> 4) * 4;
+        Self {
+            data: vec![0u16; (size_x * size_z * size_y) as usize],
+            qx0: (min_cx * 16) >> 2,
+            qz0: (min_cz * 16) >> 2,
+            qy0: (min_y >> 4) << 2,
+            size_x,
+            size_z,
+            quart_min_y: min_y >> 2,
+            quart_max_y: (min_y + height - 1) >> 2,
+        }
+    }
+
+    /// Store one chunk's per-section quart biomes into the flat grid, in the
+    /// same `(section, y, z, x)` visit order as `fillBiomesFromNoise`.
+    fn fill_chunk(&mut self, cx: i32, cz: i32, sections: &[[u16; 64]], min_y: i32) {
+        let quart_min_x = (cx * 16) >> 2;
+        let quart_min_z = (cz * 16) >> 2;
+        let min_section_y = min_y >> 4;
+        for (section_index, section) in sections.iter().enumerate() {
+            let quart_min_y = (min_section_y + section_index as i32) << 2;
+            for y in 0..4 {
+                for z in 0..4 {
+                    for x in 0..4 {
+                        let lx = quart_min_x + x - self.qx0;
+                        let lz = quart_min_z + z - self.qz0;
+                        let ly = quart_min_y + y - self.qy0;
+                        self.data[((ly * self.size_z + lz) * self.size_x + lx) as usize] =
+                            section[((y * 4 + z) * 4 + x) as usize];
                     }
                 }
             }
         }
-        Self { map, quart_min_y: min_y >> 2, quart_max_y: (min_y + height - 1) >> 2 }
     }
 
     /// `ChunkAccess.getNoiseBiome` — quart y clamped to the world range.
     fn get_noise_biome(&self, quart_x: i32, quart_y: i32, quart_z: i32) -> u16 {
         let qy = quart_y.clamp(self.quart_min_y, self.quart_max_y);
-        *self
-            .map
-            .get(&(quart_x, qy, quart_z))
-            .unwrap_or_else(|| panic!("biome quart ({quart_x},{qy},{quart_z}) not baked"))
+        let lx = quart_x - self.qx0;
+        let lz = quart_z - self.qz0;
+        let ly = qy - self.qy0;
+        if lx < 0 || lx >= self.size_x || lz < 0 || lz >= self.size_z {
+            panic!("biome quart ({quart_x},{qy},{quart_z}) not baked");
+        }
+        self.data[((ly * self.size_z + lz) * self.size_x + lx) as usize]
     }
 
     /// `BiomeManager.getBiome(BlockPos)` over the baked quarts.
@@ -597,6 +627,11 @@ impl SurfaceSystem {
                     water_height: i32::MIN,
                     stone_depth_above: 0,
                     stone_depth_below: 0,
+                    biome: None,
+                    surface_secondary: None,
+                    min_surface_level: None,
+                    noise_2d: Vec::new(),
+                    noise_3d: Vec::new(),
                 };
                 let mut stone_above_depth = 0;
                 let mut water_height = i32::MIN;
@@ -626,10 +661,7 @@ impl SurfaceSystem {
                         }
                         stone_above_depth += 1;
                         let stone_below_depth = y - next_ceiling_stone_y + 1;
-                        ctx.block_y = y;
-                        ctx.water_height = water_height;
-                        ctx.stone_depth_above = stone_above_depth;
-                        ctx.stone_depth_below = stone_below_depth;
+                        ctx.update_y(stone_above_depth, stone_below_depth, water_height, y);
                         if old == self.default_block {
                             if let Some(state) = try_apply(&self.rule, &mut ctx) {
                                 set_block(ctx.chunk, x, y, z, state);
@@ -684,6 +716,11 @@ impl SurfaceSystem {
             water_height: if under_fluid { block_y + 1 } else { i32::MIN },
             stone_depth_above: 1,
             stone_depth_below: 1,
+            biome: None,
+            surface_secondary: None,
+            min_surface_level: None,
+            noise_2d: Vec::new(),
+            noise_3d: Vec::new(),
         };
         try_apply(&self.rule, &mut ctx)
     }
@@ -866,21 +903,94 @@ struct ColumnCtx<'a> {
     water_height: i32,
     stone_depth_above: i32,
     stone_depth_below: i32,
+    /// `Context.biome` — memoized per Y (reset in [`ColumnCtx::update_y`]).
+    biome: Option<u16>,
+    /// `Context.surfaceSecondary` — memoized for the column.
+    surface_secondary: Option<f64>,
+    /// `Context.minSurfaceLevel` — memoized for the column.
+    min_surface_level: Option<i32>,
+    /// `Context.noiseSamplers2d` — one memoized sample per noise, keyed by the
+    /// noise instance's identity; a 2-D sample is constant over the column.
+    noise_2d: Vec<(*const NormalNoise, f64)>,
+    /// `Context.noiseSamplers3d` — memoized per Y (cleared in `update_y`).
+    noise_3d: Vec<(*const NormalNoise, f64)>,
 }
 
 impl ColumnCtx<'_> {
-    fn get_biome(&self) -> u16 {
-        self.biomes.get_biome(
+    /// `Context.updateY`: advance to a new block Y, dropping the caches vanilla
+    /// invalidates on `lastUpdateY` (biome + all 3-D noise samplers).
+    fn update_y(
+        &mut self,
+        stone_depth_above: i32,
+        stone_depth_below: i32,
+        water_height: i32,
+        block_y: i32,
+    ) {
+        self.biome = None;
+        self.noise_3d.clear();
+        self.block_y = block_y;
+        self.water_height = water_height;
+        self.stone_depth_below = stone_depth_below;
+        self.stone_depth_above = stone_depth_above;
+    }
+
+    fn get_biome(&mut self) -> u16 {
+        if let Some(b) = self.biome {
+            return b;
+        }
+        let b = self.biomes.get_biome(
             self.system.biome_zoom_seed,
             self.block_x,
             self.block_y,
             self.block_z,
-        )
+        );
+        self.biome = Some(b);
+        b
+    }
+
+    /// `Context.getSurfaceSecondary` — memoized per column.
+    fn surface_secondary(&mut self) -> f64 {
+        if let Some(v) = self.surface_secondary {
+            return v;
+        }
+        let v = self.system.get_surface_secondary(self.block_x, self.block_z);
+        self.surface_secondary = Some(v);
+        v
+    }
+
+    /// A memoized surface-rule noise sample. 2-D samples are cached for the
+    /// whole column; 3-D samples for the current Y (`Context.getNoiseSampler`).
+    fn noise_sample(&mut self, noise: &Rc<NormalNoise>, is_3d: bool) -> f64 {
+        let key = Rc::as_ptr(noise);
+        let store = if is_3d { &self.noise_3d } else { &self.noise_2d };
+        if let Some(&(_, v)) = store.iter().find(|(k, _)| *k == key) {
+            return v;
+        }
+        let v = if is_3d {
+            noise.get_value(self.block_x as f64, self.block_y as f64, self.block_z as f64)
+        } else {
+            noise.get_value(self.block_x as f64, 0.0, self.block_z as f64)
+        };
+        if is_3d {
+            self.noise_3d.push((key, v));
+        } else {
+            self.noise_2d.push((key, v));
+        }
+        v
     }
 
     /// `Context.getMinSurfaceLevel` — bilinear over the 16-block surface-cell
-    /// corners' preliminary surface levels.
+    /// corners' preliminary surface levels. Memoized for the column.
     fn min_surface_level(&mut self) -> i32 {
+        if let Some(v) = self.min_surface_level {
+            return v;
+        }
+        let v = self.compute_min_surface_level();
+        self.min_surface_level = Some(v);
+        v
+    }
+
+    fn compute_min_surface_level(&mut self) -> i32 {
         let cell_x = self.block_x >> 4;
         let cell_z = self.block_z >> 4;
         let c00 = self.noise_chunk.preliminary_surface_level(cell_x << 4, cell_z << 4);
@@ -971,11 +1081,7 @@ fn test_condition(cond: &Cond, ctx: &mut ColumnCtx) -> bool {
     match cond {
         Cond::Biome { biomes } => biomes.contains(&ctx.get_biome()),
         Cond::NoiseThreshold { noise, min, max, is_3d } => {
-            let value = if *is_3d {
-                noise.get_value(ctx.block_x as f64, ctx.block_y as f64, ctx.block_z as f64)
-            } else {
-                noise.get_value(ctx.block_x as f64, 0.0, ctx.block_z as f64)
-            };
+            let value = ctx.noise_sample(noise, *is_3d);
             value >= *min && value <= *max
         }
         Cond::VerticalGradient { true_at_and_below, false_at_and_above, factory } => {
@@ -1043,7 +1149,7 @@ fn test_condition(cond: &Cond, ctx: &mut ColumnCtx) -> bool {
                 0
             } else {
                 mth_map(
-                    ctx.system.get_surface_secondary(ctx.block_x, ctx.block_z),
+                    ctx.surface_secondary(),
                     -1.0,
                     1.0,
                     0.0,
