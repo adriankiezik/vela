@@ -56,6 +56,12 @@
 //!   `clay_with_dripleaves`, `clay_pool_with_dripleaves`, and `pale_moss_patch`;
 //!   `moss_patch` (vegetation = `simple_block`) runs fully.
 //! * Every nether/end feature (out of overworld scope).
+//! * Standalone overworld features outside the groups ported here remain
+//!   recognized-but-skipped: `fallen_tree`, `block_pile`, `huge_brown_mushroom`/
+//!   `huge_red_mushroom`, `vines`, `sculk_patch`, and the lush-caves standalone
+//!   placers `root_system` / `multiface_growth` (glow_lichen/sculk_vein). These
+//!   are independent features (they do **not** gate the `vegetation_patch` work
+//!   above) left for a follow-up.
 //!
 //! Each deferred feature is still recognized (so the sort/seed accounting is
 //! complete) but its placement is not run — parity-safe because the RNG is
