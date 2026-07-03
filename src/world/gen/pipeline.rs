@@ -1099,6 +1099,34 @@ mod tests {
         assert!(leaves > logs, "leaves form a canopy over the logs");
     }
 
+    /// Fancy oak reaches the live pipeline: `fancy_oak` is ~10% of oak spawns in
+    /// forest/plains, so a forested region of the live FEATURES path grows oaks
+    /// (logs + leaves), and the whole pass is a pure function of the seed
+    /// (byte-identical across two independent runs). Fancy oaks write plain
+    /// `OakLog`/`OakLeaves`, indistinguishable from straight oaks at the block
+    /// grid, so this asserts oak presence + determinism; the block-exact fancy
+    /// trunk/canopy shape is covered by the `features.rs` unit test.
+    #[test]
+    fn live_features_grow_fancy_oaks() {
+        use ParityBlock::*;
+        let scan = || {
+            let mut p = ChunkPipeline::new_overworld(0);
+            let (mut logs, mut leaves) = (0u64, 0u64);
+            for cz in -2..2 {
+                for cx in -2..2 {
+                    let fc = p.feature_extract(cx, cz).blocks.expect("featured blocks");
+                    logs += fc.blocks.iter().filter(|b| matches!(b, OakLog)).count() as u64;
+                    leaves += fc.blocks.iter().filter(|b| matches!(b, OakLeaves)).count() as u64;
+                }
+            }
+            (logs, leaves)
+        };
+        let (logs, leaves) = scan();
+        assert!(logs > 0, "the live FEATURES path placed oak logs");
+        assert!(leaves > 0, "oak leaves appear");
+        assert_eq!(scan(), (logs, leaves), "the featured oak output is deterministic across runs");
+    }
+
     /// The live FEATURES path (`feature_extract`) is a pure function of the seed:
     /// the featured center is byte-identical whether or not other chunks were
     /// served first. This is the invariant that keeps `generate_full` safe for

@@ -261,6 +261,7 @@ enum TrunkPlacer {
     Straight { base: i32, a: i32, b: i32 },
     Forking { base: i32, a: i32, b: i32 },
     DarkOak { base: i32, a: i32, b: i32 },
+    Fancy { base: i32, a: i32, b: i32 },
     Unsupported,
 }
 
@@ -274,6 +275,7 @@ impl TrunkPlacer {
             "straight_trunk_placer" => TrunkPlacer::Straight { base, a, b },
             "forking_trunk_placer" => TrunkPlacer::Forking { base, a, b },
             "dark_oak_trunk_placer" => TrunkPlacer::DarkOak { base, a, b },
+            "fancy_trunk_placer" => TrunkPlacer::Fancy { base, a, b },
             _ => TrunkPlacer::Unsupported,
         }
     }
@@ -287,7 +289,8 @@ impl TrunkPlacer {
         match self {
             TrunkPlacer::Straight { base, a, b }
             | TrunkPlacer::Forking { base, a, b }
-            | TrunkPlacer::DarkOak { base, a, b } => {
+            | TrunkPlacer::DarkOak { base, a, b }
+            | TrunkPlacer::Fancy { base, a, b } => {
                 *base + random.next_int_bounded(*a + 1) + random.next_int_bounded(*b + 1)
             }
             TrunkPlacer::Unsupported => 0,
@@ -302,6 +305,9 @@ enum FoliagePlacer {
     Spruce { radius: IntProvider, offset: IntProvider, trunk_height: IntProvider },
     Pine { radius: IntProvider, offset: IntProvider, height: IntProvider },
     DarkOak { radius: IntProvider, offset: IntProvider },
+    /// `FancyFoliagePlacer extends BlobFoliagePlacer` — same `height` field, but
+    /// its `createFoliage`/`shouldSkipLocation` are overridden (no RNG draws).
+    Fancy { radius: IntProvider, offset: IntProvider, height: i32 },
     Unsupported,
 }
 
@@ -327,6 +333,11 @@ impl FoliagePlacer {
                 height: IntProvider::parse(&v["height"]),
             },
             "dark_oak_foliage_placer" => FoliagePlacer::DarkOak { radius, offset },
+            "fancy_foliage_placer" => FoliagePlacer::Fancy {
+                radius,
+                offset,
+                height: v.get("height").and_then(Value::as_i64).unwrap_or(0) as i32,
+            },
             _ => FoliagePlacer::Unsupported,
         }
     }
@@ -1473,9 +1484,175 @@ impl TrunkPlacer {
                 }
                 attachments
             }
+            TrunkPlacer::Fancy { .. } => place_fancy_trunk(level, trunks, random, tree_height, origin, config),
             TrunkPlacer::Unsupported => Vec::new(),
         }
     }
+}
+
+/// `Mth.floor(float)` — `(int)value` then step down when `value < i`.
+fn mth_floor_f32(v: f32) -> i32 {
+    let i = v as i32;
+    if v < i as f32 {
+        i - 1
+    } else {
+        i
+    }
+}
+
+/// `Mth.floor(double)`.
+fn mth_floor_f64(v: f64) -> i32 {
+    let i = v as i64 as i32;
+    if v < i as f64 {
+        i - 1
+    } else {
+        i
+    }
+}
+
+/// `FancyTrunkPlacer.treeShape` — the canopy radius envelope. All-float math
+/// (matching `Mth.sqrt(float)` = `(float)Math.sqrt`).
+fn fancy_tree_shape(height: i32, y: i32) -> f32 {
+    if (y as f32) < height as f32 * 0.3 {
+        return -1.0;
+    }
+    let radius = height as f32 / 2.0;
+    let adjacent = radius - y as f32;
+    let mut distance = ((radius * radius - adjacent * adjacent) as f64).sqrt() as f32;
+    if adjacent == 0.0 {
+        distance = radius;
+    } else if adjacent.abs() >= radius {
+        return 0.0;
+    }
+    distance * 0.5
+}
+
+/// `FancyTrunkPlacer.trimBranches`.
+fn fancy_trim_branches(height: i32, local_y: i32) -> bool {
+    local_y as f64 >= height as f64 * 0.2
+}
+
+/// `FancyTrunkPlacer.getSteps`.
+fn fancy_get_steps(dx: i32, dy: i32, dz: i32) -> i32 {
+    dx.abs().max(dy.abs()).max(dz.abs())
+}
+
+/// `FancyTrunkPlacer.makeLimb` — walk a straight line of blocks from `start` to
+/// `end`, either placing logs (`do_place`) or probing that the path is free.
+/// The `getLogAxis` state-modifier is a no-op over the identity alphabet (default
+/// log states carry no axis), so it draws nothing and is omitted.
+fn make_limb(
+    level: &mut dyn DecorationLevel,
+    trunks: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    start: Pos,
+    end: Pos,
+    do_place: bool,
+    config: &TreeConfig,
+) -> bool {
+    if !do_place && start == end {
+        return true;
+    }
+    let (dx, dy, dz) = (end.x - start.x, end.y - start.y, end.z - start.z);
+    let steps = fancy_get_steps(dx, dy, dz);
+    let fdx = dx as f32 / steps as f32;
+    let fdy = dy as f32 / steps as f32;
+    let fdz = dz as f32 / steps as f32;
+    for i in 0..=steps {
+        let bp = Pos::new(
+            start.x + mth_floor_f32(0.5 + i as f32 * fdx),
+            start.y + mth_floor_f32(0.5 + i as f32 * fdy),
+            start.z + mth_floor_f32(0.5 + i as f32 * fdz),
+        );
+        if do_place {
+            place_log(level, trunks, random, bp, config);
+        } else if !is_free(level, bp) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A `FancyTrunkPlacer.FoliageCoords`: the foliage attachment plus its branch
+/// base Y (the trunk height the limb springs from).
+struct FoliageCoords {
+    attachment: FoliageAttachment,
+    branch_base: i32,
+}
+
+/// `FancyTrunkPlacer.placeTrunk`. Builds the branch canopy: a set of foliage
+/// clusters connected by limbs to the central trunk. Only the two `nextFloat`
+/// draws per accepted cluster iteration draw RNG (limb placement uses a simple
+/// state provider → no draw), so the sequence is exact.
+fn place_fancy_trunk(
+    level: &mut dyn DecorationLevel,
+    trunks: &mut HashSet<Pos>,
+    random: &mut WorldgenRandom,
+    tree_height: i32,
+    origin: Pos,
+    config: &TreeConfig,
+) -> Vec<FoliageAttachment> {
+    let height = tree_height + 2;
+    let trunk_height = mth_floor_f64(height as f64 * 0.618);
+    place_below_trunk_block(level, trunks, random, origin.below(), config);
+    // `Math.min(1, floor(1.382 + (height/13)²))` — always 1 for valid heights,
+    // ported literally.
+    let clusters_per_y = 1.min(mth_floor_f64(1.382 + (1.0 * height as f64 / 13.0).powf(2.0)));
+    let trunk_top = origin.y + trunk_height;
+    let mut relative_y = height - 5;
+    let mut foliage_coords: Vec<FoliageCoords> = Vec::new();
+    foliage_coords.push(FoliageCoords {
+        attachment: FoliageAttachment { pos: origin.above(relative_y), radius_offset: 0, double_trunk: false },
+        branch_base: trunk_top,
+    });
+
+    while relative_y >= 0 {
+        let tree_shape = fancy_tree_shape(height, relative_y);
+        if !(tree_shape < 0.0) {
+            for _ in 0..clusters_per_y {
+                let radius = 1.0 * tree_shape as f64 * (random.next_float() as f64 + 0.328);
+                let angle = (random.next_float() * 2.0) as f64 * std::f64::consts::PI;
+                let x = radius * angle.sin() + 0.5;
+                let z = radius * angle.cos() + 0.5;
+                let check_start =
+                    origin.offset(mth_floor_f64(x), relative_y - 1, mth_floor_f64(z));
+                let check_end = check_start.above(5);
+                if make_limb(level, trunks, random, check_start, check_end, false, config) {
+                    let ddx = origin.x - check_start.x;
+                    let ddz = origin.z - check_start.z;
+                    let branch_height =
+                        check_start.y as f64 - ((ddx * ddx + ddz * ddz) as f64).sqrt() * 0.381;
+                    let branch_top =
+                        if branch_height > trunk_top as f64 { trunk_top } else { branch_height as i32 };
+                    let check_branch_base = Pos::new(origin.x, branch_top, origin.z);
+                    if make_limb(level, trunks, random, check_branch_base, check_start, false, config) {
+                        foliage_coords.push(FoliageCoords {
+                            attachment: FoliageAttachment { pos: check_start, radius_offset: 0, double_trunk: false },
+                            branch_base: check_branch_base.y,
+                        });
+                    }
+                }
+            }
+        }
+        relative_y -= 1;
+    }
+
+    make_limb(level, trunks, random, origin, origin.above(trunk_height), true, config);
+    // `makeBranches` — connect each retained cluster's branch base to its cluster.
+    for fc in &foliage_coords {
+        let base_coord = Pos::new(origin.x, fc.branch_base, origin.z);
+        if base_coord != fc.attachment.pos && fancy_trim_branches(height, fc.branch_base - origin.y) {
+            make_limb(level, trunks, random, base_coord, fc.attachment.pos, true, config);
+        }
+    }
+
+    let mut attachments = Vec::new();
+    for fc in &foliage_coords {
+        if fancy_trim_branches(height, fc.branch_base - origin.y) {
+            attachments.push(fc.attachment);
+        }
+    }
+    attachments
 }
 
 /// `FoliagePlacer.tryPlaceLeaf`. `isPersistent` is always false over the parity
@@ -1505,7 +1682,8 @@ impl FoliagePlacer {
             FoliagePlacer::Blob { offset, .. }
             | FoliagePlacer::Spruce { offset, .. }
             | FoliagePlacer::Pine { offset, .. }
-            | FoliagePlacer::DarkOak { offset, .. } => offset,
+            | FoliagePlacer::DarkOak { offset, .. }
+            | FoliagePlacer::Fancy { offset, .. } => offset,
             FoliagePlacer::Unsupported => unreachable!("offset_ip on unsupported foliage placer"),
         }
     }
@@ -1513,7 +1691,7 @@ impl FoliagePlacer {
     /// `FoliagePlacer.foliageHeight`.
     fn foliage_height(&self, random: &mut WorldgenRandom, tree_height: i32) -> i32 {
         match self {
-            FoliagePlacer::Blob { height, .. } => *height,
+            FoliagePlacer::Blob { height, .. } | FoliagePlacer::Fancy { height, .. } => *height,
             FoliagePlacer::Spruce { trunk_height, .. } => (tree_height - trunk_height.sample(random)).max(4),
             FoliagePlacer::Pine { height, .. } => height.sample(random),
             FoliagePlacer::DarkOak { .. } => 4,
@@ -1529,7 +1707,8 @@ impl FoliagePlacer {
             }
             FoliagePlacer::Blob { radius, .. }
             | FoliagePlacer::Spruce { radius, .. }
-            | FoliagePlacer::DarkOak { radius, .. } => radius.sample(random),
+            | FoliagePlacer::DarkOak { radius, .. }
+            | FoliagePlacer::Fancy { radius, .. } => radius.sample(random),
             FoliagePlacer::Unsupported => 0,
         }
     }
@@ -1603,6 +1782,17 @@ impl FoliagePlacer {
                     self.place_leaves_row(level, foliage, random, config, pos, leaf_radius + 1, 0, dt);
                 }
             }
+            FoliagePlacer::Fancy { .. } => {
+                // `FancyFoliagePlacer.createFoliage` — a 3-row (offset .. offset -
+                // foliageHeight) blob; interior rows widen by 1. No RNG draws.
+                let mut yo = offset;
+                while yo >= offset - foliage_height {
+                    let current_radius =
+                        leaf_radius + if yo != offset && yo != offset - foliage_height { 1 } else { 0 };
+                    self.place_leaves_row(level, foliage, random, config, att.pos, current_radius, yo, dt);
+                    yo -= 1;
+                }
+            }
             FoliagePlacer::Unsupported => {}
         }
     }
@@ -1666,6 +1856,14 @@ impl FoliagePlacer {
                 } else {
                     false
                 }
+            }
+            // `FancyFoliagePlacer.shouldSkipLocation` — a circular cross-section
+            // (`(dx+0.5)² + (dz+0.5)² > r²`). `dx`/`dz` are the min-abs values from
+            // `shouldSkipLocationSigned`. No RNG draw.
+            FoliagePlacer::Fancy { .. } => {
+                let fx = dx as f32 + 0.5;
+                let fz = dz as f32 + 0.5;
+                fx * fx + fz * fz > (cr * cr) as f32
             }
             FoliagePlacer::Unsupported => false,
         }
@@ -2147,6 +2345,60 @@ mod tests {
         // At least one seed in a small sweep must grow a tree.
         let grew = (0..8).any(|s| decorate(s * 1000 + 1) > 0);
         assert!(grew, "some seed grows a tree via trees_plains");
+    }
+
+    /// Fancy oak parses to a real tree with the fancy trunk + fancy foliage
+    /// placers (not `Deferred` / `Unsupported`), and places oak logs+leaves
+    /// deterministically. The canopy branches out, so leaves must appear off the
+    /// central trunk column.
+    #[test]
+    fn fancy_oak_places_trunk_and_canopy() {
+        let registry = registry_for(&["minecraft:forest"]);
+        let fancy = match registry.configured.get("fancy_oak") {
+            Some(ConfiguredFeature::Tree(c)) => c.clone(),
+            other => panic!("fancy_oak is not a tree: {other:?}"),
+        };
+        assert!(matches!(fancy.trunk_placer, TrunkPlacer::Fancy { .. }), "fancy trunk placer");
+        assert!(matches!(fancy.foliage_placer, FoliagePlacer::Fancy { .. }), "fancy foliage placer");
+
+        let run = |seed: i64| {
+            let mut level = tree_level(70);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "fancy_oak" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_tree(&fancy, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut writes: Vec<_> = level.blocks.into_iter().collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        // Find a seed that grows (fancy oak needs vertical headroom / free space);
+        // most seeds do on open ground.
+        let seed = (0..64)
+            .find(|s| {
+                run(*s).iter().any(|(_, b)| *b == ParityBlock::OakLog)
+                    && run(*s).iter().any(|(_, b)| *b == ParityBlock::OakLeaves)
+            })
+            .expect("some seed grows a fancy oak");
+        let a = run(seed);
+        assert_eq!(a, run(seed), "fancy oak is deterministic for a fixed seed");
+
+        let logs: Vec<_> = a.iter().filter(|(_, b)| *b == ParityBlock::OakLog).collect();
+        let leaves: Vec<_> = a.iter().filter(|(_, b)| *b == ParityBlock::OakLeaves).collect();
+        assert!(!logs.is_empty(), "fancy trunk logs placed");
+        assert!(leaves.len() > logs.len(), "canopy leaves outnumber logs");
+        // The canopy is a branch structure: leaves exist off the central column.
+        let off_column = leaves.iter().any(|((x, _, z), _)| *x != 8 || *z != 8);
+        assert!(off_column, "fancy canopy spreads leaves off the trunk column");
+        // Only the identity tree alphabet is written.
+        for ((x, y, z), block) in &a {
+            assert!(
+                matches!(
+                    block,
+                    ParityBlock::OakLog | ParityBlock::OakLeaves | ParityBlock::Dirt | ParityBlock::GrassBlock
+                ),
+                "unexpected block {block:?} at {x},{y},{z}"
+            );
+        }
     }
 
     /// The beehive decorator draws its RNG (nextFloat gate + shuffle + bees)
