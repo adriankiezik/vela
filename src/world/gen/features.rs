@@ -1010,6 +1010,9 @@ enum ConfiguredFeature {
     SpeleothemCluster(SpeleothemClusterConfig),
     LargeDripstone(LargeDripstoneConfig),
     SimpleRandomSelector(SimpleRandomSelectorConfig),
+    CoralTree,
+    CoralClaw,
+    CoralMushroom,
     Deferred(String),
 }
 
@@ -1093,6 +1096,9 @@ impl ConfiguredFeature {
             "simple_random_selector" => ConfiguredFeature::SimpleRandomSelector(SimpleRandomSelectorConfig {
                 features: cfg["features"].as_array().unwrap_or(&vec![]).iter().map(parse_nested).collect(),
             }),
+            "coral_tree" => ConfiguredFeature::CoralTree,
+            "coral_claw" => ConfiguredFeature::CoralClaw,
+            "coral_mushroom" => ConfiguredFeature::CoralMushroom,
             // `freeze_top_layer` (SnowAndFreezeFeature) is recognized but
             // deferred: its exact `Biome.shouldFreeze`/`shouldSnow` gates need
             // the biome-temperature/height-adjust plumbing (in surface_rules)
@@ -1582,6 +1588,9 @@ fn place_feature(
         ConfiguredFeature::SpeleothemCluster(cfg) => place_speleothem_cluster(cfg, ctx, random, origin),
         ConfiguredFeature::LargeDripstone(cfg) => place_large_dripstone(cfg, ctx, random, origin),
         ConfiguredFeature::SimpleRandomSelector(cfg) => place_simple_random_selector(cfg, ctx, random, origin),
+        ConfiguredFeature::CoralTree => place_coral(CoralKind::Tree, ctx, random, origin),
+        ConfiguredFeature::CoralClaw => place_coral(CoralKind::Claw, ctx, random, origin),
+        ConfiguredFeature::CoralMushroom => place_coral(CoralKind::Mushroom, ctx, random, origin),
         ConfiguredFeature::Deferred(_) => {}
     }
 }
@@ -3861,6 +3870,222 @@ fn place_large_dripstone(cfg: &LargeDripstoneConfig, ctx: &mut PlacementCtx, ran
     }
     if stalagmite_embedded {
         stalagmite.place_blocks(ctx, random, &wind);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Coral group (warm ocean): coral_tree, coral_claw, coral_mushroom
+// ---------------------------------------------------------------------------
+
+enum CoralKind {
+    Tree,
+    Claw,
+    Mushroom,
+}
+
+/// `#coral_blocks` — registry (tag) order.
+const CORAL_BLOCKS: [ParityBlock; 5] = [
+    ParityBlock::TubeCoralBlock,
+    ParityBlock::BrainCoralBlock,
+    ParityBlock::BubbleCoralBlock,
+    ParityBlock::FireCoralBlock,
+    ParityBlock::HornCoralBlock,
+];
+/// `#corals` = `#coral_plants` (5) ∪ the 5 coral fans, in tag order.
+const CORALS: [ParityBlock; 10] = [
+    ParityBlock::TubeCoral,
+    ParityBlock::BrainCoral,
+    ParityBlock::BubbleCoral,
+    ParityBlock::FireCoral,
+    ParityBlock::HornCoral,
+    ParityBlock::TubeCoralFan,
+    ParityBlock::BrainCoralFan,
+    ParityBlock::BubbleCoralFan,
+    ParityBlock::FireCoralFan,
+    ParityBlock::HornCoralFan,
+];
+/// `#wall_corals` — the 5 coral wall fans, in tag order.
+const WALL_CORALS: [ParityBlock; 5] = [
+    ParityBlock::TubeCoralWallFan,
+    ParityBlock::BrainCoralWallFan,
+    ParityBlock::BubbleCoralWallFan,
+    ParityBlock::FireCoralWallFan,
+    ParityBlock::HornCoralWallFan,
+];
+
+/// `Direction.Plane.HORIZONTAL` faces, in order: NORTH, EAST, SOUTH, WEST.
+const HORIZONTAL: [(i32, i32, i32); 4] = [(0, 0, -1), (1, 0, 0), (0, 0, 1), (-1, 0, 0)];
+
+/// `Direction.getClockWise` for a horizontal facing (N→E→S→W→N).
+fn horizontal_clockwise(d: (i32, i32, i32)) -> (i32, i32, i32) {
+    match d {
+        (0, 0, -1) => (1, 0, 0),  // N -> E
+        (1, 0, 0) => (0, 0, 1),   // E -> S
+        (0, 0, 1) => (-1, 0, 0),  // S -> W
+        (-1, 0, 0) => (0, 0, -1), // W -> N
+        _ => d,
+    }
+}
+fn horizontal_counter_clockwise(d: (i32, i32, i32)) -> (i32, i32, i32) {
+    match d {
+        (0, 0, -1) => (-1, 0, 0), // N -> W
+        (-1, 0, 0) => (0, 0, 1),  // W -> S
+        (0, 0, 1) => (1, 0, 0),   // S -> E
+        (1, 0, 0) => (0, 0, -1),  // E -> N
+        _ => d,
+    }
+}
+
+/// `Util.getRandomElementOf(HolderSet, random)` = `list[nextInt(size)]`.
+fn coral_random(list: &[ParityBlock], random: &mut WorldgenRandom) -> ParityBlock {
+    list[random.next_int_bounded(list.len() as i32) as usize]
+}
+
+/// `Util.shuffle` (Fisher–Yates): `for i in size..2 { swap(i-1, nextInt(i)) }`.
+fn shuffle_directions(dirs: &mut Vec<(i32, i32, i32)>, random: &mut WorldgenRandom) {
+    let size = dirs.len();
+    let mut i = size;
+    while i > 1 {
+        let j = random.next_int_bounded(i as i32) as usize;
+        dirs.swap(i - 1, j);
+        i -= 1;
+    }
+}
+
+/// `CoralFeature.placeCoralBlock`. Coral fans are property-carrying (facing) and
+/// collapse to their default block state per precedent; the RNG is 1:1.
+fn place_coral_block(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, pos: Pos, state: ParityBlock) -> bool {
+    use ParityBlock::Water;
+    let above = Pos::new(pos.x, pos.y + 1, pos.z);
+    let target = ctx.level.get_block(pos.x, pos.y, pos.z);
+    if !(target == Water || BlockTag::Corals.contains(target)) || ctx.level.get_block(above.x, above.y, above.z) != Water {
+        return false;
+    }
+    ctx.level.set_block(pos.x, pos.y, pos.z, state);
+    if random.next_float() < 0.25 {
+        let coral = coral_random(&CORALS, random);
+        ctx.level.set_block(above.x, above.y, above.z, coral);
+    } else if random.next_float() < 0.05 {
+        // sea pickle with pickles = nextInt(4)+1 (the pickles property collapses).
+        let _pickles = random.next_int_bounded(4) + 1;
+        ctx.level.set_block(above.x, above.y, above.z, ParityBlock::SeaPickle);
+    }
+    for &(dx, dy, dz) in HORIZONTAL.iter() {
+        if random.next_float() < 0.2 {
+            let rel = Pos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+            if ctx.level.get_block(rel.x, rel.y, rel.z) == Water {
+                let fan = coral_random(&WALL_CORALS, random);
+                ctx.level.set_block(rel.x, rel.y, rel.z, fan);
+            }
+        }
+    }
+    true
+}
+
+fn place_coral(kind: CoralKind, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    let state = coral_random(&CORAL_BLOCKS, random);
+    match kind {
+        CoralKind::Tree => coral_tree(ctx, random, origin, state),
+        CoralKind::Claw => coral_claw(ctx, random, origin, state),
+        CoralKind::Mushroom => coral_mushroom(ctx, random, origin, state),
+    }
+}
+
+/// `CoralTreeFeature.placeFeature`.
+fn coral_tree(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos, state: ParityBlock) {
+    let mut pos = origin;
+    let trunk_height = random.next_int_bounded(3) + 1;
+    for _ in 0..trunk_height {
+        if !place_coral_block(ctx, random, pos, state) {
+            return;
+        }
+        pos.y += 1;
+    }
+    let trunk_top = pos;
+    let n_branches = random.next_int_bounded(3) + 2;
+    let mut dirs: Vec<(i32, i32, i32)> = HORIZONTAL.to_vec();
+    shuffle_directions(&mut dirs, random);
+    for &branch_dir in dirs.iter().take(n_branches as usize) {
+        pos = Pos::new(trunk_top.x + branch_dir.0, trunk_top.y + branch_dir.1, trunk_top.z + branch_dir.2);
+        let branch_height = random.next_int_bounded(5) + 2;
+        let mut segment_length = 0;
+        let mut j = 0;
+        while j < branch_height && place_coral_block(ctx, random, pos, state) {
+            segment_length += 1;
+            pos.y += 1;
+            if j == 0 || (segment_length >= 2 && random.next_float() < 0.25) {
+                pos = Pos::new(pos.x + branch_dir.0, pos.y + branch_dir.1, pos.z + branch_dir.2);
+                segment_length = 0;
+            }
+            j += 1;
+        }
+    }
+}
+
+/// `CoralClawFeature.placeFeature`.
+fn coral_claw(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos, state: ParityBlock) {
+    if !place_coral_block(ctx, random, origin, state) {
+        return;
+    }
+    let claw_dir = HORIZONTAL[random.next_int_bounded(4) as usize];
+    let n_branches = random.next_int_bounded(2) + 2;
+    let mut dirs: Vec<(i32, i32, i32)> =
+        vec![claw_dir, horizontal_clockwise(claw_dir), horizontal_counter_clockwise(claw_dir)];
+    shuffle_directions(&mut dirs, random);
+    for &branch_dir in dirs.iter().take(n_branches as usize) {
+        let mut pos = origin;
+        let sideway_length = random.next_int_bounded(2) + 1;
+        pos = Pos::new(pos.x + branch_dir.0, pos.y + branch_dir.1, pos.z + branch_dir.2);
+        let inway_length;
+        let segment_dir;
+        if branch_dir == claw_dir {
+            segment_dir = claw_dir;
+            inway_length = random.next_int_bounded(3) + 2;
+        } else {
+            pos.y += 1;
+            let seg_possible = [branch_dir, (0, 1, 0)];
+            segment_dir = seg_possible[random.next_int_bounded(2) as usize];
+            inway_length = random.next_int_bounded(3) + 3;
+        }
+        let mut i = 0;
+        while i < sideway_length && place_coral_block(ctx, random, pos, state) {
+            pos = Pos::new(pos.x + segment_dir.0, pos.y + segment_dir.1, pos.z + segment_dir.2);
+            i += 1;
+        }
+        pos = Pos::new(pos.x - segment_dir.0, pos.y - segment_dir.1, pos.z - segment_dir.2);
+        pos.y += 1;
+        for _ in 0..inway_length {
+            pos = Pos::new(pos.x + claw_dir.0, pos.y + claw_dir.1, pos.z + claw_dir.2);
+            if !place_coral_block(ctx, random, pos, state) {
+                break;
+            }
+            if random.next_float() < 0.25 {
+                pos.y += 1;
+            }
+        }
+    }
+}
+
+/// `CoralMushroomFeature.placeFeature`.
+fn coral_mushroom(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos, state: ParityBlock) {
+    let height = random.next_int_bounded(3) + 3;
+    let width = random.next_int_bounded(3) + 3;
+    let length = random.next_int_bounded(3) + 3;
+    let sink = random.next_int_bounded(3) + 1;
+    for x in 0..=width {
+        for y in 0..=height {
+            for z in 0..=length {
+                let pos = Pos::new(x + origin.x, y + origin.y - sink, z + origin.z);
+                if (x != 0 && x != width || y != 0 && y != height)
+                    && (z != 0 && z != length || y != 0 && y != height)
+                    && (x != 0 && x != width || z != 0 && z != length)
+                    && (x == 0 || x == width || y == 0 || y == height || z == 0 || z == length)
+                    && !(random.next_float() < 0.1)
+                {
+                    place_coral_block(ctx, random, pos, state);
+                }
+            }
+        }
     }
 }
 
@@ -6698,5 +6923,49 @@ mod tests {
         let seed = (0..128).find(|s| run(*s) > 0).expect("some seed builds a large dripstone");
         assert_eq!(run(seed), run(seed), "large dripstone deterministic");
         assert!(run(seed) > 0, "the column places dripstone block");
+    }
+
+    /// Coral features (`coral_tree`/`coral_claw`/`coral_mushroom`) grow a coral
+    /// structure in a warm-ocean water column, deterministically, and pick one of
+    /// the five coral colours from `#coral_blocks`.
+    #[test]
+    fn coral_features_grow_in_water() {
+        use ParityBlock::*;
+        let coral_blocks =
+            [TubeCoralBlock, BrainCoralBlock, BubbleCoralBlock, FireCoralBlock, HornCoralBlock];
+        for kind_name in ["tree", "claw", "mushroom"] {
+            let run = |seed: i64| {
+                // Stone floor at 50, deep water 51..72.
+                let mut level = TestLevel::new(51);
+                for z in -12..12 {
+                    for x in -12..12 {
+                        for y in 51..72 {
+                            level.set_block(x, y, z, Water);
+                        }
+                    }
+                }
+                let idx = AllBiome;
+                let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+                let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+                let kind = match kind_name {
+                    "tree" => CoralKind::Tree,
+                    "claw" => CoralKind::Claw,
+                    _ => CoralKind::Mushroom,
+                };
+                place_coral(kind, &mut ctx, &mut random, Pos::new(0, 55, 0));
+                let mut writes: Vec<_> = level.blocks.iter().map(|(k, v)| (*k, *v)).collect();
+                writes.sort_by_key(|(k, _)| *k);
+                writes
+            };
+            let seed = (0..64)
+                .find(|s| run(*s).iter().any(|(_, b)| coral_blocks.contains(b)))
+                .unwrap_or_else(|| panic!("coral_{kind_name} grows for some seed"));
+            let a = run(seed);
+            assert_eq!(a, run(seed), "coral_{kind_name} deterministic");
+            assert!(
+                a.iter().any(|(_, b)| coral_blocks.contains(b)),
+                "coral_{kind_name} places a coral block"
+            );
+        }
     }
 }
