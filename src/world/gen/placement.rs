@@ -502,6 +502,16 @@ pub enum BlockTag {
     /// `#minecraft:lava_pool_stone_cannot_replace` (= `#features_cannot_replace ∪
     /// #leaves ∪ #logs`) — the lava-lake barrier cannot replace these.
     LavaPoolStoneCannotReplace,
+    /// `#minecraft:ice_spike_replaceable` (= `#substrate_overworld ∪ snow_block ∪ ice`).
+    IceSpikeReplaceable,
+    /// `#minecraft:forest_rock_can_place_on` (= `#substrate_overworld ∪ #base_stone_overworld`).
+    ForestRockCanPlaceOn,
+    /// `#minecraft:dripstone_replaceable_blocks` (= `#base_stone_overworld`).
+    DripstoneReplaceableBlocks,
+    /// `#minecraft:geode_invalid_blocks`.
+    GeodeInvalidBlocks,
+    /// `#minecraft:corals` (`#coral_plants ∪` the 5 coral fans).
+    Corals,
 }
 
 impl BlockTag {
@@ -523,6 +533,11 @@ impl BlockTag {
             "air" => BlockTag::Air,
             "features_cannot_replace" => BlockTag::FeaturesCannotReplace,
             "lava_pool_stone_cannot_replace" => BlockTag::LavaPoolStoneCannotReplace,
+            "ice_spike_replaceable" => BlockTag::IceSpikeReplaceable,
+            "forest_rock_can_place_on" => BlockTag::ForestRockCanPlaceOn,
+            "dripstone_replaceable_blocks" => BlockTag::DripstoneReplaceableBlocks,
+            "geode_invalid_blocks" => BlockTag::GeodeInvalidBlocks,
+            "corals" => BlockTag::Corals,
             _ => return None,
         })
     }
@@ -574,10 +589,27 @@ impl BlockTag {
                 Mud | MuddyMangroveRoots | MangroveRoots | MossCarpet | Vine | MangrovePropagule | Snow
             ),
             BlockTag::Air => b.is_air(),
-            BlockTag::FeaturesCannotReplace => matches!(b, Bedrock),
+            // `#features_cannot_replace` — over the parity alphabet: bedrock,
+            // spawner, chest (the vault/trial-spawner/portal-frame members are
+            // not in the alphabet).
+            BlockTag::FeaturesCannotReplace => matches!(b, Bedrock | Spawner | Chest),
             BlockTag::LavaPoolStoneCannotReplace => {
-                matches!(b, Bedrock) || b.is_leaves() || BlockTag::Logs.contains(b)
+                BlockTag::FeaturesCannotReplace.contains(b) || b.is_leaves() || BlockTag::Logs.contains(b)
             }
+            // `#substrate_overworld` (= `#beneath_tree_podzol_replaceable`) ∪ snow_block ∪ ice.
+            BlockTag::IceSpikeReplaceable => {
+                BlockTag::BeneathTreePodzolReplaceable.contains(b) || matches!(b, SnowBlock | Ice)
+            }
+            BlockTag::ForestRockCanPlaceOn => {
+                BlockTag::BeneathTreePodzolReplaceable.contains(b) || BlockTag::BaseStoneOverworld.contains(b)
+            }
+            BlockTag::DripstoneReplaceableBlocks => BlockTag::BaseStoneOverworld.contains(b),
+            BlockTag::GeodeInvalidBlocks => matches!(b, Bedrock | Water | Lava | Ice | PackedIce | BlueIce),
+            BlockTag::Corals => matches!(
+                b,
+                TubeCoral | BrainCoral | BubbleCoral | FireCoral | HornCoral
+                    | TubeCoralFan | BrainCoralFan | BubbleCoralFan | FireCoralFan | HornCoralFan
+            ),
         }
     }
 }

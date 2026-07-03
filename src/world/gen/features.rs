@@ -349,6 +349,27 @@ struct LakeConfig {
     can_replace_with_barrier: BlockPredicate,
 }
 
+/// `SpikeConfiguration` (`ice_spike`).
+#[derive(Clone, Debug)]
+struct SpikeConfig {
+    state: ParityBlock,
+    can_place_on: BlockPredicate,
+    can_replace: BlockPredicate,
+}
+
+/// `BlockStateConfiguration` for `IcebergFeature`.
+#[derive(Clone, Debug)]
+struct IcebergConfig {
+    state: ParityBlock,
+}
+
+/// `BlockBlobConfiguration` (`forest_rock`).
+#[derive(Clone, Debug)]
+struct BlockBlobConfig {
+    state: ParityBlock,
+    can_place_on: BlockPredicate,
+}
+
 // ---------------------------------------------------------------------------
 // Tree feature (TreeFeature / TreeConfiguration and the placer system)
 // ---------------------------------------------------------------------------
@@ -876,6 +897,9 @@ enum ConfiguredFeature {
     Seagrass { probability: f32 },
     SeaPickle { count: IntProvider },
     Lake(LakeConfig),
+    BlueIce,
+    Spike(SpikeConfig),
+    Iceberg(IcebergConfig),
     Deferred(String),
 }
 
@@ -931,6 +955,15 @@ impl ConfiguredFeature {
                 barrier: StateProvider::parse(&cfg["barrier"]),
                 can_replace_with_air_or_fluid: BlockPredicate::parse(&cfg["can_replace_with_air_or_fluid"]),
                 can_replace_with_barrier: BlockPredicate::parse(&cfg["can_replace_with_barrier"]),
+            }),
+            "blue_ice" => ConfiguredFeature::BlueIce,
+            "spike" => ConfiguredFeature::Spike(SpikeConfig {
+                state: cfg["state"]["Name"].as_str().and_then(ParityBlock::from_name).unwrap_or(ParityBlock::PackedIce),
+                can_place_on: BlockPredicate::parse(&cfg["can_place_on"]),
+                can_replace: BlockPredicate::parse(&cfg["can_replace"]),
+            }),
+            "iceberg" => ConfiguredFeature::Iceberg(IcebergConfig {
+                state: cfg["state"]["Name"].as_str().and_then(ParityBlock::from_name).unwrap_or(ParityBlock::PackedIce),
             }),
             // `freeze_top_layer` (SnowAndFreezeFeature) is recognized but
             // deferred: its exact `Biome.shouldFreeze`/`shouldSnow` gates need
@@ -1402,6 +1435,9 @@ fn place_feature(
         ConfiguredFeature::Seagrass { probability } => place_seagrass(*probability, ctx, random, origin),
         ConfiguredFeature::SeaPickle { count } => place_sea_pickle(count, ctx, random, origin),
         ConfiguredFeature::Lake(cfg) => place_lake(cfg, ctx, random, origin),
+        ConfiguredFeature::BlueIce => place_blue_ice(ctx, random, origin),
+        ConfiguredFeature::Spike(cfg) => place_spike(cfg, ctx, random, origin),
+        ConfiguredFeature::Iceberg(cfg) => place_iceberg(cfg, ctx, random, origin),
         ConfiguredFeature::Deferred(_) => {}
     }
 }
@@ -2099,6 +2135,426 @@ fn place_lake(cfg: &LakeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRan
         }
     }
     // Lava fluid → the water-ice pass is skipped.
+}
+
+// ---------------------------------------------------------------------------
+// Frozen / ice group: blue_ice, ice_spike (SpikeFeature), iceberg
+// ---------------------------------------------------------------------------
+
+/// `Mth.ceil(float)` — `(int)value` (truncate toward zero), rounded up when
+/// `value` exceeds that truncation.
+fn mth_ceil_f32(v: f32) -> i32 {
+    let i = v as i32;
+    if v > i as f32 { i + 1 } else { i }
+}
+
+/// `BlueIceFeature.place`.
+fn place_blue_ice(ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    if origin.y > ctx.level.sea_level() - 1 {
+        return;
+    }
+    let here = ctx.level.get_block(origin.x, origin.y, origin.z);
+    let below = ctx.level.get_block(origin.x, origin.y - 1, origin.z);
+    if here != ParityBlock::Water && below != ParityBlock::Water {
+        return;
+    }
+    // Direction.values() minus DOWN: UP, NORTH, SOUTH, WEST, EAST.
+    const NON_DOWN: [(i32, i32, i32); 5] = [(0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)];
+    let found = NON_DOWN
+        .iter()
+        .any(|&(dx, dy, dz)| ctx.level.get_block(origin.x + dx, origin.y + dy, origin.z + dz) == ParityBlock::PackedIce);
+    if !found {
+        return;
+    }
+    ctx.level.set_block(origin.x, origin.y, origin.z, ParityBlock::BlueIce);
+
+    for _ in 0..200 {
+        let y_off = random.next_int_bounded(5) - random.next_int_bounded(6);
+        let mut xz_diff = 3;
+        if y_off < 2 {
+            xz_diff += y_off / 2;
+        }
+        if xz_diff >= 1 {
+            let dx = random.next_int_bounded(xz_diff) - random.next_int_bounded(xz_diff);
+            let dz = random.next_int_bounded(xz_diff) - random.next_int_bounded(xz_diff);
+            let px = origin.x + dx;
+            let py = origin.y + y_off;
+            let pz = origin.z + dz;
+            let ps = ctx.level.get_block(px, py, pz);
+            if ps.is_air() || matches!(ps, ParityBlock::Water | ParityBlock::PackedIce | ParityBlock::Ice) {
+                // Direction.values(): DOWN, UP, NORTH, SOUTH, WEST, EAST.
+                const ALL6: [(i32, i32, i32); 6] =
+                    [(0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)];
+                for &(rx, ry, rz) in ALL6.iter() {
+                    if ctx.level.get_block(px + rx, py + ry, pz + rz) == ParityBlock::BlueIce {
+                        ctx.level.set_block(px, py, pz, ParityBlock::BlueIce);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `SpikeFeature.place` (ice_spike).
+fn place_spike(cfg: &SpikeConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    let mut origin = origin;
+    while ctx.level.get_block(origin.x, origin.y, origin.z).is_air() && origin.y > ctx.level.min_y() + 2 {
+        origin.y -= 1;
+    }
+    if !cfg.can_place_on.test(ctx.level, origin) {
+        return;
+    }
+    origin.y += random.next_int_bounded(4);
+    let height = random.next_int_bounded(4) + 7;
+    let width = height / 4 + random.next_int_bounded(2);
+    if width > 1 && random.next_int_bounded(60) == 0 {
+        origin.y += 10 + random.next_int_bounded(30);
+    }
+
+    for y_off in 0..height {
+        let scale = (1.0 - y_off as f32 / height as f32) * width as f32;
+        let new_width = mth_ceil_f32(scale);
+        for xo in -new_width..=new_width {
+            let dx = (xo.abs() as f32) - 0.25;
+            for zo in -new_width..=new_width {
+                let dz = (zo.abs() as f32) - 0.25;
+                if ((xo == 0 && zo == 0) || !(dx * dx + dz * dz > scale * scale))
+                    && ((xo != -new_width && xo != new_width && zo != -new_width && zo != new_width)
+                        || !(random.next_float() > 0.75))
+                {
+                    let p = Pos::new(origin.x + xo, origin.y + y_off, origin.z + zo);
+                    let st = ctx.level.get_block(p.x, p.y, p.z);
+                    if st.is_air() || cfg.can_replace.test(ctx.level, p) {
+                        ctx.level.set_block(p.x, p.y, p.z, cfg.state);
+                    }
+                    if y_off != 0 && new_width > 1 {
+                        let pn = Pos::new(origin.x + xo, origin.y - y_off, origin.z + zo);
+                        let stn = ctx.level.get_block(pn.x, pn.y, pn.z);
+                        if stn.is_air() || cfg.can_replace.test(ctx.level, pn) {
+                            ctx.level.set_block(pn.x, pn.y, pn.z, cfg.state);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pillar_width = width - 1;
+    if pillar_width < 0 {
+        pillar_width = 0;
+    } else if pillar_width > 1 {
+        pillar_width = 1;
+    }
+    for xo in -pillar_width..=pillar_width {
+        for zo in -pillar_width..=pillar_width {
+            let mut cursor = Pos::new(origin.x + xo, origin.y - 1, origin.z + zo);
+            let mut run_length = 50;
+            if xo.abs() == 1 && zo.abs() == 1 {
+                run_length = random.next_int_bounded(5);
+            }
+            while cursor.y > 50 {
+                let st = ctx.level.get_block(cursor.x, cursor.y, cursor.z);
+                if !st.is_air() && !cfg.can_replace.test(ctx.level, cursor) && st != cfg.state {
+                    break;
+                }
+                ctx.level.set_block(cursor.x, cursor.y, cursor.z, cfg.state);
+                cursor.y -= 1;
+                run_length -= 1;
+                if run_length <= 0 {
+                    cursor.y -= random.next_int_bounded(5) + 1;
+                    run_length = random.next_int_bounded(5);
+                }
+            }
+        }
+    }
+}
+
+// --- IcebergFeature ---------------------------------------------------------
+
+fn iceberg_is_iceberg_state(b: ParityBlock) -> bool {
+    matches!(b, ParityBlock::PackedIce | ParityBlock::SnowBlock | ParityBlock::BlueIce)
+}
+
+fn iceberg_signed_distance_ellipse(xo: i32, zo: i32, ox: i32, oz: i32, a: i32, c: i32, angle: f64) -> f64 {
+    let fx = (xo - ox) as f64;
+    let fz = (zo - oz) as f64;
+    let t1 = (fx * angle.cos() - fz * angle.sin()) / a as f64;
+    let t2 = (fx * angle.sin() + fz * angle.cos()) / c as f64;
+    t1 * t1 + t2 * t2 - 1.0
+}
+
+fn iceberg_signed_distance_circle(xo: i32, zo: i32, radius: i32, random: &mut WorldgenRandom) -> f64 {
+    let off = 10.0_f32 * random.next_float().clamp(0.2, 0.8) / radius as f32;
+    off as f64 + (xo * xo) as f64 + (zo * zo) as f64 - (radius * radius) as f64
+}
+
+fn iceberg_radius_round(random: &mut WorldgenRandom, y_off: i32, height: i32, width: i32) -> i32 {
+    let k = 3.5_f32 - random.next_float();
+    let mut scale = (1.0 - (y_off * y_off) as f64 as f32 / (height as f32 * k)) * width as f32;
+    if height > 15 + random.next_int_bounded(5) {
+        let temp_y = if y_off < 3 + random.next_int_bounded(6) { y_off / 2 } else { y_off };
+        scale = (1.0 - temp_y as f32 / (height as f32 * k * 0.4)) * width as f32;
+    }
+    mth_ceil_f32(scale / 2.0)
+}
+
+fn iceberg_radius_ellipse(y_off: i32, height: i32, width: i32) -> i32 {
+    let scale = (1.0 - (y_off * y_off) as f64 as f32 / (height as f32)) * width as f32;
+    mth_ceil_f32(scale / 2.0)
+}
+
+fn iceberg_radius_steep(random: &mut WorldgenRandom, y_off: i32, height: i32, width: i32) -> i32 {
+    let k = 1.0_f32 + random.next_float() / 2.0;
+    let scale = (1.0 - y_off as f32 / (height as f32 * k)) * width as f32;
+    mth_ceil_f32(scale / 2.0)
+}
+
+fn iceberg_ellipse_c(y_off: i32, height: i32, shape_c: i32) -> i32 {
+    let mut c = shape_c;
+    if y_off > 0 && height - y_off <= 3 {
+        c -= 4 - (height - y_off);
+    }
+    c
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iceberg_set_block(
+    ctx: &mut PlacementCtx,
+    random: &mut WorldgenRandom,
+    p: Pos,
+    h_diff: i32,
+    height: i32,
+    is_ellipse: bool,
+    snow_on_top: bool,
+    main: ParityBlock,
+) {
+    let st = ctx.level.get_block(p.x, p.y, p.z);
+    if st.is_air() || matches!(st, ParityBlock::SnowBlock | ParityBlock::Ice | ParityBlock::Water) {
+        let randomness = !is_ellipse || random.next_double() > 0.05;
+        let divisor = if is_ellipse { 3 } else { 2 };
+        if snow_on_top
+            && st != ParityBlock::Water
+            && (h_diff as f64) <= random.next_int_bounded((height / divisor).max(1)) as f64 + height as f64 * 0.6
+            && randomness
+        {
+            ctx.level.set_block(p.x, p.y, p.z, ParityBlock::SnowBlock);
+        } else {
+            ctx.level.set_block(p.x, p.y, p.z, main);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iceberg_generate_block(
+    ctx: &mut PlacementCtx,
+    random: &mut WorldgenRandom,
+    origin: Pos,
+    height: i32,
+    xo: i32,
+    y_off: i32,
+    zo: i32,
+    radius: i32,
+    a: i32,
+    is_ellipse: bool,
+    shape_c: i32,
+    angle: f64,
+    snow_on_top: bool,
+    main: ParityBlock,
+) {
+    let signed = if is_ellipse {
+        iceberg_signed_distance_ellipse(xo, zo, 0, 0, a, iceberg_ellipse_c(y_off, height, shape_c), angle)
+    } else {
+        iceberg_signed_distance_circle(xo, zo, radius, random)
+    };
+    if signed < 0.0 {
+        let compare = if is_ellipse { -0.5 } else { -6.0 - random.next_int_bounded(3) as f64 };
+        if signed > compare && random.next_double() > 0.9 {
+            return;
+        }
+        let p = Pos::new(origin.x + xo, origin.y + y_off, origin.z + zo);
+        iceberg_set_block(ctx, random, p, height - y_off, height, is_ellipse, snow_on_top, main);
+    }
+}
+
+fn iceberg_below_is_air(ctx: &PlacementCtx, p: Pos) -> bool {
+    ctx.level.get_block(p.x, p.y - 1, p.z).is_air()
+}
+
+fn iceberg_smooth(ctx: &mut PlacementCtx, origin: Pos, width: i32, height: i32, is_ellipse: bool, shape_a: i32) {
+    let a = if is_ellipse { shape_a } else { width / 2 };
+    for x in -a..=a {
+        for z in -a..=a {
+            for y_off in 0..=height {
+                let p = Pos::new(origin.x + x, origin.y + y_off, origin.z + z);
+                let st = ctx.level.get_block(p.x, p.y, p.z);
+                if iceberg_is_iceberg_state(st) || st == ParityBlock::Snow {
+                    if iceberg_below_is_air(ctx, p) {
+                        ctx.level.set_block(p.x, p.y, p.z, ParityBlock::Air);
+                        ctx.level.set_block(p.x, p.y + 1, p.z, ParityBlock::Air);
+                    } else if iceberg_is_iceberg_state(st) {
+                        let sides = [
+                            ctx.level.get_block(p.x - 1, p.y, p.z),
+                            ctx.level.get_block(p.x + 1, p.y, p.z),
+                            ctx.level.get_block(p.x, p.y, p.z - 1),
+                            ctx.level.get_block(p.x, p.y, p.z + 1),
+                        ];
+                        let counter = sides.iter().filter(|&&s| !iceberg_is_iceberg_state(s)).count();
+                        if counter >= 3 {
+                            ctx.level.set_block(p.x, p.y, p.z, ParityBlock::Air);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iceberg_carve(
+    ctx: &mut PlacementCtx,
+    radius: i32,
+    y_off: i32,
+    origin: Pos,
+    under_water: bool,
+    angle: f64,
+    local: Pos,
+    shape_a: i32,
+    shape_c: i32,
+) {
+    let a = radius + 1 + shape_a / 3;
+    let c = (radius - 3).min(3) + shape_c / 2 - 1;
+    for xo in -a..a {
+        for zo in -a..a {
+            let signed = iceberg_signed_distance_ellipse(xo, zo, local.x, local.z, a, c, angle);
+            if signed < 0.0 {
+                let p = Pos::new(origin.x + xo, origin.y + y_off, origin.z + zo);
+                let st = ctx.level.get_block(p.x, p.y, p.z);
+                if iceberg_is_iceberg_state(st) || st == ParityBlock::SnowBlock {
+                    if under_water {
+                        ctx.level.set_block(p.x, p.y, p.z, ParityBlock::Water);
+                    } else {
+                        ctx.level.set_block(p.x, p.y, p.z, ParityBlock::Air);
+                        if ctx.level.get_block(p.x, p.y + 1, p.z) == ParityBlock::Snow {
+                            ctx.level.set_block(p.x, p.y + 1, p.z, ParityBlock::Air);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iceberg_generate_cutout(
+    ctx: &mut PlacementCtx,
+    random: &mut WorldgenRandom,
+    width: i32,
+    height: i32,
+    origin: Pos,
+    is_ellipse: bool,
+    shape_a: i32,
+    angle_base: f64,
+    shape_c: i32,
+) {
+    let sign_x = if random.next_boolean() { -1 } else { 1 };
+    let sign_z = if random.next_boolean() { -1 } else { 1 };
+    let mut x_off = random.next_int_bounded((width / 2 - 2).max(1));
+    if random.next_boolean() {
+        x_off = width / 2 + 1 - random.next_int_bounded((width - width / 2 - 1).max(1));
+    }
+    let mut z_off = random.next_int_bounded((width / 2 - 2).max(1));
+    if random.next_boolean() {
+        z_off = width / 2 + 1 - random.next_int_bounded((width - width / 2 - 1).max(1));
+    }
+    if is_ellipse {
+        x_off = random.next_int_bounded((shape_a - 5).max(1));
+        z_off = x_off;
+    }
+    let local = Pos::new(sign_x * x_off, 0, sign_z * z_off);
+    let angle = if is_ellipse {
+        angle_base + std::f64::consts::FRAC_PI_2
+    } else {
+        random.next_double() * 2.0 * std::f64::consts::PI
+    };
+
+    for y_off in 0..height - 3 {
+        let radius = iceberg_radius_round(random, y_off, height, width);
+        iceberg_carve(ctx, radius, y_off, origin, false, angle, local, shape_a, shape_c);
+    }
+    let mut y_off = -1;
+    loop {
+        let bound = -height + random.next_int_bounded(5);
+        if !(y_off > bound) {
+            break;
+        }
+        let radius = iceberg_radius_steep(random, -y_off, height, width);
+        iceberg_carve(ctx, radius, y_off, origin, true, angle, local, shape_a, shape_c);
+        y_off -= 1;
+    }
+}
+
+/// `IcebergFeature.place`.
+fn place_iceberg(cfg: &IcebergConfig, ctx: &mut PlacementCtx, random: &mut WorldgenRandom, origin: Pos) {
+    let origin = Pos::new(origin.x, ctx.level.sea_level(), origin.z);
+    let snow_on_top = random.next_double() > 0.7;
+    let main = cfg.state;
+    let shape_angle = random.next_double() * 2.0 * std::f64::consts::PI;
+    let shape_a = 11 - random.next_int_bounded(5);
+    let shape_c = 3 + random.next_int_bounded(3);
+    let is_ellipse = random.next_double() > 0.7;
+    let mut over = if is_ellipse { random.next_int_bounded(6) + 6 } else { random.next_int_bounded(15) + 3 };
+    if !is_ellipse && random.next_double() > 0.9 {
+        over += random.next_int_bounded(19) + 7;
+    }
+    let under = (over + random.next_int_bounded(11)).min(18);
+    let width = (over + random.next_int_bounded(7) - random.next_int_bounded(5)).min(11);
+    let a = if is_ellipse { shape_a } else { 11 };
+
+    for xo in -a..a {
+        for zo in -a..a {
+            for y_off in 0..over {
+                let radius = if is_ellipse {
+                    iceberg_radius_ellipse(y_off, over, width)
+                } else {
+                    iceberg_radius_round(random, y_off, over, width)
+                };
+                if is_ellipse || xo < radius {
+                    iceberg_generate_block(
+                        ctx, random, origin, over, xo, y_off, zo, radius, a, is_ellipse, shape_c, shape_angle, snow_on_top, main,
+                    );
+                }
+            }
+        }
+    }
+
+    iceberg_smooth(ctx, origin, width, over, is_ellipse, shape_a);
+
+    for xo in -a..a {
+        for zo in -a..a {
+            let mut y_off = -1;
+            while y_off > -under {
+                let new_a = if is_ellipse {
+                    mth_ceil_f32(a as f32 * (1.0 - (y_off * y_off) as f64 as f32 / (under as f32 * 8.0)))
+                } else {
+                    a
+                };
+                let radius = iceberg_radius_steep(random, -y_off, under, width);
+                if xo < radius {
+                    iceberg_generate_block(
+                        ctx, random, origin, under, xo, y_off, zo, radius, new_a, is_ellipse, shape_c, shape_angle, snow_on_top,
+                        main,
+                    );
+                }
+                y_off -= 1;
+            }
+        }
+    }
+
+    let do_cutout = if is_ellipse { random.next_double() > 0.1 } else { random.next_double() > 0.7 };
+    if do_cutout {
+        iceberg_generate_cutout(ctx, random, width, over, origin, is_ellipse, shape_a, shape_angle, shape_c);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4571,6 +5027,107 @@ mod tests {
         // Only lava / air / stone-barrier written (no bedrock replaced — none present).
         for (_, b) in &a {
             assert!(matches!(b, Lava | Air | Stone), "unexpected lake block {b:?}");
+        }
+    }
+
+    /// `ice_spike` grows a packed-ice spike on a snow_block cap, replacing only
+    /// air / `#ice_spike_replaceable`, deterministically.
+    #[test]
+    fn ice_spike_grows_packed_ice() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:ice_spikes"]);
+        let cfg = match reg.configured.get("ice_spike") {
+            Some(ConfiguredFeature::Spike(c)) => c.clone(),
+            other => panic!("ice_spike is not a spike: {other:?}"),
+        };
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(70);
+            // snow_block cap so `can_place_on` (matching snow_block) passes.
+            for z in -8..24 {
+                for x in -8..24 {
+                    level.set_block(x, 69, z, SnowBlock);
+                }
+            }
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_spike(&cfg, &mut ctx, &mut random, Pos::new(8, 70, 8));
+            let mut writes: Vec<_> = level.blocks.into_iter().collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(5);
+        assert_eq!(a, run(5), "ice spike deterministic");
+        let ice = a.iter().filter(|(_, b)| *b == PackedIce).count();
+        assert!(ice > 5, "the spike is made of packed ice, got {ice}");
+        // Only packed_ice / snow_block appear (spike writes packed ice; snow cap stays).
+        for (_, b) in &a {
+            assert!(matches!(b, PackedIce | SnowBlock), "unexpected spike block {b:?}");
+        }
+    }
+
+    /// `blue_ice` seeds a blue-ice patch: needs a water column, an adjacent
+    /// packed-ice block, and origin below sea level; grows deterministically.
+    #[test]
+    fn blue_ice_spreads_from_packed_ice() {
+        use ParityBlock::*;
+        let run = |seed: i64| {
+            let mut level = TestLevel::new(40); // solid stone below; carve water above
+            for z in -8..8 {
+                for x in -8..8 {
+                    for y in 40..62 {
+                        level.set_block(x, y, z, Water);
+                    }
+                }
+            }
+            // A packed-ice neighbour beside the origin.
+            level.set_block(9, 50, 8, PackedIce);
+            level.set_block(8, 50, 8, Water);
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_blue_ice(&mut ctx, &mut random, Pos::new(8, 50, 8));
+            level.blocks.iter().filter(|(_, b)| **b == BlueIce).count()
+        };
+        let a = run(3);
+        assert!(a >= 1, "at least the seed blue-ice block is placed");
+        assert_eq!(a, run(3), "blue ice deterministic");
+    }
+
+    /// `iceberg` builds a packed-ice mass around sea level, deterministically,
+    /// writing only iceberg materials (packed ice / snow / air / water carve).
+    #[test]
+    fn iceberg_builds_ice_mass() {
+        use ParityBlock::*;
+        let reg = registry_for(&["minecraft:frozen_ocean"]);
+        let cfg = match reg.configured.get("iceberg_packed") {
+            Some(ConfiguredFeature::Iceberg(c)) => c.clone(),
+            other => panic!("iceberg_packed is not an iceberg: {other:?}"),
+        };
+        let run = |seed: i64| {
+            // Ocean: stone floor at 40, water 40..63, air above.
+            let mut level = TestLevel::new(40);
+            for z in -16..16 {
+                for x in -16..16 {
+                    for y in 40..63 {
+                        level.set_block(x, y, z, Water);
+                    }
+                }
+            }
+            let idx = AllBiome;
+            let mut ctx = PlacementCtx { level: &mut level, biome_index: &idx, top_feature: "t" };
+            let mut random = WorldgenRandom::new(RandomSource::xoroshiro(seed));
+            place_iceberg(&cfg, &mut ctx, &mut random, Pos::new(0, 90, 0));
+            let mut writes: Vec<_> = level.blocks.iter().map(|(k, v)| (*k, *v)).collect();
+            writes.sort_by_key(|(k, _)| *k);
+            writes
+        };
+        let a = run(7);
+        assert_eq!(a, run(7), "iceberg deterministic");
+        let packed = a.iter().filter(|(_, b)| *b == PackedIce).count();
+        assert!(packed > 0, "the iceberg is built from packed ice, got {packed}");
+        for (_, b) in &a {
+            assert!(matches!(b, PackedIce | SnowBlock | Snow | Air | Water), "unexpected iceberg block {b:?}");
         }
     }
 }
