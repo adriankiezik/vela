@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use serde_json::Value;
 
-use super::density::{compute_at, Dfn, RandomState};
+use super::density::{compute_at, compute_at_with, ChunkEvalState, Dfn, RandomState};
 use super::vanilla_jsons;
 
 /// `Climate.quantizeCoord` — float climate coordinate to fixed-point long.
@@ -374,6 +374,20 @@ pub struct Sampler {
     weirdness: Rc<Dfn>,
 }
 
+/// The five quantized climate coordinates of a quart column that do not vary
+/// with Y — everything a `TargetPoint` needs except `depth`. Cached once per
+/// column during a biome fill (vanilla's `FlatCache`). The `Default` (all-zero)
+/// value only backs the fill array's initialisation; every entry is overwritten
+/// before it is read.
+#[derive(Clone, Copy, Default)]
+struct ColumnClimate {
+    temperature: i64,
+    humidity: i64,
+    continentalness: i64,
+    erosion: i64,
+    weirdness: i64,
+}
+
 impl Sampler {
     /// The wiring in `RandomState`: humidity is the router's `vegetation`,
     /// weirdness its `ridges`.
@@ -400,6 +414,51 @@ impl Sampler {
             q(&self.erosion),
             q(&self.depth),
             q(&self.weirdness),
+        )
+    }
+
+    /// Sample the five 2-D climate coordinates that only depend on `(x, z)` for
+    /// one quart column, reusing `st`. Vanilla's `cachedClimateSampler`
+    /// FlatCache-wraps these functions and prefills them at `y = 0`; here the
+    /// fillers are genuinely two-dimensional (temperature/humidity are
+    /// `shiftedNoise2d`, whose `yScale` is 0 and whose shift noises hardcode
+    /// `y = 0`; continentalness/erosion/weirdness are `flatCache` over the same),
+    /// so the value is identical at every `y`. Computed once per column and
+    /// reused across all 96 quart-Y levels of the chunk.
+    fn sample_column(&self, quart_x: i32, quart_z: i32, st: &mut ChunkEvalState) -> ColumnClimate {
+        let (x, z) = (quart_x << 2, quart_z << 2);
+        // Mirror FlatCache's prefill position (`y = 0`); value is y-invariant.
+        let q = |f: &Rc<Dfn>, st: &mut ChunkEvalState| {
+            quantize_coord(compute_at_with(f, x, 0, z, st) as f32)
+        };
+        ColumnClimate {
+            temperature: q(&self.temperature, st),
+            humidity: q(&self.humidity, st),
+            continentalness: q(&self.continentalness, st),
+            erosion: q(&self.erosion, st),
+            weirdness: q(&self.weirdness, st),
+        }
+    }
+
+    /// `Sampler.sample` for one quart using a column's cached 2-D coordinates —
+    /// only `depth` (the sole Y-dependent climate function) is evaluated here.
+    fn sample_with_column(
+        &self,
+        col: &ColumnClimate,
+        quart_x: i32,
+        quart_y: i32,
+        quart_z: i32,
+        st: &mut ChunkEvalState,
+    ) -> TargetPoint {
+        let (x, y, z) = (quart_x << 2, quart_y << 2, quart_z << 2);
+        let depth = quantize_coord(compute_at_with(&self.depth, x, y, z, st) as f32);
+        TargetPoint::new(
+            col.temperature,
+            col.humidity,
+            col.continentalness,
+            col.erosion,
+            depth,
+            col.weirdness,
         )
     }
 }
@@ -492,14 +551,37 @@ impl MultiNoiseBiomeSource {
         let min_section_y = min_y >> 4;
         let section_count = height / 16;
         let mut sections = Vec::with_capacity(section_count as usize);
+
+        // One evaluation state for every density-function sample of the chunk
+        // (vanilla's per-`NoiseChunk` sampler), plus a per-column cache of the
+        // Y-invariant climate coordinates (vanilla's `FlatCache`): the chunk's
+        // 4×4 quart columns are sampled once here and reused across all
+        // `section_count · 4` quart-Y levels, so only `depth` is evaluated per
+        // quart. This changes neither the values nor the `find_value` call order
+        // below, so the stateful RTree search is bit-identical.
+        let mut st = ChunkEvalState::standalone();
+        let mut columns = [ColumnClimate::default(); 16];
+        for x in 0..4 {
+            for z in 0..4 {
+                columns[(x * 4 + z) as usize] =
+                    sampler.sample_column(quart_min_x + x, quart_min_z + z, &mut st);
+            }
+        }
+
         for section_index in 0..section_count {
             let quart_min_y = (min_section_y + section_index) << 2;
             let mut section = [0u16; 64];
             for x in 0..4 {
                 for y in 0..4 {
                     for z in 0..4 {
-                        let target =
-                            sampler.sample(quart_min_x + x, quart_min_y + y, quart_min_z + z);
+                        let col = &columns[(x * 4 + z) as usize];
+                        let target = sampler.sample_with_column(
+                            col,
+                            quart_min_x + x,
+                            quart_min_y + y,
+                            quart_min_z + z,
+                            &mut st,
+                        );
                         section[((y * 4 + z) * 4 + x) as usize] = self.list.find_value(target);
                     }
                 }
